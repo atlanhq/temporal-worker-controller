@@ -1,11 +1,10 @@
-name: Build Temporal Worker Controller Image
+name: Build Temporal Worker Controller
 on:
   push:
     branches:
     - main
-    - feat/enable-twd-autoscaling
 jobs:
-  build:
+  build-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,3 +26,17 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ghcr.io/atlanhq/temporal-worker-controller:0.12.0-scale-subresource-${{ github.sha }}
+
+  push-chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        run: echo "${{ secrets.ORG_PAT_GITHUB }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Package and push Helm chart
+        run: |
+          helm package helm/temporal-worker-controller
+          helm push temporal-worker-controller-0.12.0.tgz oci://ghcr.io/atlanhq/charts
