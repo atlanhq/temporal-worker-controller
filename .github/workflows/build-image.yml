@@ -40,4 +40,4 @@ jobs:
       - name: Package and push Helm chart
         run: |
           helm package helm/temporal-worker-controller
-          helm push temporal-worker-controller-0.12.0.tgz oci://ghcr.io/atlanhq/charts
+          helm push temporal-worker-controller-0.12.0-atlan.1.tgz oci://ghcr.io/atlanhq/charts
