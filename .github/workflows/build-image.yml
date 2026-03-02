@@ -2,7 +2,7 @@ name: Build Temporal Worker Controller
 on:
   push:
     branches:
-    - main
+    - v1.2.0-atlan
     - feat/enable-twd-autoscaling
 jobs:
   build-image:
