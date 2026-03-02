@@ -27,8 +27,8 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/atlanhq/temporal-worker-controller:1.2.0-atlan-1.1-${{ github.sha }}
-            ghcr.io/atlanhq/temporal-worker-controller:1.2.0-atlan-1.1
+            ghcr.io/atlanhq/temporal-worker-controller:1.2.0-atlan-1.2-${{ github.sha }}
+            ghcr.io/atlanhq/temporal-worker-controller:1.2.0-atlan-1.2
 
   push-chart:
     needs: build-image
@@ -43,4 +43,4 @@ jobs:
       - name: Package and push Helm chart
         run: |
           helm package helm/temporal-worker-controller
-          helm push temporal-worker-controller-1.2.0-atlan-1.1.tgz oci://ghcr.io/atlanhq/charts
+          helm push temporal-worker-controller-1.2.0-atlan-1.2.tgz oci://ghcr.io/atlanhq/charts
