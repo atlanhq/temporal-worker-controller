@@ -5,13 +5,13 @@ metadata:
   labels:
     app.kubernetes.io/component: manager
     {{- include "temporal-worker-controller.labels" . | nindent 4 }}
-  name: {{ .Release.Name }}
+  name: {{ include "temporal-worker-controller.fullname" . }}
 {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name }}-manager
+  name: {{ include "temporal-worker-controller.fullname" . }}-manager
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/component: manager
@@ -51,6 +51,7 @@ spec:
       {{- end }}
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65532
         {{- if .Values.securityContext.seccompProfile.enabled }}
         seccompProfile:
           type: RuntimeDefault
@@ -61,7 +62,7 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         env:
         - name: CONTROLLER_IDENTITY
-          value: "{{ .Release.Name }}/{{ .Release.Namespace }}"
+          value: "{{ include "temporal-worker-controller.fullname" . }}/{{ .Release.Namespace }}"
         - name: CONTROLLER_VERSION
           value: "{{ .Values.image.tag | default .Chart.AppVersion }}"
         args:
@@ -133,7 +134,7 @@ spec:
             defaultMode: 420
             secretName: webhook-server-cert
       {{- end }}
-      serviceAccountName: {{ .Values.serviceAccount.name | default (printf "%s-service-account" .Release.Name) }}
+      serviceAccountName: {{ .Values.serviceAccount.name | default (printf "%s-service-account" (include "temporal-worker-controller.fullname" .)) }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

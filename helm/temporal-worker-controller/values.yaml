@@ -1,3 +1,7 @@
+# Override the resource name prefix. Defaults to "temporal-worker-controller".
+# Ensures predictable naming when deployed as a subchart.
+fullnameOverride: "temporal-worker-controller"
+
 image:
   repository: temporalio/temporal-worker-controller
   tag: "" # Defaults to Chart.appVersion if not specified
