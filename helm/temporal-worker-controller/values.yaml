@@ -11,8 +11,8 @@ imagePullSecrets: []
 
 kubeRbacProxy:
   image:
-    repository: gcr.io/kubebuilder/kube-rbac-proxy
-    tag: v0.14.1
+    repository: ghcr.io/atlanhq/kube-rbac-proxy
+    tag: v0.14.1-multiarch
 
 podAnnotations: {}
   # Additional pod annotations can be added here
