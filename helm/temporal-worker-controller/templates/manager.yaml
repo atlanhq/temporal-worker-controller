@@ -35,6 +35,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if .Values.affinity }}
       affinity:
 {{ toYaml .Values.affinity | nindent 8 }}
@@ -108,7 +112,7 @@ spec:
           capabilities:
             drop:
               - "ALL"
-        image: gcr.io/kubebuilder/kube-rbac-proxy:v0.14.1
+        image: "{{ .Values.kubeRbacProxy.image.repository }}:{{ .Values.kubeRbacProxy.image.tag }}"
         args:
           - "--secure-listen-address=0.0.0.0:8443"
           - --upstream=http://127.0.0.1:{{ .Values.metrics.port }}/
