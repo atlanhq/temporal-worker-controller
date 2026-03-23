@@ -21,6 +21,37 @@
         }
       }
     },
+    "imagePullSecrets": {
+      "type": "array",
+      "description": "Image pull secrets for the pod",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "kubeRbacProxy": {
+      "type": "object",
+      "description": "Configuration for the kube-rbac-proxy sidecar",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "kube-rbac-proxy image repository"
+            },
+            "tag": {
+              "type": "string",
+              "description": "kube-rbac-proxy image tag"
+            }
+          }
+        }
+      }
+    },
     "podAnnotations": {
       "type": "object",
       "description": "Additional pod annotations",

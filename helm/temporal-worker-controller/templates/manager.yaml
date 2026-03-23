@@ -5,13 +5,13 @@ metadata:
   labels:
     app.kubernetes.io/component: manager
     {{- include "temporal-worker-controller.labels" . | nindent 4 }}
-  name: {{ .Release.Name }}
+  name: {{ include "temporal-worker-controller.fullname" . }}
 {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name }}-manager
+  name: {{ include "temporal-worker-controller.fullname" . }}-manager
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/component: manager
@@ -35,6 +35,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if .Values.affinity }}
       affinity:
 {{ toYaml .Values.affinity | nindent 8 }}
@@ -51,6 +55,7 @@ spec:
       {{- end }}
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65532
         {{- if .Values.securityContext.seccompProfile.enabled }}
         seccompProfile:
           type: RuntimeDefault
@@ -61,15 +66,25 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         env:
         - name: CONTROLLER_IDENTITY
-          value: "{{ .Release.Name }}/{{ .Release.Namespace }}"
+          value: "{{ include "temporal-worker-controller.fullname" . }}/{{ .Release.Namespace }}"
         - name: CONTROLLER_VERSION
           value: "{{ .Values.image.tag | default .Chart.AppVersion }}"
         args:
         - --leader-elect
         {{- if .Values.metrics.enabled }}
+        {{- if .Values.metrics.disableAuth }}
+        - "--metrics-bind-address=0.0.0.0:{{ .Values.metrics.port }}"
+        {{- else }}
         - "--metrics-bind-address=127.0.0.1:{{ .Values.metrics.port }}"
         {{- end }}
+        {{- end }}
         - "--health-probe-bind-address=:8081"
+        {{- if and .Values.metrics.enabled .Values.metrics.disableAuth }}
+        ports:
+          - containerPort: {{ .Values.metrics.port }}
+            name: metrics
+            protocol: TCP
+        {{- end }}
         {{- if .Values.webhook.enabled }}
         {{ fail "webhooks aren't supported yet" }}
         ports:
@@ -107,7 +122,7 @@ spec:
           capabilities:
             drop:
               - "ALL"
-        image: gcr.io/kubebuilder/kube-rbac-proxy:v0.14.1
+        image: "{{ .Values.kubeRbacProxy.image.repository }}:{{ .Values.kubeRbacProxy.image.tag }}"
         args:
           - "--secure-listen-address=0.0.0.0:8443"
           - --upstream=http://127.0.0.1:{{ .Values.metrics.port }}/
@@ -133,7 +148,7 @@ spec:
             defaultMode: 420
             secretName: webhook-server-cert
       {{- end }}
-      serviceAccountName: {{ .Values.serviceAccount.name | default (printf "%s-service-account" .Release.Name) }}
+      serviceAccountName: {{ .Values.serviceAccount.name | default (printf "%s-service-account" (include "temporal-worker-controller.fullname" .)) }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

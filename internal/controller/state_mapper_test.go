@@ -132,7 +132,7 @@ func TestMapToStatus(t *testing.T) {
 	}
 
 	// Create state mapper
-	mapper := newStateMapper(k8sState, temporalState, "worker")
+	mapper := newStateMapper(k8sState, temporalState, "worker", "test-twd")
 
 	// Map to status
 	status := mapper.mapToStatus("v2")
@@ -228,7 +228,7 @@ func TestMapWorkerDeploymentVersion(t *testing.T) {
 		},
 	}
 
-	mapper := newStateMapper(k8sState, temporalState, "worker")
+	mapper := newStateMapper(k8sState, temporalState, "worker", "test-twd")
 
 	// Test current version mapping
 	currentVersion := mapper.mapCurrentWorkerDeploymentVersionByBuildID("v1")

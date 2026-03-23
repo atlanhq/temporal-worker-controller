@@ -1,7 +1,18 @@
+# Override the resource name prefix. Defaults to "temporal-worker-controller".
+# Ensures predictable naming when deployed as a subchart.
+fullnameOverride: "temporal-worker-controller"
+
 image:
   repository: temporalio/temporal-worker-controller
   tag: "" # Defaults to Chart.appVersion if not specified
   pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+kubeRbacProxy:
+  image:
+    repository: ghcr.io/atlanhq/kube-rbac-proxy
+    tag: v0.15.0-multiarch
 
 podAnnotations: {}
   # Additional pod annotations can be added here
@@ -61,7 +72,7 @@ replicas: 2
 # auth proxy (https://github.com/brancz/kube-rbac-proxy)
 # which protects your /metrics endpoint.
 authProxy:
-  enabled: true
+  enabled: false
 
 metrics:
   enabled: true
@@ -70,7 +81,7 @@ metrics:
   # endpoint w/o any authn/z. If false, creates an HTTP proxy sidecar container
   # for the controller manager which performs RBAC authorization against the
   # Kubernetes API using SubjectAccessReviews.
-  disableAuth: false
+  disableAuth: true
 
 namespace:
   create: false
@@ -85,9 +96,8 @@ webhook:
 certmanager:
   enabled: false
 
-# Not yet supported
 prometheus:
-  enabled: false
+  enabled: true
 
 nodeSelector: {}
 

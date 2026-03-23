@@ -395,8 +395,17 @@ func getScaleDeployments(
 	if (status.CurrentVersion == nil || status.CurrentVersion.BuildID != status.TargetVersion.BuildID) &&
 		status.TargetVersion.Deployment != nil {
 		if d, exists := k8sState.Deployments[status.TargetVersion.BuildID]; exists {
-			if d.Spec.Replicas == nil || *d.Spec.Replicas != replicas {
-				scaleDeployments[status.TargetVersion.Deployment] = uint32(replicas)
+			targetReplicas := replicas
+			// When a version is NotRegistered, at least one worker must be running
+			// to poll Temporal and register the build ID. Without this, external
+			// scalers (KEDA) that set spec.replicas=0 create a deadlock: no worker
+			// → no registration → no tasks routed → scaler stays inactive → no worker.
+			// Once registered, the override stops and the scaler regains full control.
+			if status.TargetVersion.Status == temporaliov1alpha1.VersionStatusNotRegistered && targetReplicas == 0 {
+				targetReplicas = 1
+			}
+			if d.Spec.Replicas == nil || *d.Spec.Replicas != targetReplicas {
+				scaleDeployments[status.TargetVersion.Deployment] = uint32(targetReplicas)
 			}
 		}
 	}
