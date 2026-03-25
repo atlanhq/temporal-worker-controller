@@ -37,7 +37,16 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
+- apiGroups:
+  - temporal.io
+  resources:
+  - temporalconnections/finalizers
+  - temporalworkerdeployments/finalizers
+  verbs:
+  - update
 - apiGroups:
   - temporal.io
   resources:
@@ -50,12 +59,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - temporal.io
-  resources:
-  - temporalworkerdeployments/finalizers
-  verbs:
-  - update
 - apiGroups:
   - temporal.io
   resources:
