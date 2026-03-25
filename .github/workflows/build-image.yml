@@ -3,7 +3,7 @@ on:
   push:
     branches:
     - v1.2.0-atlan
-    - feat/enable-twd-autoscaling
+    - fix/twd-leaves-stale-versioning-data
 jobs:
   build-image:
     runs-on: ubuntu-latest
