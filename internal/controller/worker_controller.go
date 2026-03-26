@@ -49,6 +49,12 @@ const (
 	// them from being deleted while any TemporalWorkerDeployment still references them.
 	// This ensures the connection is available during TWD deletion cleanup.
 	tcFinalizerName = "temporal.io/connection-in-use"
+
+	// deletionCleanupTimeout is the maximum duration to retry Temporal server-side
+	// cleanup before giving up and allowing the K8s resource to be deleted.
+	// This prevents the TWD from being stuck in terminating state indefinitely
+	// if Temporal server is unavailable or the deployment is undeletable.
+	deletionCleanupTimeout = 5 * time.Minute
 )
 
 // getAPIKeySecretName extracts the secret name from a SecretKeySelector
@@ -143,8 +149,14 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		if controllerutil.ContainsFinalizer(&workerDeploy, twdFinalizerName) {
 			l.Info("TemporalWorkerDeployment is being deleted, running cleanup")
 			if err := r.handleDeletion(ctx, l, &workerDeploy); err != nil {
-				l.Error(err, "failed to clean up Temporal server-side deployment data")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				elapsed := time.Since(workerDeploy.DeletionTimestamp.Time)
+				if elapsed < deletionCleanupTimeout {
+					l.Error(err, "failed to clean up Temporal server-side deployment data, will retry",
+						"elapsed", elapsed.Round(time.Second), "timeout", deletionCleanupTimeout)
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+				l.Error(err, "failed to clean up Temporal server-side deployment data after timeout, proceeding with finalizer removal",
+					"elapsed", elapsed.Round(time.Second), "timeout", deletionCleanupTimeout)
 			}
 
 			// Remove our finalizer from the TemporalConnection if no other TWDs reference it.
@@ -398,10 +410,15 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 		}); err != nil {
 			l.Info("Failed to clear ramping version (may have been cleared by SetCurrentVersion)", "error", err)
 		}
+	} else {
+		l.Info("No ramping version set, skipping clear ramping version")
 	}
 
 	// Step 3: Delete versions that are eligible. Versions that are still draining
 	// are force-deleted with SkipDrainage since the TWD is being removed entirely.
+	// If any version fails to delete (e.g. active pollers), return an error so the
+	// reconciler requeues. Pollers will disappear once the pods terminate shortly
+	// after, and the next reconciliation will succeed.
 	for _, version := range resp.Info.VersionSummaries {
 		buildID := version.Version.BuildId
 		l.Info("Deleting worker deployment version", "buildID", buildID)
@@ -410,20 +427,17 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			SkipDrainage: true,
 			Identity:     getControllerIdentity(),
 		}); err != nil {
-			// Log but don't fail -- the version may still have pollers or be current.
-			// Temporal will garbage collect it eventually.
-			l.Info("Could not delete version (will be garbage collected)", "buildID", buildID, "error", err)
+			return fmt.Errorf("unable to delete version %s (will retry): %w", buildID, err)
 		}
 	}
 
-	// Step 4: Attempt to delete the deployment itself. This only succeeds if all versions are gone.
+	// Step 4: Delete the deployment itself. This only succeeds if all versions are gone.
 	l.Info("Attempting to delete worker deployment from Temporal server", "name", workerDeploymentName)
 	if _, err := temporalClient.WorkerDeploymentClient().Delete(ctx, sdkclient.WorkerDeploymentDeleteOptions{
 		Name:     workerDeploymentName,
 		Identity: getControllerIdentity(),
 	}); err != nil {
-		// Non-fatal: deployment will be garbage collected once all versions drain.
-		l.Info("Could not delete worker deployment (will be garbage collected)", "name", workerDeploymentName, "error", err)
+		return fmt.Errorf("unable to delete worker deployment %s (will retry): %w", workerDeploymentName, err)
 	}
 
 	return nil
