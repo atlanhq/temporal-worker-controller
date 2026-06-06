@@ -815,6 +815,74 @@ func TestGetScaleDeployments(t *testing.T) {
 			expectScales: map[string]uint32{"test-456": 0},
 		},
 		{
+			name: "draining version scales down to a single poller",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"123": createDeploymentWithDefaultConnectionSpecHash(1),
+					"456": createDeploymentWithDefaultConnectionSpecHash(7),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusDraining,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				SunsetStrategy: temporaliov1alpha1.SunsetStrategy{
+					ScaledownDelay: &metav1.Duration{Duration: 0},
+				},
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectScales: map[string]uint32{"test-456": 1},
+		},
+		{
+			name: "draining version already at one poller is left alone",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"123": createDeploymentWithDefaultConnectionSpecHash(1),
+					"456": createDeploymentWithDefaultConnectionSpecHash(1),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusDraining,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				SunsetStrategy: temporaliov1alpha1.SunsetStrategy{
+					ScaledownDelay: &metav1.Duration{Duration: 0},
+				},
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectScales: map[string]uint32{},
+		},
+		{
 			name: "inactive non-target version needs scaling down",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{

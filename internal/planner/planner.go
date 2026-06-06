@@ -678,6 +678,18 @@ func getScaleDeployments(
 					scaleDeployments[version.Deployment] = uint32(replicas)
 				}
 			}
+		case temporaliov1alpha1.VersionStatusDraining:
+			// A draining version is kept alive only so that pinned workflows
+			// still open on it can resume when they wake (e.g. a parent
+			// waiting on a long-running child workflow). Those wake-ups are
+			// rare and brief, so a single poller is sufficient. Without this
+			// case the deployment stays frozen at whatever replica count it
+			// had when it was superseded — e.g. 7-8 idle pods held for days
+			// behind one waiting workflow. Never scale to zero here: a pinned
+			// workflow with no live worker of its build can never resume.
+			if d.Spec.Replicas == nil || *d.Spec.Replicas > 1 {
+				scaleDeployments[version.Deployment] = 1
+			}
 		case temporaliov1alpha1.VersionStatusDrained:
 			if version.DrainedSince != nil && time.Since(version.DrainedSince.Time) > spec.SunsetStrategy.ScaledownDelay.Duration {
 				// Scale down drained deployments after delay
