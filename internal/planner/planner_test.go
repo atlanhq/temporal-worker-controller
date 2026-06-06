@@ -815,7 +815,7 @@ func TestGetScaleDeployments(t *testing.T) {
 			expectScales: map[string]uint32{"test-456": 0},
 		},
 		{
-			name: "draining version scales down to a single poller",
+			name: "idle draining version (zero backlog) scales down to a single poller",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
 					"123": createDeploymentWithDefaultConnectionSpecHash(1),
@@ -846,7 +846,85 @@ func TestGetScaleDeployments(t *testing.T) {
 				},
 				Replicas: func() *int32 { r := int32(1); return &r }(),
 			},
+			state: &temporal.TemporalWorkerState{
+				Versions: map[string]*temporal.VersionInfo{
+					"456": {BuildID: "456", Backlog: func() *int64 { b := int64(0); return &b }()},
+				},
+			},
 			expectScales: map[string]uint32{"test-456": 1},
+		},
+		{
+			name: "busy draining version (non-zero backlog) keeps its replicas",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"123": createDeploymentWithDefaultConnectionSpecHash(1),
+					"456": createDeploymentWithDefaultConnectionSpecHash(7),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusDraining,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				SunsetStrategy: temporaliov1alpha1.SunsetStrategy{
+					ScaledownDelay: &metav1.Duration{Duration: 0},
+				},
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			state: &temporal.TemporalWorkerState{
+				Versions: map[string]*temporal.VersionInfo{
+					"456": {BuildID: "456", Backlog: func() *int64 { b := int64(42); return &b }()},
+				},
+			},
+			expectScales: map[string]uint32{},
+		},
+		{
+			name: "draining version with unknown backlog keeps its replicas",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"123": createDeploymentWithDefaultConnectionSpecHash(1),
+					"456": createDeploymentWithDefaultConnectionSpecHash(7),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusDraining,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				SunsetStrategy: temporaliov1alpha1.SunsetStrategy{
+					ScaledownDelay: &metav1.Duration{Duration: 0},
+				},
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectScales: map[string]uint32{},
 		},
 		{
 			name: "draining version already at one poller is left alone",
@@ -879,6 +957,11 @@ func TestGetScaleDeployments(t *testing.T) {
 					ScaledownDelay: &metav1.Duration{Duration: 0},
 				},
 				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			state: &temporal.TemporalWorkerState{
+				Versions: map[string]*temporal.VersionInfo{
+					"456": {BuildID: "456", Backlog: func() *int64 { b := int64(0); return &b }()},
+				},
 			},
 			expectScales: map[string]uint32{},
 		},
@@ -1107,7 +1190,7 @@ func TestGetScaleDeployments(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			scales := getScaleDeployments(tc.k8sState, tc.status, tc.spec)
+			scales := getScaleDeployments(tc.k8sState, tc.status, tc.spec, tc.state)
 			assert.Equal(t, len(tc.expectScales), len(scales), "unexpected number of scales")
 			actualScaleDeploymentNames := make([]string, 0)
 			for deploymentRef, actualReplicas := range scales {

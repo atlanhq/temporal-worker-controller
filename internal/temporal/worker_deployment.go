@@ -30,6 +30,12 @@ type VersionInfo struct {
 	TaskQueues     []temporaliov1alpha1.TaskQueue
 	TestWorkflows  []temporaliov1alpha1.WorkflowExecution
 
+	// Backlog is the approximate number of pending workflow + activity tasks
+	// across this version's task queues. Only collected for Draining versions
+	// (used by the planner to decide whether the version can be scaled down
+	// to a single poller). Nil means unknown / not collected.
+	Backlog *int64
+
 	// True if all task queues in this version have at least one unversioned poller.
 	// False could just mean unknown / not checked / not checked successfully.
 	// Only checked for Target Version when Current Version is nil and strategy is Progressive.
@@ -142,6 +148,15 @@ func GetWorkerDeploymentState(
 			versionInfo.Status = temporaliov1alpha1.VersionStatusRamping
 		} else if drainageStatus == enumspb.VERSION_DRAINAGE_STATUS_DRAINING {
 			versionInfo.Status = temporaliov1alpha1.VersionStatusDraining
+			// Collect the version's task-queue backlog so the planner can
+			// right-size the draining deployment: an idle draining version
+			// (pinned workflows merely waiting) needs only a single poller,
+			// while one still executing activities keeps its replicas.
+			// Errors leave Backlog nil (= unknown), which the planner treats
+			// conservatively by not scaling the version down.
+			if backlog, backlogErr := getVersionBacklog(ctx, client, deploymentHandler, version.DeploymentVersion.BuildId); backlogErr == nil {
+				versionInfo.Backlog = &backlog
+			}
 		} else if drainageStatus == enumspb.VERSION_DRAINAGE_STATUS_DRAINED {
 			versionInfo.Status = temporaliov1alpha1.VersionStatusDrained
 
@@ -331,6 +346,57 @@ func getPollers(ctx context.Context,
 		return nil, fmt.Errorf("unable to describe task queue %s: %w", taskQueueInfo.Name, err)
 	}
 	return resp.GetPollers(), nil
+}
+
+// getVersionBacklog sums the approximate pending workflow + activity task
+// counts across all task queues of a specific worker deployment version.
+// Zero backlog means the version's pinned workflows are idle (e.g. waiting
+// on child workflows or timers) and the version can safely run on a single
+// poller while it drains.
+func getVersionBacklog(
+	ctx context.Context,
+	client temporalClient.Client,
+	deploymentHandler temporalClient.WorkerDeploymentHandle,
+	buildID string,
+) (int64, error) {
+	desc, err := deploymentHandler.DescribeVersion(ctx, temporalClient.WorkerDeploymentDescribeVersionOptions{
+		BuildID: buildID,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("unable to describe version %q: %w", buildID, err)
+	}
+
+	seen := make(map[string]struct{})
+	var total int64
+	for _, tq := range desc.Info.TaskQueuesInfos {
+		if _, ok := seen[tq.Name]; ok {
+			continue
+		}
+		seen[tq.Name] = struct{}{}
+
+		resp, err := client.DescribeTaskQueueEnhanced(ctx, temporalClient.DescribeTaskQueueEnhancedOptions{
+			TaskQueue:   tq.Name,
+			ReportStats: true,
+			Versions: &temporalClient.TaskQueueVersionSelection{
+				BuildIDs: []string{buildID},
+			},
+			TaskQueueTypes: []temporalClient.TaskQueueType{
+				temporalClient.TaskQueueTypeWorkflow,
+				temporalClient.TaskQueueTypeActivity,
+			},
+		})
+		if err != nil {
+			return 0, fmt.Errorf("unable to describe task queue %q: %w", tq.Name, err)
+		}
+		for _, versionInfo := range resp.VersionsInfo {
+			for _, typeInfo := range versionInfo.TypesInfo {
+				if typeInfo.Stats != nil {
+					total += typeInfo.Stats.ApproximateBacklogCount
+				}
+			}
+		}
+	}
+	return total, nil
 }
 
 func allTaskQueuesHaveUnversionedPoller(
