@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
@@ -148,15 +149,6 @@ func GetWorkerDeploymentState(
 			versionInfo.Status = temporaliov1alpha1.VersionStatusRamping
 		} else if drainageStatus == enumspb.VERSION_DRAINAGE_STATUS_DRAINING {
 			versionInfo.Status = temporaliov1alpha1.VersionStatusDraining
-			// Collect the version's task-queue backlog so the planner can
-			// right-size the draining deployment: an idle draining version
-			// (pinned workflows merely waiting) needs only a single poller,
-			// while one still executing activities keeps its replicas.
-			// Errors leave Backlog nil (= unknown), which the planner treats
-			// conservatively by not scaling the version down.
-			if backlog, backlogErr := getVersionBacklog(ctx, client, deploymentHandler, version.DeploymentVersion.BuildId); backlogErr == nil {
-				versionInfo.Backlog = &backlog
-			}
 		} else if drainageStatus == enumspb.VERSION_DRAINAGE_STATUS_DRAINED {
 			versionInfo.Status = temporaliov1alpha1.VersionStatusDrained
 
@@ -195,7 +187,53 @@ func GetWorkerDeploymentState(
 		state.Versions[version.DeploymentVersion.BuildId] = versionInfo
 	}
 
+	collectDrainingVersionBacklogs(ctx, client, deploymentHandler, state, k8sDeployments)
+
 	return state, nil
+}
+
+// backlogCollectionBudget bounds how long a single reconcile may spend
+// gathering draining-version backlogs. Backlog data is best-effort: when the
+// budget is exceeded the affected versions keep a nil (unknown) Backlog and
+// the planner conservatively leaves their replicas untouched until a later
+// reconcile succeeds.
+const backlogCollectionBudget = 2 * time.Second
+
+// collectDrainingVersionBacklogs fetches the approximate task backlog for
+// Draining versions so the planner can scale idle ones down to a single
+// poller. Fetches run in parallel under a shared time budget so they can
+// never stall the reconcile loop, and are skipped entirely for versions
+// whose deployment is already at <=1 replica (nothing to scale down).
+func collectDrainingVersionBacklogs(
+	ctx context.Context,
+	client temporalClient.Client,
+	deploymentHandler temporalClient.WorkerDeploymentHandle,
+	state *TemporalWorkerState,
+	k8sDeployments map[string]*appsv1.Deployment,
+) {
+	budgetCtx, cancel := context.WithTimeout(ctx, backlogCollectionBudget)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for buildID, versionInfo := range state.Versions {
+		if versionInfo.Status != temporaliov1alpha1.VersionStatusDraining {
+			continue
+		}
+		// Only relevant when there is something to scale down.
+		d, exists := k8sDeployments[buildID]
+		if !exists || d.Spec.Replicas == nil || *d.Spec.Replicas <= 1 {
+			continue
+		}
+
+		wg.Add(1)
+		go func(buildID string, vi *VersionInfo) {
+			defer wg.Done()
+			if backlog, err := getVersionBacklog(budgetCtx, client, deploymentHandler, buildID); err == nil {
+				vi.Backlog = &backlog
+			}
+		}(buildID, versionInfo)
+	}
+	wg.Wait()
 }
 
 func withBackoff(timeout time.Duration, tick time.Duration, fn func() error) error {
@@ -388,7 +426,11 @@ func getVersionBacklog(
 		if err != nil {
 			return 0, fmt.Errorf("unable to describe task queue %q: %w", tq.Name, err)
 		}
-		for _, versionInfo := range resp.VersionsInfo {
+		// VersionsInfo is deprecated in favor of VersioningInfo, but it is
+		// the only surface that exposes per-version TaskQueueStats
+		// (ApproximateBacklogCount) on this SDK version, and we query with
+		// an explicit version selection above.
+		for _, versionInfo := range resp.VersionsInfo { //nolint:staticcheck
 			for _, typeInfo := range versionInfo.TypesInfo {
 				if typeInfo.Stats != nil {
 					total += typeInfo.Stats.ApproximateBacklogCount
