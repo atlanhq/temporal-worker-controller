@@ -300,6 +300,17 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile per-version KEDA ScaledObjects (B2). This must run BEFORE
+	// generatePlan/executePlan: it sets the `keda-managed` label on
+	// Deployments that have a managed ScaledObject, which the planner reads
+	// to decide whether to skip spec.replicas writes.
+	if err := r.reconcileScaledObjects(ctx, l, &workerDeploy, temporalConnection.Spec.HostPort); err != nil {
+		// Don't block the rest of the reconcile on SO failures: the planner's
+		// existing fallback (write spec.replicas on unlabelled Deployments)
+		// keeps the system functional. Log and continue.
+		l.Error(err, "scaled-object reconcile failed; continuing with legacy path")
+	}
+
 	// Generate a plan to get to desired spec from current status
 	plan, err := r.generatePlan(ctx, l, &workerDeploy, temporalConnection.Spec, temporalState)
 	if err != nil {

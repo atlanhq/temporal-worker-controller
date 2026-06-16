@@ -84,6 +84,42 @@ type TemporalWorkerDeploymentSpec struct {
 
 	// WorkerOptions configures the worker's connection to Temporal.
 	WorkerOptions WorkerOptions `json:"workerOptions"`
+
+	// WorkerScaling configures per-version KEDA ScaledObject parameters for
+	// worker autoscaling. The controller creates one KEDA ScaledObject per
+	// active worker-deployment-version, each targeting only that version's
+	// child Deployment. Fields here flow through to each per-version SO.
+	//
+	// Defaults: all fields are optional. When unset, the corresponding field
+	// is omitted from the generated ScaledObject, falling back to KEDA's own
+	// defaults. Atlan deployments populate these via the Helm chart
+	// (atlanhq/atlan) and per-app atlan.yaml overrides; the controller itself
+	// does not hardcode defaults.
+	//
+	// +optional
+	WorkerScaling *WorkerScalingConfig `json:"workerScaling,omitempty"`
+}
+
+// WorkerScalingConfig holds the per-version KEDA scaling knobs that flow
+// through to each generated ScaledObject. Values are intentionally pointers
+// so the controller can distinguish "not set" from "explicit zero".
+type WorkerScalingConfig struct {
+	// MinReplicaCount sets MinReplicaCount on each per-version ScaledObject.
+	// Note: the controller still ensures Target/Ramping versions are pinned to
+	// at least 1 (regardless of this value) so Temporal can route new
+	// workflow executions to them on first launch — that's a correctness
+	// invariant, not a default.
+	// +optional
+	MinReplicaCount *int32 `json:"minReplicaCount,omitempty"`
+
+	// MaxReplicaCount sets MaxReplicaCount on each per-version ScaledObject.
+	// +optional
+	MaxReplicaCount *int32 `json:"maxReplicaCount,omitempty"`
+
+	// TargetQueueSize is the per-pod backlog target for the Temporal scaler.
+	// HPA computes: desiredReplicas = ceil(backlog / TargetQueueSize).
+	// +optional
+	TargetQueueSize *int32 `json:"targetQueueSize,omitempty"`
 }
 
 // VersionStatus indicates the status of a version.
