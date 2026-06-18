@@ -238,6 +238,16 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 ) error {
 	l = l.WithValues("phase", "scaledObjects")
 
+	// Step 0 — opt-out. When WorkerScaling is unset, the app has not opted
+	// into per-version SO management (the chart's `keda.enabled: false`
+	// path). Clean up anything we previously owned for this TWD, return
+	// scaling ownership to the planner (strip managed labels), and exit.
+	// Apps that previously had keda.enabled=true and now flip to false
+	// land here on the next reconcile.
+	if twd.Spec.WorkerScaling == nil {
+		return r.disablePerVersionScaling(ctx, l, twd)
+	}
+
 	// Step 1 — enumerate desired SOs from active versions.
 	versions := activeVersionsForScaling(&twd.Status)
 	desired := make(map[string]*unstructured.Unstructured, len(versions))
@@ -296,6 +306,40 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 		}
 	}
 
+	return nil
+}
+
+// disablePerVersionScaling is the opt-out path: clean up any SOs we previously
+// created for this TWD, strip the keda-managed label from child Deployments
+// (so the planner takes back replica control), and also remove any legacy
+// TWD-targeting SO. Called when twd.Spec.WorkerScaling is nil.
+func (r *TemporalWorkerDeploymentReconciler) disablePerVersionScaling(
+	ctx context.Context,
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+) error {
+	existing, err := r.listOwnedScaledObjects(ctx, twd)
+	if err != nil {
+		return fmt.Errorf("list scaled objects (disable path): %w", err)
+	}
+	for name, so := range existing {
+		buildID := so.GetLabels()[BuildIDLabel]
+		l.Info("disabling per-version scaling — deleting owned ScaledObject",
+			"name", name, "buildId", buildID)
+		// Strip the managed-by label so the planner is free to drive replicas.
+		if deployName, deployNS, ok := scaleTargetRef(so); ok {
+			if err := r.ensureDeploymentManagedLabel(ctx, deployNS, deployName, false); err != nil {
+				l.Error(err, "failed to remove managed label", "deployment", deployName)
+			}
+		}
+		if err := r.Delete(ctx, so); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete scaledobject %s: %w", name, err)
+		}
+	}
+	// Also handle the legacy SO if it's still around from before the bump.
+	if err := r.deleteLegacyTWDScaledObject(ctx, l, twd); err != nil {
+		l.Error(err, "failed to delete legacy TWD-targeting ScaledObject (disable path)")
+	}
 	return nil
 }
 
