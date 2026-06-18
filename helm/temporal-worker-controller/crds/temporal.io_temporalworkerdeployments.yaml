@@ -3961,6 +3961,60 @@ spec:
                 - connectionRef
                 - temporalNamespace
                 type: object
+              workerScaling:
+                properties:
+                  activationTargetQueueSize:
+                    format: int32
+                    type: integer
+                  advanced:
+                    x-kubernetes-preserve-unknown-fields: true
+                  cooldownPeriod:
+                    format: int32
+                    type: integer
+                  fallback:
+                    properties:
+                      behavior:
+                        type: string
+                      failureThreshold:
+                        format: int32
+                        type: integer
+                      replicas:
+                        format: int32
+                        type: integer
+                    type: object
+                  idleReplicaCount:
+                    format: int32
+                    type: integer
+                  includeRunningWorkflowCount:
+                    type: boolean
+                  initialCooldownPeriod:
+                    format: int32
+                    type: integer
+                  maxReplicaCount:
+                    format: int32
+                    type: integer
+                  minConnectTimeout:
+                    format: int32
+                    type: integer
+                  minReplicaCount:
+                    format: int32
+                    type: integer
+                  pollingInterval:
+                    format: int32
+                    type: integer
+                  queueTypes:
+                    items:
+                      type: string
+                    type: array
+                  targetQueueSize:
+                    format: int32
+                    type: integer
+                  workerMetricsPort:
+                    format: int32
+                    type: integer
+                  workflowTaskQueueForCount:
+                    type: string
+                type: object
             required:
             - rollout
             - sunset

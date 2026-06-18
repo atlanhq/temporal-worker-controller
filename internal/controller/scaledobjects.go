@@ -50,6 +50,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -445,16 +446,18 @@ func buildScaledObject(
 	// Resolve scaling config from TWD spec — no defaults hardcoded in the
 	// controller. Unset values are omitted from the SO so KEDA's own
 	// defaults apply.
+	//
+	// The controller sets endpoint/namespace/taskQueue/buildId on the trigger
+	// since those derive from the TWD context. All other Temporal-scaler
+	// metadata flows through from twd.Spec.WorkerScaling. KEDA expects all
+	// triggerMetadata values as strings.
 	triggerMetadata := map[string]interface{}{
-		"endpoint":                    temporalEndpoint,
-		"namespace":                   twd.Spec.WorkerOptions.TemporalNamespace,
-		"taskQueue":                   resolveTaskQueue(twd),
-		"buildId":                     v.BuildID,
-		"includeRunningWorkflowCount": "true",
+		"endpoint":  temporalEndpoint,
+		"namespace": twd.Spec.WorkerOptions.TemporalNamespace,
+		"taskQueue": resolveTaskQueue(twd),
+		"buildId":   v.BuildID,
 	}
-	if tqs, ok := resolveTargetQueueSize(twd); ok {
-		triggerMetadata["targetQueueSize"] = tqs
-	}
+	setTriggerMetadata(triggerMetadata, twd)
 
 	spec := map[string]interface{}{
 		"scaleTargetRef": map[string]interface{}{
@@ -475,9 +478,87 @@ func buildScaledObject(
 	if maxR, ok := resolveMaxReplicas(twd); ok {
 		spec["maxReplicaCount"] = maxR
 	}
+	setScaledObjectSpec(spec, twd)
 
 	_ = unstructured.SetNestedField(so.Object, spec, "spec")
 	return so
+}
+
+// setTriggerMetadata writes the optional Temporal-scaler triggerMetadata
+// fields from twd.Spec.WorkerScaling into m. Fields are omitted when unset
+// so the KEDA scaler's own defaults apply. KEDA expects all triggerMetadata
+// values to be strings.
+func setTriggerMetadata(m map[string]interface{}, twd *temporaliov1alpha1.TemporalWorkerDeployment) {
+	ws := twd.Spec.WorkerScaling
+	if ws == nil {
+		return
+	}
+	if ws.TargetQueueSize != nil {
+		m["targetQueueSize"] = strconv.FormatInt(int64(*ws.TargetQueueSize), 10)
+	}
+	if ws.ActivationTargetQueueSize != nil {
+		m["activationTargetQueueSize"] = strconv.FormatInt(int64(*ws.ActivationTargetQueueSize), 10)
+	}
+	if len(ws.QueueTypes) > 0 {
+		m["queueTypes"] = strings.Join(ws.QueueTypes, ",")
+	}
+	if ws.IncludeRunningWorkflowCount != nil {
+		m["includeRunningWorkflowCount"] = strconv.FormatBool(*ws.IncludeRunningWorkflowCount)
+	}
+	if ws.WorkflowTaskQueueForCount != "" {
+		m["workflowTaskQueueForCount"] = ws.WorkflowTaskQueueForCount
+	}
+	if ws.WorkerMetricsPort != nil {
+		m["workerMetricsPort"] = strconv.FormatInt(int64(*ws.WorkerMetricsPort), 10)
+	}
+	if ws.MinConnectTimeout != nil {
+		m["minConnectTimeout"] = strconv.FormatInt(int64(*ws.MinConnectTimeout), 10)
+	}
+}
+
+// setScaledObjectSpec writes the optional ScaledObject-level fields (other
+// than min/max which the caller already handled) from twd.Spec.WorkerScaling
+// into spec. Fields are omitted when unset so KEDA's own defaults apply.
+func setScaledObjectSpec(spec map[string]interface{}, twd *temporaliov1alpha1.TemporalWorkerDeployment) {
+	ws := twd.Spec.WorkerScaling
+	if ws == nil {
+		return
+	}
+	if ws.IdleReplicaCount != nil {
+		spec["idleReplicaCount"] = int64(*ws.IdleReplicaCount)
+	}
+	if ws.PollingInterval != nil {
+		spec["pollingInterval"] = int64(*ws.PollingInterval)
+	}
+	if ws.CooldownPeriod != nil {
+		spec["cooldownPeriod"] = int64(*ws.CooldownPeriod)
+	}
+	if ws.InitialCooldownPeriod != nil {
+		spec["initialCooldownPeriod"] = int64(*ws.InitialCooldownPeriod)
+	}
+	if ws.Fallback != nil {
+		fb := map[string]interface{}{}
+		if ws.Fallback.FailureThreshold != nil {
+			fb["failureThreshold"] = int64(*ws.Fallback.FailureThreshold)
+		}
+		if ws.Fallback.Replicas != nil {
+			fb["replicas"] = int64(*ws.Fallback.Replicas)
+		}
+		if ws.Fallback.Behavior != "" {
+			fb["behavior"] = ws.Fallback.Behavior
+		}
+		if len(fb) > 0 {
+			spec["fallback"] = fb
+		}
+	}
+	if ws.Advanced != nil && len(ws.Advanced.Raw) > 0 {
+		var adv map[string]interface{}
+		// If the raw JSON is malformed, fall back to omitting — the CRD
+		// validator should reject this earlier in practice.
+		if err := json.Unmarshal(ws.Advanced.Raw, &adv); err == nil && len(adv) > 0 {
+			spec["advanced"] = adv
+		}
+	}
 }
 
 // resolveTaskQueue returns the task queue name to register on the trigger.

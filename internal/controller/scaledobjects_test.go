@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 )
@@ -346,14 +347,16 @@ func TestBuildScaledObject_ShapeAndFields(t *testing.T) {
 	assert.Equal(t, "default", meta["namespace"])
 	assert.Equal(t, "main-f085195", meta["buildId"])
 	assert.Equal(t, "5", meta["targetQueueSize"])
-	assert.Equal(t, "true", meta["includeRunningWorkflowCount"])
 	assert.Equal(t, "publish-app:publish", meta["taskQueue"])
+	// includeRunningWorkflowCount is omitted when unset — KEDA's own default (true) applies.
+	_, hasIRWC := meta["includeRunningWorkflowCount"]
+	assert.False(t, hasIRWC, "includeRunningWorkflowCount should be omitted when unset")
 }
 
 func TestBuildScaledObject_OmitsUnsetFields(t *testing.T) {
-	// No WorkerScaling at all → SO omits minReplicaCount, maxReplicaCount,
-	// targetQueueSize entirely so KEDA's own defaults apply. Current-status
-	// version has no warm-start floor, so min is also omitted.
+	// No WorkerScaling at all → SO omits every optional field so KEDA's own
+	// defaults apply. Current-status version has no warm-start floor, so min
+	// is also omitted.
 	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
 		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
@@ -369,15 +372,153 @@ func TestBuildScaledObject_OmitsUnsetFields(t *testing.T) {
 	so := buildScaledObject(twd, v, "temporal:7233")
 	spec := so.Object["spec"].(map[string]interface{})
 
-	_, hasMin := spec["minReplicaCount"]
-	_, hasMax := spec["maxReplicaCount"]
-	assert.False(t, hasMin, "minReplicaCount should be omitted when unset")
-	assert.False(t, hasMax, "maxReplicaCount should be omitted when unset")
+	// Every optional ScaledObject-level field is absent.
+	for _, k := range []string{
+		"minReplicaCount", "maxReplicaCount", "idleReplicaCount",
+		"pollingInterval", "cooldownPeriod", "initialCooldownPeriod",
+		"fallback", "advanced",
+	} {
+		_, has := spec[k]
+		assert.False(t, has, "spec.%s should be omitted when unset", k)
+	}
 
+	// Every optional trigger metadata field is absent.
 	trigger := spec["triggers"].([]interface{})[0].(map[string]interface{})
 	meta := trigger["metadata"].(map[string]interface{})
-	_, hasTQS := meta["targetQueueSize"]
-	assert.False(t, hasTQS, "targetQueueSize should be omitted when unset")
+	for _, k := range []string{
+		"targetQueueSize", "activationTargetQueueSize", "queueTypes",
+		"includeRunningWorkflowCount", "workflowTaskQueueForCount",
+		"workerMetricsPort", "minConnectTimeout",
+	} {
+		_, has := meta[k]
+		assert.False(t, has, "trigger.metadata.%s should be omitted when unset", k)
+	}
+}
+
+func TestBuildScaledObject_FullScalingConfig(t *testing.T) {
+	// Every field on WorkerScalingConfig (and ScalingFallback) flows through
+	// to the generated SO. Confirms Tianchu's review #3 expansion is wired up
+	// end-to-end. RawExtension Advanced block tested separately below.
+	int32Ptr := func(v int32) *int32 { return &v }
+	boolPtr := func(v bool) *bool { return &v }
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "publish", Namespace: "publish-app"},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+				MinReplicaCount:             int32Ptr(2),
+				MaxReplicaCount:             int32Ptr(10),
+				IdleReplicaCount:            int32Ptr(1),
+				PollingInterval:             int32Ptr(30),
+				CooldownPeriod:              int32Ptr(300),
+				InitialCooldownPeriod:       int32Ptr(60),
+				TargetQueueSize:             int32Ptr(5),
+				ActivationTargetQueueSize:   int32Ptr(1),
+				QueueTypes:                  []string{"workflow", "activity"},
+				IncludeRunningWorkflowCount: boolPtr(false),
+				WorkflowTaskQueueForCount:   "custom-wf-tq",
+				WorkerMetricsPort:           int32Ptr(9464),
+				MinConnectTimeout:           int32Ptr(10),
+				Fallback: &temporaliov1alpha1.ScalingFallback{
+					FailureThreshold: int32Ptr(3),
+					Replicas:         int32Ptr(2),
+					Behavior:         "static",
+				},
+			},
+		},
+	}
+	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+	v := versionRef{
+		BuildID:    "v1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "publish-worker-twd-v1", Namespace: "publish-app"},
+	}
+	so := buildScaledObject(twd, v, "temporal:7233")
+	spec := so.Object["spec"].(map[string]interface{})
+
+	// ScaledObject-level
+	assert.EqualValues(t, 2, spec["minReplicaCount"])
+	assert.EqualValues(t, 10, spec["maxReplicaCount"])
+	assert.EqualValues(t, 1, spec["idleReplicaCount"])
+	assert.EqualValues(t, 30, spec["pollingInterval"])
+	assert.EqualValues(t, 300, spec["cooldownPeriod"])
+	assert.EqualValues(t, 60, spec["initialCooldownPeriod"])
+
+	fb := spec["fallback"].(map[string]interface{})
+	assert.EqualValues(t, 3, fb["failureThreshold"])
+	assert.EqualValues(t, 2, fb["replicas"])
+	assert.Equal(t, "static", fb["behavior"])
+
+	// Trigger metadata — all values are strings per KEDA convention.
+	meta := spec["triggers"].([]interface{})[0].(map[string]interface{})["metadata"].(map[string]interface{})
+	assert.Equal(t, "5", meta["targetQueueSize"])
+	assert.Equal(t, "1", meta["activationTargetQueueSize"])
+	assert.Equal(t, "workflow,activity", meta["queueTypes"])
+	assert.Equal(t, "false", meta["includeRunningWorkflowCount"])
+	assert.Equal(t, "custom-wf-tq", meta["workflowTaskQueueForCount"])
+	assert.Equal(t, "9464", meta["workerMetricsPort"])
+	assert.Equal(t, "10", meta["minConnectTimeout"])
+}
+
+func TestBuildScaledObject_AdvancedRawExtensionPassthrough(t *testing.T) {
+	// The Advanced block is forwarded verbatim as parsed JSON. Used to set
+	// HPA behavior tuning without bumping the CRD.
+	advRaw := []byte(`{"horizontalPodAutoscalerConfig":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":120}}}}`)
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+				Advanced: &runtime.RawExtension{Raw: advRaw},
+			},
+		},
+	}
+	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+	v := versionRef{
+		BuildID:    "v1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "foo-worker-twd-v1", Namespace: "ns"},
+	}
+	so := buildScaledObject(twd, v, "temporal:7233")
+	spec := so.Object["spec"].(map[string]interface{})
+
+	adv, ok := spec["advanced"].(map[string]interface{})
+	assert.True(t, ok, "advanced block should be set")
+	hpa := adv["horizontalPodAutoscalerConfig"].(map[string]interface{})
+	behavior := hpa["behavior"].(map[string]interface{})
+	scaleDown := behavior["scaleDown"].(map[string]interface{})
+	assert.EqualValues(t, 120, scaleDown["stabilizationWindowSeconds"])
+}
+
+func TestBuildScaledObject_FallbackPartialFields(t *testing.T) {
+	// Setting only FailureThreshold + Replicas (no Behavior) yields a
+	// fallback block without the behavior key.
+	int32Ptr := func(v int32) *int32 { return &v }
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+				Fallback: &temporaliov1alpha1.ScalingFallback{
+					FailureThreshold: int32Ptr(5),
+					Replicas:         int32Ptr(1),
+				},
+			},
+		},
+	}
+	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+	v := versionRef{
+		BuildID:    "v1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "foo-worker-twd-v1", Namespace: "ns"},
+	}
+	so := buildScaledObject(twd, v, "temporal:7233")
+	spec := so.Object["spec"].(map[string]interface{})
+	fb := spec["fallback"].(map[string]interface{})
+	assert.EqualValues(t, 5, fb["failureThreshold"])
+	assert.EqualValues(t, 1, fb["replicas"])
+	_, hasBehavior := fb["behavior"]
+	assert.False(t, hasBehavior, "behavior should be omitted when unset")
 }
 
 func TestBuildScaledObject_RampingWithoutConfig_StillWarmStarts(t *testing.T) {
