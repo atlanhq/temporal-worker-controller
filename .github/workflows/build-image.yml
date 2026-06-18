@@ -4,6 +4,7 @@ on:
     branches:
     - v1.2.0-atlan
     - fix/twd-leaves-stale-versioning-data
+    - sanil/per-version-scaledobjects
 jobs:
   build-image:
     runs-on: ubuntu-latest
