@@ -57,6 +57,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -65,8 +66,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 )
 
 // --- Constants ----------------------------------------------------------------
