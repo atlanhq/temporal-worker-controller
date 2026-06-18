@@ -270,25 +270,8 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			l.Error(err, "failed to label Deployment as managed", "deployment", v.Deployment.Name)
 			// continue — best effort
 		}
-
-		got, ok := existing[name]
-		if !ok {
-			l.Info("creating ScaledObject", "name", name, "buildId", v.BuildID)
-			if err := r.Create(ctx, want); err != nil && !apierrors.IsAlreadyExists(err) {
-				return fmt.Errorf("create scaledobject %s: %w", name, err)
-			}
-			continue
-		}
-
-		if soSpecEqual(got, want) {
-			continue
-		}
-		// Patch the spec/labels to match desired; preserve resourceVersion to
-		// avoid stale-write conflicts.
-		want.SetResourceVersion(got.GetResourceVersion())
-		l.Info("updating ScaledObject", "name", name, "buildId", v.BuildID)
-		if err := r.Update(ctx, want); err != nil {
-			return fmt.Errorf("update scaledobject %s: %w", name, err)
+		if err := r.applyDesiredScaledObject(ctx, l, name, want, existing[name], v); err != nil {
+			return err
 		}
 	}
 
@@ -558,6 +541,36 @@ func setScaledObjectSpec(spec map[string]interface{}, twd *temporaliov1alpha1.Te
 			spec["advanced"] = adv
 		}
 	}
+}
+
+// applyDesiredScaledObject creates a missing SO or patches an existing one to
+// match `want`. Pre-existing SOs whose spec already matches are a no-op.
+// Caller passes `got` (may be nil) from the existing-SOs map.
+func (r *TemporalWorkerDeploymentReconciler) applyDesiredScaledObject(
+	ctx context.Context,
+	l logr.Logger,
+	name string,
+	want, got *unstructured.Unstructured,
+	v versionRef,
+) error {
+	if got == nil {
+		l.Info("creating ScaledObject", "name", name, "buildId", v.BuildID)
+		if err := r.Create(ctx, want); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create scaledobject %s: %w", name, err)
+		}
+		return nil
+	}
+	if soSpecEqual(got, want) {
+		return nil
+	}
+	// Patch the spec/labels to match desired; preserve resourceVersion to
+	// avoid stale-write conflicts.
+	want.SetResourceVersion(got.GetResourceVersion())
+	l.Info("updating ScaledObject", "name", name, "buildId", v.BuildID)
+	if err := r.Update(ctx, want); err != nil {
+		return fmt.Errorf("update scaledobject %s: %w", name, err)
+	}
+	return nil
 }
 
 // resolveTaskQueue returns the task queue name to register on the trigger.
