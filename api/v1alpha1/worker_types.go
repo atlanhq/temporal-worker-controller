@@ -168,6 +168,13 @@ type WorkerScalingConfig struct {
 	// +kubebuilder:validation:Schemaless
 	Advanced *runtime.RawExtension `json:"advanced,omitempty"`
 
+	// TaskQueue is the actual Temporal task queue workers poll. Defaults to the
+	// chart-rendered `atlan-<app>-<deploymentName>` formula. Required: the
+	// controller cannot derive this from TWD spec alone (the worker-deployment-
+	// name `<namespace>:<twd-name>` is NOT the same as the task queue).
+	// +optional
+	TaskQueue string `json:"taskQueue,omitempty"`
+
 	// TargetQueueSize is the per-pod backlog target for the Temporal scaler.
 	// HPA computes: desiredReplicas = ceil(backlog / TargetQueueSize).
 	// Maps to the Temporal scaler's triggerMetadata.targetQueueSize.

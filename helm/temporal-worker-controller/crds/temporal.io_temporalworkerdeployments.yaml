@@ -4009,6 +4009,8 @@ spec:
                   targetQueueSize:
                     format: int32
                     type: integer
+                  taskQueue:
+                    type: string
                   workerMetricsPort:
                     format: int32
                     type: integer

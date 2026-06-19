@@ -291,6 +291,7 @@ func TestBuildScaledObject_ShapeAndFields(t *testing.T) {
 				MinReplicaCount: int32Ptr(0),
 				MaxReplicaCount: int32Ptr(7),
 				TargetQueueSize: int32Ptr(5),
+				TaskQueue:       "atlan-publish-production",
 			},
 		},
 	}
@@ -346,7 +347,8 @@ func TestBuildScaledObject_ShapeAndFields(t *testing.T) {
 	assert.Equal(t, "default", meta["namespace"])
 	assert.Equal(t, "main-f085195", meta["buildId"])
 	assert.Equal(t, "5", meta["targetQueueSize"])
-	assert.Equal(t, "publish-app:publish", meta["taskQueue"])
+	assert.Equal(t, "atlan-publish-production", meta["taskQueue"])
+	assert.Equal(t, "publish-app/publish", meta["workerDeployment"])
 	// includeRunningWorkflowCount is omitted when unset — KEDA's own default (true) applies.
 	_, hasIRWC := meta["includeRunningWorkflowCount"]
 	assert.False(t, hasIRWC, "includeRunningWorkflowCount should be omitted when unset")

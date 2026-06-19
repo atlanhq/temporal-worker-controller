@@ -478,10 +478,11 @@ func buildScaledObject(
 	// metadata flows through from twd.Spec.WorkerScaling. KEDA expects all
 	// triggerMetadata values as strings.
 	triggerMetadata := map[string]interface{}{
-		"endpoint":  temporalEndpoint,
-		"namespace": twd.Spec.WorkerOptions.TemporalNamespace,
-		"taskQueue": resolveTaskQueue(twd),
-		"buildId":   v.BuildID,
+		"endpoint":         temporalEndpoint,
+		"namespace":        twd.Spec.WorkerOptions.TemporalNamespace,
+		"taskQueue":        resolveTaskQueue(twd),
+		"buildId":          v.BuildID,
+		"workerDeployment": resolveWorkerDeployment(twd),
 	}
 	setTriggerMetadata(triggerMetadata, twd)
 
@@ -617,12 +618,27 @@ func (r *TemporalWorkerDeploymentReconciler) applyDesiredScaledObject(
 	return nil
 }
 
-// resolveTaskQueue returns the task queue name to register on the trigger.
-// Matches the convention used elsewhere in the controller: the "worker
-// deployment name" computed by k8s.ComputeWorkerDeploymentName, which is
-// "<namespace>:<name>". The Temporal worker registers on this task queue.
+// resolveTaskQueue returns the actual Temporal task queue name workers poll.
+// Reads from twd.Spec.WorkerScaling.TaskQueue (chart-populated). Returns ""
+// if unset — caller may choose to omit the trigger metadata field, which
+// would make the SO non-functional. The previous implementation returned
+// "<namespace>:<name>" (the worker-deployment-name, NOT a task queue),
+// which made the SO query the wrong attribute and never see backlog.
 func resolveTaskQueue(twd *temporaliov1alpha1.TemporalWorkerDeployment) string {
-	return twd.Namespace + ":" + twd.Name
+	if twd.Spec.WorkerScaling != nil && twd.Spec.WorkerScaling.TaskQueue != "" {
+		return twd.Spec.WorkerScaling.TaskQueue
+	}
+	return ""
+}
+
+// resolveWorkerDeployment returns the Temporal worker-deployment-name for use
+// in the trigger metadata. The KEDA Temporal scaler combines this with
+// buildId to query "TemporalWorkerDeploymentVersion = '<dep>:<bid>'" — the
+// canonical, non-deprecated way to count workflows pinned to / assigned to
+// a specific version. Format is "<namespace>/<twd-name>" matching the
+// TEMPORAL_DEPLOYMENT_NAME env on worker pods.
+func resolveWorkerDeployment(twd *temporaliov1alpha1.TemporalWorkerDeployment) string {
+	return twd.Namespace + "/" + twd.Name
 }
 
 // --- Helpers ------------------------------------------------------------------
