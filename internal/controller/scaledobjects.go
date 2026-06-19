@@ -484,6 +484,20 @@ func buildScaledObject(
 		"buildId":          v.BuildID,
 		"workerDeployment": resolveWorkerDeployment(twd),
 	}
+	// Current version catches unassigned backlog so it can scale from zero.
+	// In Temporal's worker-deployment-versioning model, newly-queued workflows
+	// have no version search attribute until a worker picks them up — per-build
+	// scoped queries (TaskQueueVersionSelection.BuildIDs / TemporalWorker
+	// DeploymentVersion) return 0 for them. Setting selectAllActive +
+	// selectUnversioned on the Current version's SO routes its
+	// DescribeTaskQueueEnhanced query through the all-active + unversioned
+	// buckets so it sees those unassigned workflows and can wake up a worker.
+	// Other versions stay per-build-scoped — Drained/Deprecated versions only
+	// see workflows already pinned to them, which is the correct behavior.
+	if v.Status == temporaliov1alpha1.VersionStatusCurrent {
+		triggerMetadata["selectAllActive"] = "true"
+		triggerMetadata["selectUnversioned"] = "true"
+	}
 	setTriggerMetadata(triggerMetadata, twd)
 
 	spec := map[string]interface{}{

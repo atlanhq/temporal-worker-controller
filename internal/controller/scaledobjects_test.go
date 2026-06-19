@@ -13,6 +13,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -541,6 +542,57 @@ func TestBuildScaledObject_RampingWithoutConfig_StillWarmStarts(t *testing.T) {
 	spec := so.Object["spec"].(map[string]interface{})
 	assert.EqualValues(t, 1, spec["minReplicaCount"],
 		"ramping versions must be pinned to at least 1 to receive new workflows")
+}
+
+func TestBuildScaledObject_CurrentVersionCatchesUnassignedBacklog(t *testing.T) {
+	// Current version's SO must set selectAllActive + selectUnversioned so its
+	// DescribeTaskQueueEnhanced query catches workflows that arrived but
+	// haven't been assigned to any worker yet (the from-zero scale-up case
+	// in Temporal's worker-deployment-versioning model — newly-queued
+	// workflows have no version search attribute until a worker picks them
+	// up). Other version statuses stay per-build-scoped.
+	mk := func(status temporaliov1alpha1.VersionStatus) *unstructured.Unstructured {
+		twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
+			Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
+				WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+					TaskQueue: "atlan-foo-production",
+				},
+			},
+		}
+		twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+		v := versionRef{
+			BuildID:    "v1",
+			Status:     status,
+			Deployment: &corev1.ObjectReference{Name: "foo-worker-twd-v1", Namespace: "ns"},
+		}
+		return buildScaledObject(twd, v, "temporal:7233")
+	}
+
+	cases := []struct {
+		name        string
+		status      temporaliov1alpha1.VersionStatus
+		wantAllActv bool
+		wantUnvrsnd bool
+	}{
+		{"Current — must catch unassigned", temporaliov1alpha1.VersionStatusCurrent, true, true},
+		{"Ramping — per-build scoped", temporaliov1alpha1.VersionStatusRamping, false, false},
+		{"Inactive — per-build scoped", temporaliov1alpha1.VersionStatusInactive, false, false},
+		{"Draining — per-build scoped", temporaliov1alpha1.VersionStatusDraining, false, false},
+		{"NotRegistered — per-build scoped", temporaliov1alpha1.VersionStatusNotRegistered, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			so := mk(tc.status)
+			spec := so.Object["spec"].(map[string]interface{})
+			meta := spec["triggers"].([]interface{})[0].(map[string]interface{})["metadata"].(map[string]interface{})
+			gotAllActv := meta["selectAllActive"] == "true"
+			gotUnvrsnd := meta["selectUnversioned"] == "true"
+			assert.Equal(t, tc.wantAllActv, gotAllActv, "selectAllActive for status %s", tc.status)
+			assert.Equal(t, tc.wantUnvrsnd, gotUnvrsnd, "selectUnversioned for status %s", tc.status)
+		})
+	}
 }
 
 func TestSOSpecEqual(t *testing.T) {
