@@ -86,12 +86,11 @@ func (m *stateMapper) mapCurrentWorkerDeploymentVersionByBuildID(buildID string)
 	}
 
 	// Set deployment reference if it exists
-	if deployment, exists := m.k8sState.Deployments[buildID]; exists {
+	if _, exists := m.k8sState.Deployments[buildID]; exists {
 		version.Deployment = m.k8sState.DeploymentRefs[buildID]
 
-		// Check deployment health
-		healthy, healthySince := k8s.IsDeploymentHealthy(deployment)
-		if healthy {
+		// A version is healthy only when ALL of its pool Deployments are healthy.
+		if healthySince := m.versionHealthySince(buildID); healthySince != nil {
 			version.HealthySince = healthySince
 		}
 	}
@@ -105,6 +104,28 @@ func (m *stateMapper) mapCurrentWorkerDeploymentVersionByBuildID(buildID string)
 	}
 
 	return version
+}
+
+// versionHealthySince aggregates pool-level health for a build: the version is
+// healthy only when EVERY pool Deployment is healthy, and the returned time is
+// the latest pool's HealthySince (the moment the whole version became ready).
+// Returns nil if the version has no Deployments or any pool is unhealthy.
+func (m *stateMapper) versionHealthySince(buildID string) *metav1.Time {
+	poolDeployments := m.k8sState.PoolDeployments(buildID)
+	if len(poolDeployments) == 0 {
+		return nil
+	}
+	var latest *metav1.Time
+	for _, d := range poolDeployments {
+		healthy, healthySince := k8s.IsDeploymentHealthy(d)
+		if !healthy {
+			return nil
+		}
+		if latest == nil || (healthySince != nil && healthySince.After(latest.Time)) {
+			latest = healthySince
+		}
+	}
+	return latest
 }
 
 // mapTargetWorkerDeploymentVersionByBuildID creates a target version status from the states using buildID
@@ -121,12 +142,11 @@ func (m *stateMapper) mapTargetWorkerDeploymentVersionByBuildID(buildID string) 
 	}
 
 	// Set deployment reference if it exists
-	if deployment, exists := m.k8sState.Deployments[buildID]; exists {
+	if _, exists := m.k8sState.Deployments[buildID]; exists {
 		version.Deployment = m.k8sState.DeploymentRefs[buildID]
 
-		// Check deployment health
-		healthy, healthySince := k8s.IsDeploymentHealthy(deployment)
-		if healthy {
+		// A version is healthy only when ALL of its pool Deployments are healthy.
+		if healthySince := m.versionHealthySince(buildID); healthySince != nil {
 			version.HealthySince = healthySince
 		}
 	}
@@ -171,12 +191,11 @@ func (m *stateMapper) mapDeprecatedWorkerDeploymentVersionByBuildID(buildID stri
 	}
 
 	// Set deployment reference if it exists
-	if deployment, exists := m.k8sState.Deployments[buildID]; exists {
+	if _, exists := m.k8sState.Deployments[buildID]; exists {
 		version.Deployment = m.k8sState.DeploymentRefs[buildID]
 
-		// Check deployment health
-		healthy, healthySince := k8s.IsDeploymentHealthy(deployment)
-		if healthy {
+		// A version is healthy only when ALL of its pool Deployments are healthy.
+		if healthySince := m.versionHealthySince(buildID); healthySince != nil {
 			version.HealthySince = healthySince
 		}
 	}

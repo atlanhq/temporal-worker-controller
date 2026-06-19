@@ -28,7 +28,11 @@ import (
 const (
 	DeployOwnerKey = ".metadata.controller"
 	// BuildIDLabel is the label that identifies the build ID for a deployment
-	BuildIDLabel                  = "temporal.io/build-id"
+	BuildIDLabel = "temporal.io/build-id"
+	// PoolLabel identifies which pool a managed Deployment belongs to. For
+	// single-pool (no spec.pools) TemporalWorkerDeployments this label is absent,
+	// preserving byte-identical behavior with pre-pools deployments.
+	PoolLabel                     = "temporal.io/pool"
 	twdNameLabel                  = "temporal.io/deployment-name"
 	WorkerDeploymentNameSeparator = "/"
 	ResourceNameSeparator         = "-"
@@ -39,13 +43,47 @@ const (
 
 // DeploymentState represents the Kubernetes state of all deployments for a temporal worker deployment
 type DeploymentState struct {
-	// Map of buildID to deployment
+	// Map of buildID to deployment.
+	//
+	// For single-pool deployments this is the (only) Deployment for the build.
+	// For multi-pool deployments this points at the build's "primary" pool
+	// Deployment (the first pool by sorted name) so that all the existing
+	// single-pool code paths (status refs, scaling, deletion) keep working;
+	// the full per-pool set lives in DeploymentsByVersionPool.
 	Deployments map[string]*appsv1.Deployment
 	// Sorted deployments by creation time
 	DeploymentsByTime []*appsv1.Deployment
-	// Map of buildID to deployment references
+	// Map of buildID to deployment references (primary pool, see above)
 	DeploymentRefs map[string]*corev1.ObjectReference
+	// DeploymentsByVersionPool maps buildID -> poolName -> Deployment for every
+	// managed Deployment, across all pools of a version. For single-pool
+	// deployments there is exactly one entry per build keyed by the empty pool
+	// name "".
+	DeploymentsByVersionPool map[string]map[string]*appsv1.Deployment
 }
+
+// PoolDeployments returns all Deployments for the given buildID across pools,
+// keyed by pool name (empty string == implicit single pool).
+//
+// It is safe to call when the build is unknown (returns nil). As a robustness
+// fallback (e.g. for hand-constructed DeploymentState in tests that only set
+// Deployments), if the per-pool map has no entry for the build but the flat
+// Deployments map does, it synthesizes a single implicit-pool entry.
+func (s *DeploymentState) PoolDeployments(buildID string) map[string]*appsv1.Deployment {
+	if s == nil {
+		return nil
+	}
+	if byPool, ok := s.DeploymentsByVersionPool[buildID]; ok && len(byPool) > 0 {
+		return byPool
+	}
+	if d, ok := s.Deployments[buildID]; ok {
+		return map[string]*appsv1.Deployment{ImplicitPoolNameKey: d}
+	}
+	return nil
+}
+
+// ImplicitPoolNameKey is the per-pool map key used for the single implicit pool.
+const ImplicitPoolNameKey = ""
 
 // GetDeploymentState queries Kubernetes to get the state of all deployments
 // associated with a TemporalWorkerDeployment
@@ -57,9 +95,10 @@ func GetDeploymentState(
 	workerDeploymentName string,
 ) (*DeploymentState, error) {
 	state := &DeploymentState{
-		Deployments:       make(map[string]*appsv1.Deployment),
-		DeploymentsByTime: []*appsv1.Deployment{},
-		DeploymentRefs:    make(map[string]*corev1.ObjectReference),
+		Deployments:              make(map[string]*appsv1.Deployment),
+		DeploymentsByTime:        []*appsv1.Deployment{},
+		DeploymentRefs:           make(map[string]*corev1.ObjectReference),
+		DeploymentsByVersionPool: make(map[string]map[string]*appsv1.Deployment),
 	}
 
 	// List k8s deployments that correspond to managed worker deployment versions
@@ -78,18 +117,50 @@ func GetDeploymentState(
 		return childDeploys.Items[i].ObjectMeta.CreationTimestamp.Before(&childDeploys.Items[j].ObjectMeta.CreationTimestamp)
 	})
 
-	// Track each k8s deployment by build ID
+	// Track each k8s deployment by build ID and pool.
 	for i := range childDeploys.Items {
 		deploy := &childDeploys.Items[i]
-		if buildID, ok := deploy.GetLabels()[BuildIDLabel]; ok {
-			state.Deployments[buildID] = deploy
-			state.DeploymentsByTime = append(state.DeploymentsByTime, deploy)
-			state.DeploymentRefs[buildID] = NewObjectRef(deploy)
+		buildID, ok := deploy.GetLabels()[BuildIDLabel]
+		if !ok {
+			// Any deployments without the build ID label are ignored
+			continue
 		}
-		// Any deployments without the build ID label are ignored
+		state.DeploymentsByTime = append(state.DeploymentsByTime, deploy)
+
+		// Pool name is empty ("") for single-pool (pre-pools) deployments.
+		poolName := deploy.GetLabels()[PoolLabel]
+		if state.DeploymentsByVersionPool[buildID] == nil {
+			state.DeploymentsByVersionPool[buildID] = make(map[string]*appsv1.Deployment)
+		}
+		state.DeploymentsByVersionPool[buildID][poolName] = deploy
+	}
+
+	// Choose a deterministic "primary" pool Deployment per build for the
+	// single-pool-shaped maps consumed by status/scale/delete code. For
+	// single-pool deployments this is simply the only Deployment.
+	for buildID, byPool := range state.DeploymentsByVersionPool {
+		primary := primaryPoolDeployment(byPool)
+		if primary != nil {
+			state.Deployments[buildID] = primary
+			state.DeploymentRefs[buildID] = NewObjectRef(primary)
+		}
 	}
 
 	return state, nil
+}
+
+// primaryPoolDeployment returns a deterministic Deployment from a build's
+// per-pool map: the one whose pool name sorts first.
+func primaryPoolDeployment(byPool map[string]*appsv1.Deployment) *appsv1.Deployment {
+	if len(byPool) == 0 {
+		return nil
+	}
+	poolNames := make([]string, 0, len(byPool))
+	for name := range byPool {
+		poolNames = append(poolNames, name)
+	}
+	sort.Strings(poolNames)
+	return byPool[poolNames[0]]
 }
 
 // IsDeploymentHealthy checks if a deployment is in the "Available" state
@@ -141,9 +212,79 @@ func ComputeWorkerDeploymentName(w *temporaliov1alpha1.TemporalWorkerDeployment)
 	return w.GetNamespace() + WorkerDeploymentNameSeparator + w.GetName()
 }
 
-// ComputeVersionedDeploymentName generates a name for a versioned deployment
+// ComputeVersionedDeploymentName generates a name for a versioned deployment.
+// This is the single-pool name and is unchanged from pre-pools behavior.
 func ComputeVersionedDeploymentName(baseName, buildID string) string {
 	return CleanStringForDNS(baseName + ResourceNameSeparator + buildID)
+}
+
+// ComputeVersionedPoolDeploymentName generates the k8s Deployment name for a
+// (version, pool) pair. For the implicit pool (poolName == "") it returns
+// exactly ComputeVersionedDeploymentName so single-pool deployment names are
+// byte-identical to pre-pools behavior.
+func ComputeVersionedPoolDeploymentName(baseName, buildID, poolName string) string {
+	if poolName == temporaliov1alpha1.ImplicitPoolName {
+		return ComputeVersionedDeploymentName(baseName, buildID)
+	}
+	return CleanStringForDNS(baseName + ResourceNameSeparator + buildID + ResourceNameSeparator + poolName)
+}
+
+// ResolvePoolByName returns the PoolSpec with the given name from the spec's
+// effective pools. If poolName is not found (e.g. a pool removed from spec but
+// still present in k8s), it returns a PoolSpec with just that name so callers
+// still get deterministic behavior.
+func ResolvePoolByName(spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec, poolName string) temporaliov1alpha1.PoolSpec {
+	for _, p := range spec.EffectivePools() {
+		if p.Name == poolName {
+			return p
+		}
+	}
+	return temporaliov1alpha1.PoolSpec{Name: poolName}
+}
+
+// ApplyPoolPodSpecModifications applies a pool's placement/sizing overrides and
+// then the controller-managed env/volumes (including the pool task queue) to a
+// pod spec in place. It is the update-path equivalent of NewDeploymentForPool's
+// pod-spec construction.
+func ApplyPoolPodSpecModifications(
+	podSpec *corev1.PodSpec,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	temporalNamespace string,
+	workerDeploymentName string,
+	buildID string,
+	pool temporaliov1alpha1.PoolSpec,
+) {
+	applyPoolPodPlacement(podSpec, pool)
+	applyControllerPodSpecModifications(podSpec, connection, temporalNamespace, workerDeploymentName, buildID, pool.TaskQueue)
+}
+
+// applyPoolPodPlacement applies a pool's placement and sizing overrides to a
+// pod spec in place. Nil/empty overrides leave the corresponding base-template
+// field untouched.
+func applyPoolPodPlacement(podSpec *corev1.PodSpec, pool temporaliov1alpha1.PoolSpec) {
+	if pool.NodeSelector != nil {
+		podSpec.NodeSelector = pool.NodeSelector
+	}
+	if pool.Affinity != nil {
+		podSpec.Affinity = pool.Affinity
+	}
+	if pool.Tolerations != nil {
+		podSpec.Tolerations = pool.Tolerations
+	}
+	if pool.Resources != nil {
+		for i := range podSpec.Containers {
+			podSpec.Containers[i].Resources = *pool.Resources
+		}
+	}
+}
+
+// poolReplicas returns the replica count to use for a pool: the pool override
+// when set, otherwise the spec-level replicas.
+func poolReplicas(spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec, pool temporaliov1alpha1.PoolSpec) *int32 {
+	if pool.Replicas != nil {
+		return pool.Replicas
+	}
+	return spec.Replicas
 }
 
 func computeImagePrefix(s string, maxLen int) string {
@@ -197,7 +338,9 @@ func cleanBuildID(s string) string {
 	return strings.Trim(s, "-._")
 }
 
-// NewDeploymentWithOwnerRef creates a new deployment resource, including owner references
+// NewDeploymentWithOwnerRef creates a new deployment resource for the implicit
+// (single) pool, including owner references. Preserved for backward compatibility;
+// it delegates to NewDeploymentForPool with the implicit pool.
 func NewDeploymentWithOwnerRef(
 	typeMeta *metav1.TypeMeta,
 	objectMeta *metav1.ObjectMeta,
@@ -206,9 +349,39 @@ func NewDeploymentWithOwnerRef(
 	buildID string,
 	connection temporaliov1alpha1.TemporalConnectionSpec,
 ) *appsv1.Deployment {
+	return NewDeploymentForPool(
+		typeMeta,
+		objectMeta,
+		spec,
+		workerDeploymentName,
+		buildID,
+		connection,
+		temporaliov1alpha1.PoolSpec{Name: temporaliov1alpha1.ImplicitPoolName},
+	)
+}
+
+// NewDeploymentForPool creates a new k8s Deployment for a single (version, pool)
+// pair, including owner references. For the implicit pool (pool.Name == "") the
+// result is byte-identical to the pre-pools behavior: no pool label, no
+// TEMPORAL_TASK_QUEUE env var, base template placement/resources, and the
+// pre-pools Deployment name.
+func NewDeploymentForPool(
+	typeMeta *metav1.TypeMeta,
+	objectMeta *metav1.ObjectMeta,
+	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
+	workerDeploymentName string,
+	buildID string,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	pool temporaliov1alpha1.PoolSpec,
+) *appsv1.Deployment {
 	selectorLabels := map[string]string{
 		twdNameLabel: TruncateString(CleanStringForDNS(objectMeta.GetName()), 63),
 		BuildIDLabel: TruncateString(buildID, 63),
+	}
+	// Only add the pool label for real (named) pools, so single-pool Deployments
+	// keep their original selector and remain byte-identical to pre-pools.
+	if pool.Name != temporaliov1alpha1.ImplicitPoolName {
+		selectorLabels[PoolLabel] = TruncateString(CleanStringForDNS(pool.Name), 63)
 	}
 
 	// Set pod labels
@@ -222,8 +395,13 @@ func NewDeploymentWithOwnerRef(
 
 	podSpec := spec.Template.Spec.DeepCopy()
 
-	// Apply controller-managed environment variables and volume mounts
-	ApplyControllerPodSpecModifications(podSpec, connection, spec.WorkerOptions.TemporalNamespace, workerDeploymentName, buildID)
+	// Apply pool-specific placement/sizing BEFORE controller env injection so
+	// that resource overrides land on the user containers.
+	applyPoolPodPlacement(podSpec, pool)
+
+	// Apply controller-managed environment variables and volume mounts (and the
+	// pool's task queue, if any).
+	applyControllerPodSpecModifications(podSpec, connection, spec.WorkerOptions.TemporalNamespace, workerDeploymentName, buildID, pool.TaskQueue)
 
 	// Build pod annotations
 	podAnnotations := make(map[string]string)
@@ -238,7 +416,7 @@ func NewDeploymentWithOwnerRef(
 
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:                       ComputeVersionedDeploymentName(objectMeta.Name, buildID),
+			Name:                       ComputeVersionedPoolDeploymentName(objectMeta.Name, buildID, pool.Name),
 			Namespace:                  objectMeta.Namespace,
 			DeletionGracePeriodSeconds: nil,
 			Labels:                     selectorLabels,
@@ -255,7 +433,7 @@ func NewDeploymentWithOwnerRef(
 			//                 deleting deployments that are still reachable.
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: spec.Replicas,
+			Replicas: poolReplicas(spec, pool),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: selectorLabels,
 			},
@@ -324,6 +502,21 @@ func ApplyControllerPodSpecModifications(
 	workerDeploymentName string,
 	buildID string,
 ) {
+	applyControllerPodSpecModifications(podSpec, connection, temporalNamespace, workerDeploymentName, buildID, "")
+}
+
+// applyControllerPodSpecModifications is the pool-aware implementation. When
+// taskQueue is non-empty, it injects a TEMPORAL_TASK_QUEUE env var so the
+// worker polls the pool's queue. When empty (single implicit pool) no such env
+// var is added, preserving byte-identical behavior with pre-pools deployments.
+func applyControllerPodSpecModifications(
+	podSpec *corev1.PodSpec,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	temporalNamespace string,
+	workerDeploymentName string,
+	buildID string,
+	taskQueue string,
+) {
 	// Add environment variables to containers
 	for i, container := range podSpec.Containers {
 		container.Env = append(container.Env,
@@ -344,6 +537,12 @@ func ApplyControllerPodSpecModifications(
 				Value: buildID,
 			},
 		)
+		if taskQueue != "" {
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name:  "TEMPORAL_TASK_QUEUE",
+				Value: taskQueue,
+			})
+		}
 		podSpec.Containers[i] = container
 	}
 
@@ -411,4 +610,33 @@ func NewDeploymentWithControllerRef(
 		return nil, err
 	}
 	return d, nil
+}
+
+// NewPoolDeploymentsWithControllerRef builds one k8s Deployment per effective
+// pool for the given build, all sharing the worker deployment name and build ID.
+// For a TWD without spec.pools this returns exactly one Deployment, identical to
+// NewDeploymentWithControllerRef.
+func NewPoolDeploymentsWithControllerRef(
+	w *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	reconcilerScheme *runtime.Scheme,
+) ([]*appsv1.Deployment, error) {
+	var deployments []*appsv1.Deployment
+	for _, pool := range w.Spec.EffectivePools() {
+		d := NewDeploymentForPool(
+			&w.TypeMeta,
+			&w.ObjectMeta,
+			&w.Spec,
+			ComputeWorkerDeploymentName(w),
+			buildID,
+			connection,
+			pool,
+		)
+		if err := ctrl.SetControllerReference(w, d, reconcilerScheme); err != nil {
+			return nil, err
+		}
+		deployments = append(deployments, d)
+	}
+	return deployments, nil
 }

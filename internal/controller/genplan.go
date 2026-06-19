@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // plan holds the actions to execute during reconciliation
@@ -26,7 +27,10 @@ type plan struct {
 
 	// Which actions to take
 	DeleteDeployments []*appsv1.Deployment
-	CreateDeployment  *appsv1.Deployment
+	// CreateDeployments are the k8s Deployments to create this reconcile. For a
+	// single-pool TWD this holds at most one Deployment (the target version); for
+	// a multi-pool TWD it holds one per missing pool of the target version.
+	CreateDeployments []*appsv1.Deployment
 	ScaleDeployments  map[*corev1.ObjectReference]uint32
 	UpdateDeployments []*appsv1.Deployment
 	// Register new versions as current or with ramp
@@ -167,23 +171,32 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 		})
 	}
 
-	// Handle deployment creation if needed
+	// Handle deployment creation if needed. One Deployment is created per missing
+	// pool of the target version; all share the worker deployment name + build ID.
 	if planResult.ShouldCreateDeployment {
-		d, err := r.newDeployment(w, targetBuildID, connection)
-		if err != nil {
-			return nil, err
+		for _, pool := range planResult.CreatePools {
+			d, err := r.newPoolDeployment(w, targetBuildID, connection, pool)
+			if err != nil {
+				return nil, err
+			}
+			plan.CreateDeployments = append(plan.CreateDeployments, d)
 		}
-		plan.CreateDeployment = d
 	}
 
 	return plan, nil
 }
 
-// Create a new deployment with owner reference
-func (r *TemporalWorkerDeploymentReconciler) newDeployment(
+// newPoolDeployment creates a new k8s Deployment for a single (version, pool)
+// pair, with the controller owner reference set.
+func (r *TemporalWorkerDeploymentReconciler) newPoolDeployment(
 	w *temporaliov1alpha1.TemporalWorkerDeployment,
 	buildID string,
 	connection temporaliov1alpha1.TemporalConnectionSpec,
+	pool temporaliov1alpha1.PoolSpec,
 ) (*appsv1.Deployment, error) {
-	return k8s.NewDeploymentWithControllerRef(w, buildID, connection, r.Scheme)
+	d := k8s.NewDeploymentForPool(&w.TypeMeta, &w.ObjectMeta, &w.Spec, k8s.ComputeWorkerDeploymentName(w), buildID, connection, pool)
+	if err := ctrl.SetControllerReference(w, d, r.Scheme); err != nil {
+		return nil, err
+	}
+	return d, nil
 }

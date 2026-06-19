@@ -588,7 +588,7 @@ func TestGetScaleDeployments(t *testing.T) {
 			name: "current version needs scaling",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"123": createDeploymentWithDefaultConnectionSpecHash(1),
+					"123": namedDeployment("test-123", createDeploymentWithDefaultConnectionSpecHash(1)),
 				},
 			},
 			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
@@ -616,8 +616,8 @@ func TestGetScaleDeployments(t *testing.T) {
 			name: "drained version needs scaling down",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"123": createDeploymentWithDefaultConnectionSpecHash(1),
-					"456": createDeploymentWithDefaultConnectionSpecHash(2),
+					"123": namedDeployment("test-123", createDeploymentWithDefaultConnectionSpecHash(1)),
+					"456": namedDeployment("test-456", createDeploymentWithDefaultConnectionSpecHash(2)),
 				},
 			},
 			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
@@ -653,7 +653,7 @@ func TestGetScaleDeployments(t *testing.T) {
 			name: "inactive non-target version needs scaling down",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"a": createDeploymentWithDefaultConnectionSpecHash(1),
+					"a": namedDeployment("test-a", createDeploymentWithDefaultConnectionSpecHash(1)),
 				},
 				DeploymentRefs: map[string]*corev1.ObjectReference{
 					"a": {Name: "test-a"},
@@ -686,7 +686,7 @@ func TestGetScaleDeployments(t *testing.T) {
 			name: "ramping version needs scaling up",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"b": createDeploymentWithDefaultConnectionSpecHash(0),
+					"b": namedDeployment("test-b", createDeploymentWithDefaultConnectionSpecHash(0)),
 				},
 				DeploymentRefs: map[string]*corev1.ObjectReference{
 					"b": {Name: "test-b"},
@@ -713,7 +713,7 @@ func TestGetScaleDeployments(t *testing.T) {
 			name: "inactive target version needs scaling up",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"a": createDeploymentWithDefaultConnectionSpecHash(0),
+					"a": namedDeployment("test-a", createDeploymentWithDefaultConnectionSpecHash(0)),
 				},
 				DeploymentRefs: map[string]*corev1.ObjectReference{
 					"a": {Name: "test-a"},
@@ -746,7 +746,7 @@ func TestGetScaleDeployments(t *testing.T) {
 			name: "don't scale down drained deployment before delay",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"b": createDeploymentWithDefaultConnectionSpecHash(3),
+					"b": namedDeployment("test-b", createDeploymentWithDefaultConnectionSpecHash(3)),
 				},
 				DeploymentRefs: map[string]*corev1.ObjectReference{
 					"b": {Name: "test-b"},
@@ -928,7 +928,19 @@ func TestShouldCreateDeployment(t *testing.T) {
 			if tc.maxVersionsIneligibleForDeletion != nil {
 				maxV = *tc.maxVersionsIneligibleForDeletion
 			}
-			creates := shouldCreateDeployment(tc.status, maxV)
+			// Build a k8sState reflecting whether the target version's Deployment
+			// already exists (signaled in these cases by status.TargetVersion.Deployment).
+			k8sState := &k8s.DeploymentState{
+				Deployments:              map[string]*appsv1.Deployment{},
+				DeploymentsByVersionPool: map[string]map[string]*appsv1.Deployment{},
+			}
+			if tc.status.TargetVersion.Deployment != nil {
+				buildID := tc.status.TargetVersion.BuildID
+				d := &appsv1.Deployment{}
+				k8sState.Deployments[buildID] = d
+				k8sState.DeploymentsByVersionPool[buildID] = map[string]*appsv1.Deployment{"": d}
+			}
+			creates := len(getCreatePools(k8sState, tc.status, tc.spec, maxV)) > 0
 			assert.Equal(t, tc.expectCreates, creates, "unexpected create decision")
 		})
 	}
@@ -1817,11 +1829,11 @@ func TestComplexVersionStateScenarios(t *testing.T) {
 			name: "multiple deprecated versions in different states",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
-					"a": createDeploymentWithDefaultConnectionSpecHash(5),
-					"b": createDeploymentWithDefaultConnectionSpecHash(3),
-					"c": createDeploymentWithDefaultConnectionSpecHash(3),
-					"d": createDeploymentWithDefaultConnectionSpecHash(1),
-					"e": createDeploymentWithDefaultConnectionSpecHash(0),
+					"a": namedDeployment("test-a", createDeploymentWithDefaultConnectionSpecHash(5)),
+					"b": namedDeployment("test-b", createDeploymentWithDefaultConnectionSpecHash(3)),
+					"c": namedDeployment("test-c", createDeploymentWithDefaultConnectionSpecHash(3)),
+					"d": namedDeployment("test-d", createDeploymentWithDefaultConnectionSpecHash(1)),
+					"e": namedDeployment("test-e", createDeploymentWithDefaultConnectionSpecHash(0)),
 				},
 			},
 			config: &Config{
@@ -2134,7 +2146,7 @@ func TestCheckAndUpdateDeploymentConnectionSpec(t *testing.T) {
 				k8sState.Deployments[buildID] = tt.existingDeployment
 			}
 
-			result := checkAndUpdateDeploymentConnectionSpec(buildID, k8sState, tt.newConnection)
+			result := checkAndUpdateDeploymentConnectionSpec(k8sState.Deployments[buildID], tt.newConnection)
 
 			if !tt.expectUpdate {
 				assert.Nil(t, result, "Expected no update, but got deployment")
@@ -2345,7 +2357,7 @@ func TestCheckAndUpdateDeploymentPodTemplateSpec(t *testing.T) {
 				k8sState.Deployments[buildID] = tt.existingDeployment
 			}
 
-			result := checkAndUpdateDeploymentPodTemplateSpec(buildID, k8sState, tt.newSpec, tt.connection)
+			result := checkAndUpdateDeploymentPodTemplateSpec(k8sState.Deployments[buildID], tt.newSpec, tt.connection)
 
 			if !tt.expectUpdate {
 				assert.Nil(t, result, "Expected no update, but got deployment")
@@ -2377,6 +2389,15 @@ func TestCheckAndUpdateDeploymentPodTemplateSpec(t *testing.T) {
 }
 
 // Helper function to create a deployment with the specified replicas and the default connection spec hash
+// namedDeployment sets the k8s Deployment name so that k8s.NewObjectRef(d)
+// produces a stable, build-specific reference. Production GetDeploymentState
+// always populates real names; this mirrors that for helper-built states used by
+// scale/delete tests that assert on Deployment names.
+func namedDeployment(name string, d *appsv1.Deployment) *appsv1.Deployment {
+	d.ObjectMeta.Name = name
+	return d
+}
+
 func createDeploymentWithDefaultConnectionSpecHash(replicas int32) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{

@@ -22,11 +22,11 @@ import (
 )
 
 func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, temporalClient sdkclient.Client, p *plan) error {
-	// Create deployment
-	if p.CreateDeployment != nil {
-		l.Info("creating deployment", "deployment", p.CreateDeployment)
-		if err := r.Create(ctx, p.CreateDeployment); err != nil {
-			l.Error(err, "unable to create deployment", "deployment", p.CreateDeployment)
+	// Create deployments (one per missing pool of the target version)
+	for _, d := range p.CreateDeployments {
+		l.Info("creating deployment", "deployment", d)
+		if err := r.Create(ctx, d); err != nil {
+			l.Error(err, "unable to create deployment", "deployment", d)
 			return err
 		}
 	}

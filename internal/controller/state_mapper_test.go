@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
@@ -268,4 +269,69 @@ func TestMapWorkerDeploymentVersion(t *testing.T) {
 	assert.Equal(t, temporaliov1alpha1.VersionStatusNotRegistered, currentVersion.Status)
 	assert.Nil(t, currentVersion.HealthySince)
 	assert.Nil(t, currentVersion.Deployment)
+}
+
+// helper to build an available/unavailable Deployment for pool readiness tests
+func poolDeployment(available bool, healthyAt metav1.Time) *appsv1.Deployment {
+	cond := corev1.ConditionFalse
+	if available {
+		cond = corev1.ConditionTrue
+	}
+	return &appsv1.Deployment{
+		Status: appsv1.DeploymentStatus{
+			Conditions: []appsv1.DeploymentCondition{{
+				Type:               appsv1.DeploymentAvailable,
+				Status:             cond,
+				LastTransitionTime: healthyAt,
+			}},
+		},
+	}
+}
+
+// (b) A multi-pool version is only HEALTHY once EVERY pool Deployment is healthy.
+// HealthySince is the latest pool's transition time (when the whole version became ready).
+func TestMapToStatus_VersionReadinessRequiresAllPools(t *testing.T) {
+	now := time.Now()
+	earlier := metav1.NewTime(now.Add(-2 * time.Hour))
+	later := metav1.NewTime(now.Add(-1 * time.Hour))
+
+	temporalState := &temporal.TemporalWorkerState{
+		Versions: map[string]*temporal.VersionInfo{
+			"v1": {DeploymentName: "worker", BuildID: "v1", Status: temporaliov1alpha1.VersionStatusCurrent},
+		},
+	}
+
+	t.Run("one pool unhealthy => version not healthy", func(t *testing.T) {
+		k8sState := &k8s.DeploymentState{
+			Deployments:    map[string]*appsv1.Deployment{"v1": poolDeployment(true, earlier)},
+			DeploymentRefs: map[string]*corev1.ObjectReference{"v1": {Name: "worker-v1"}},
+			DeploymentsByVersionPool: map[string]map[string]*appsv1.Deployment{
+				"v1": {
+					"spot":      poolDeployment(true, earlier),
+					"metastore": poolDeployment(false, metav1.Time{}),
+				},
+			},
+		}
+		mapper := newStateMapper(k8sState, temporalState, "worker")
+		v := mapper.mapTargetWorkerDeploymentVersionByBuildID("v1")
+		assert.NotNil(t, v.Deployment, "deployment ref still set")
+		assert.Nil(t, v.HealthySince, "version must NOT be healthy while a pool is unhealthy")
+	})
+
+	t.Run("all pools healthy => healthy at latest pool time", func(t *testing.T) {
+		k8sState := &k8s.DeploymentState{
+			Deployments:    map[string]*appsv1.Deployment{"v1": poolDeployment(true, earlier)},
+			DeploymentRefs: map[string]*corev1.ObjectReference{"v1": {Name: "worker-v1"}},
+			DeploymentsByVersionPool: map[string]map[string]*appsv1.Deployment{
+				"v1": {
+					"spot":      poolDeployment(true, earlier),
+					"metastore": poolDeployment(true, later),
+				},
+			},
+		}
+		mapper := newStateMapper(k8sState, temporalState, "worker")
+		v := mapper.mapTargetWorkerDeploymentVersionByBuildID("v1")
+		require.NotNil(t, v.HealthySince, "version healthy once all pools healthy")
+		assert.Equal(t, later.Time.Unix(), v.HealthySince.Time.Unix(), "healthy since latest pool")
+	})
 }

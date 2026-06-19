@@ -84,6 +84,74 @@ type TemporalWorkerDeploymentSpec struct {
 
 	// WorkerOptions configures the worker's connection to Temporal.
 	WorkerOptions WorkerOptions `json:"workerOptions"`
+
+	// Pools optionally splits each worker deployment version across multiple
+	// "pools". A pool is a (task queue + pod placement/sizing) combination. All
+	// pools share the SAME Temporal worker deployment name and the SAME per-version
+	// build ID, so a workflow PINNED to a build always finds a worker of that build
+	// on every task queue. This solves the problem where routing an activity to a
+	// separate Temporal deployment's queue would leave it SCHEDULED forever.
+	//
+	// When Pools is empty or absent, the controller behaves exactly as before:
+	// a single implicit pool that uses spec.template / spec.replicas as-is and the
+	// task queue configured on the worker (TEMPORAL_DEPLOYMENT_NAME based default).
+	//
+	// When Pools is set, the controller creates one Kubernetes Deployment per
+	// (version, pool); a version is only considered healthy once every pool's
+	// Deployment is healthy, and is only deletable once every pool's Deployment is gone.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Pools []PoolSpec `json:"pools,omitempty"`
+}
+
+// PoolSpec describes a single pool within a multi-pool worker deployment.
+// A pool determines which task queue its pods poll and where/how those pods
+// are scheduled. All pools of a TemporalWorkerDeployment share one Temporal
+// worker deployment name and one per-version build ID.
+type PoolSpec struct {
+	// Name is a unique, stable identifier for the pool within the
+	// TemporalWorkerDeployment. It is used as part of the generated Kubernetes
+	// Deployment name and as a label value, so it must be DNS-label safe.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// TaskQueue is the Temporal task queue that this pool's workers poll.
+	// The controller injects it into the pod via the TEMPORAL_TASK_QUEUE
+	// environment variable. When empty, the worker falls back to its default
+	// task queue (preserving the pre-pools behavior).
+	// +optional
+	TaskQueue string `json:"taskQueue,omitempty"`
+
+	// Replicas optionally overrides spec.replicas for this pool only.
+	// When nil, spec.replicas is used.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// NodeSelector optionally overrides the pod nodeSelector for this pool only.
+	// When nil, the base template's nodeSelector is used.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Affinity optionally overrides the pod affinity for this pool only.
+	// When nil, the base template's affinity is used.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// Tolerations optionally overrides the pod tolerations for this pool only.
+	// When nil, the base template's tolerations are used.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// Resources optionally overrides the resource requirements applied to every
+	// container in this pool's pods. When nil, the base template's per-container
+	// resources are used.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // VersionStatus indicates the status of a version.
@@ -388,6 +456,24 @@ type TemporalWorkerDeploymentList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []TemporalWorkerDeployment `json:"items"`
+}
+
+// ImplicitPoolName is the pool name used for the single implicit pool when
+// spec.pools is empty. It is intentionally the empty string so that single-pool
+// (pre-pools) Deployments carry no pool label and behave byte-identically to
+// deployments created before multi-pool support existed.
+const ImplicitPoolName = ""
+
+// EffectivePools returns the list of pools to materialize for this spec.
+//
+// When spec.pools is empty, it returns a single implicit pool (Name == "",
+// TaskQueue == "", no overrides) so that all downstream code can iterate pools
+// uniformly while producing exactly the pre-pools single-Deployment behavior.
+func (s *TemporalWorkerDeploymentSpec) EffectivePools() []PoolSpec {
+	if len(s.Pools) == 0 {
+		return []PoolSpec{{Name: ImplicitPoolName}}
+	}
+	return s.Pools
 }
 
 func init() {
