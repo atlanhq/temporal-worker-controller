@@ -545,12 +545,19 @@ func TestBuildScaledObject_RampingWithoutConfig_StillWarmStarts(t *testing.T) {
 }
 
 func TestBuildScaledObject_CurrentVersionCatchesUnassignedBacklog(t *testing.T) {
-	// Current version's SO must set selectAllActive + selectUnversioned so its
-	// DescribeTaskQueueEnhanced query catches workflows that arrived but
-	// haven't been assigned to any worker yet (the from-zero scale-up case
-	// in Temporal's worker-deployment-versioning model — newly-queued
-	// workflows have no version search attribute until a worker picks them
-	// up). Other version statuses stay per-build-scoped.
+	// Current AND Ramping versions' SOs must set selectAllActive +
+	// selectUnversioned so their DescribeTaskQueueEnhanced queries catch
+	// workflows that arrived but haven't been assigned to any worker yet
+	// (the from-zero scale-up case in Temporal's worker-deployment-versioning
+	// model — newly-queued workflows have no version search attribute until
+	// a worker picks them up, and matching spools them in the default
+	// partition with a syncMatchQueue target that per-build queries can't
+	// see). Ramping needs this because the matching-side routing decision
+	// can deterministically target Ramping for a fraction of new workflows
+	// (per the routing %), and without the flag those tasks would sit in
+	// the default partition with no scaling signal back to Ramping.
+	// Other version statuses (Inactive/Draining/NotRegistered) stay strictly
+	// per-build-scoped — they should never reach into the unversioned bucket.
 	mk := func(status temporaliov1alpha1.VersionStatus) *unstructured.Unstructured {
 		twd := &temporaliov1alpha1.TemporalWorkerDeployment{
 			ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
@@ -577,7 +584,7 @@ func TestBuildScaledObject_CurrentVersionCatchesUnassignedBacklog(t *testing.T) 
 		wantUnvrsnd bool
 	}{
 		{"Current — must catch unassigned", temporaliov1alpha1.VersionStatusCurrent, true, true},
-		{"Ramping — per-build scoped", temporaliov1alpha1.VersionStatusRamping, false, false},
+		{"Ramping — must catch unassigned (matching may route here)", temporaliov1alpha1.VersionStatusRamping, true, true},
 		{"Inactive — per-build scoped", temporaliov1alpha1.VersionStatusInactive, false, false},
 		{"Draining — per-build scoped", temporaliov1alpha1.VersionStatusDraining, false, false},
 		{"NotRegistered — per-build scoped", temporaliov1alpha1.VersionStatusNotRegistered, false, false},
