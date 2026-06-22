@@ -346,10 +346,10 @@ func TestBuildScaledObject_ShapeAndFields(t *testing.T) {
 	meta := trigger["metadata"].(map[string]interface{})
 	assert.Equal(t, "temporal:7233", meta["endpoint"])
 	assert.Equal(t, "default", meta["namespace"])
-	assert.Equal(t, "main-f085195", meta["buildId"])
+	assert.Equal(t, "main-f085195", meta["workerDeploymentBuildId"])
 	assert.Equal(t, "5", meta["targetQueueSize"])
 	assert.Equal(t, "atlan-publish-production", meta["taskQueue"])
-	assert.Equal(t, "publish-app/publish", meta["workerDeployment"])
+	assert.Equal(t, "publish-app/publish", meta["workerDeploymentName"])
 	// includeRunningWorkflowCount is omitted when unset — KEDA's own default (true) applies.
 	_, hasIRWC := meta["includeRunningWorkflowCount"]
 	assert.False(t, hasIRWC, "includeRunningWorkflowCount should be omitted when unset")

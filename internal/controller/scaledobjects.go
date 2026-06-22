@@ -473,16 +473,21 @@ func buildScaledObject(
 	// controller. Unset values are omitted from the SO so KEDA's own
 	// defaults apply.
 	//
-	// The controller sets endpoint/namespace/taskQueue/buildId on the trigger
-	// since those derive from the TWD context. All other Temporal-scaler
-	// metadata flows through from twd.Spec.WorkerScaling. KEDA expects all
-	// triggerMetadata values as strings.
+	// The controller sets endpoint/namespace/taskQueue/workerDeploymentName/
+	// workerDeploymentBuildId on the trigger since those derive from the TWD
+	// context. All other Temporal-scaler metadata flows through from
+	// twd.Spec.WorkerScaling. KEDA expects all triggerMetadata values as
+	// strings.
+	//
+	// Field names match upstream KEDA v2.20.1's schema (workerDeploymentName +
+	// workerDeploymentBuildId). The fork (atlanhq/keda 2.19.0-main) accepts
+	// these via the rename PR companion to this change.
 	triggerMetadata := map[string]interface{}{
-		"endpoint":         temporalEndpoint,
-		"namespace":        twd.Spec.WorkerOptions.TemporalNamespace,
-		"taskQueue":        resolveTaskQueue(twd),
-		"buildId":          v.BuildID,
-		"workerDeployment": resolveWorkerDeployment(twd),
+		"endpoint":                temporalEndpoint,
+		"namespace":               twd.Spec.WorkerOptions.TemporalNamespace,
+		"taskQueue":               resolveTaskQueue(twd),
+		"workerDeploymentName":    resolveWorkerDeployment(twd),
+		"workerDeploymentBuildId": v.BuildID,
 	}
 	// Current and Ramping versions catch unassigned backlog so they can scale
 	// from zero. In Temporal's worker-deployment-versioning model, newly-queued
