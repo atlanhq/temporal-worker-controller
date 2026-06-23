@@ -91,6 +91,18 @@ rules:
     verbs:
       - update
   - apiGroups:
+      - keda.sh
+    resources:
+      - scaledobjects
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
       - temporal.io
     resources:
       - temporalconnections

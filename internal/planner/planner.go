@@ -372,7 +372,30 @@ func getDeleteDeployments(
 	return deleteDeployments
 }
 
-// getScaleDeployments determines which deployments should be scaled and to what size
+// kedaManagedLabel mirrors the label set by internal/controller/scaledobjects.go.
+// Duplicated here as a const to avoid a controller→planner package import cycle.
+const kedaManagedLabel = "twd.temporal.io/keda-managed"
+
+// isDeploymentKEDAManaged reports whether the given Deployment is owned by a
+// per-version ScaledObject. When true, the planner skips spec.replicas writes
+// for that Deployment — KEDA's HPA owns the value, and overwriting it here
+// would cause the controller and HPA to fight every reconcile.
+func isDeploymentKEDAManaged(d *appsv1.Deployment) bool {
+	if d == nil || d.Labels == nil {
+		return false
+	}
+	return d.Labels[kedaManagedLabel] == "true"
+}
+
+// getScaleDeployments determines which deployments should be scaled and to what size.
+//
+// Deployments labelled `twd.temporal.io/keda-managed=true` are intentionally
+// skipped: when per-version ScaledObjects are in play, KEDA's HPA owns
+// .spec.replicas for those Deployments, and any write here would be reverted
+// (and would cause oscillation with the HPA). Drained versions are still
+// handled here: by the time a version drains, the controller has deleted its
+// ScaledObject and removed this label, so the scale-to-zero on line 434
+// below applies normally.
 func getScaleDeployments(
 	k8sState *k8s.DeploymentState,
 	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
@@ -385,7 +408,7 @@ func getScaleDeployments(
 	if status.CurrentVersion != nil && status.CurrentVersion.Deployment != nil {
 		ref := status.CurrentVersion.Deployment
 		if d, exists := k8sState.Deployments[status.CurrentVersion.BuildID]; exists {
-			if d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
+			if !isDeploymentKEDAManaged(d) && d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
 				scaleDeployments[ref] = uint32(replicas)
 			}
 		}
@@ -404,7 +427,7 @@ func getScaleDeployments(
 			if status.TargetVersion.Status == temporaliov1alpha1.VersionStatusNotRegistered && targetReplicas == 0 {
 				targetReplicas = 1
 			}
-			if d.Spec.Replicas == nil || *d.Spec.Replicas != targetReplicas {
+			if !isDeploymentKEDAManaged(d) && (d.Spec.Replicas == nil || *d.Spec.Replicas != targetReplicas) {
 				scaleDeployments[status.TargetVersion.Deployment] = uint32(targetReplicas)
 			}
 		}
@@ -425,22 +448,29 @@ func getScaleDeployments(
 		case temporaliov1alpha1.VersionStatusInactive:
 			// Scale down inactive versions that are not the target
 			if status.TargetVersion.BuildID == version.BuildID {
-				if d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
+				if !isDeploymentKEDAManaged(d) && d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
 					scaleDeployments[version.Deployment] = uint32(replicas)
 				}
 			} else if d.Spec.Replicas != nil && *d.Spec.Replicas != 0 {
-				scaleDeployments[version.Deployment] = 0
+				// Drain-to-zero: even if the label is still present, the
+				// controller's reconcileScaledObjects will have removed it
+				// before deleting the SO for stale versions (see the
+				// coordination protocol in scaledobjects.go). If it's still
+				// here, KEDA's HPA was already torn down; safe to write 0.
+				if !isDeploymentKEDAManaged(d) {
+					scaleDeployments[version.Deployment] = 0
+				}
 			}
 		case temporaliov1alpha1.VersionStatusRamping, temporaliov1alpha1.VersionStatusCurrent:
 			// Scale up these deployments
-			if d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
+			if !isDeploymentKEDAManaged(d) && d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
 				scaleDeployments[version.Deployment] = uint32(replicas)
 			}
 		case temporaliov1alpha1.VersionStatusDrained:
 			if time.Since(version.DrainedSince.Time) > spec.SunsetStrategy.ScaledownDelay.Duration {
 				// TODO(jlegrone): Compute scale based on load? Or percentage of replicas?
 				// Scale down drained deployments after delay
-				if d.Spec.Replicas != nil && *d.Spec.Replicas != 0 {
+				if !isDeploymentKEDAManaged(d) && d.Spec.Replicas != nil && *d.Spec.Replicas != 0 {
 					scaleDeployments[version.Deployment] = 0
 				}
 			}

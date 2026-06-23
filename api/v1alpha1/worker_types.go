@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
@@ -84,6 +85,157 @@ type TemporalWorkerDeploymentSpec struct {
 
 	// WorkerOptions configures the worker's connection to Temporal.
 	WorkerOptions WorkerOptions `json:"workerOptions"`
+
+	// WorkerScaling configures per-version KEDA ScaledObject parameters for
+	// worker autoscaling. The controller creates one KEDA ScaledObject per
+	// active worker-deployment-version, each targeting only that version's
+	// child Deployment. Fields here flow through to each per-version SO.
+	//
+	// Defaults: all fields are optional. When unset, the corresponding field
+	// is omitted from the generated ScaledObject, falling back to KEDA's own
+	// defaults. Atlan deployments populate these via the Helm chart
+	// (atlanhq/atlan) and per-app atlan.yaml overrides; the controller itself
+	// does not hardcode defaults.
+	//
+	// +optional
+	WorkerScaling *WorkerScalingConfig `json:"workerScaling,omitempty"`
+}
+
+// WorkerScalingConfig holds the per-version KEDA scaling knobs that flow
+// through to each generated ScaledObject. Values are intentionally pointers
+// so the controller can distinguish "not set" from "explicit zero".
+//
+// Fields fall into two groups:
+//   - ScaledObject-level knobs (minReplicaCount, maxReplicaCount, pollingInterval,
+//     cooldownPeriod, idleReplicaCount, initialCooldownPeriod, fallback, advanced)
+//     mirror the keda.sh/v1alpha1 ScaledObject spec field-for-field.
+//   - Trigger-metadata knobs (targetQueueSize, activationTargetQueueSize, queueTypes,
+//     includeRunningWorkflowCount, workflowTaskQueueForCount, workerMetricsPort,
+//     minConnectTimeout) mirror the KEDA Temporal scaler's triggerMetadata.
+//
+// The controller already sets endpoint, namespace, taskQueue, and buildId on the
+// trigger — those are intentionally not exposed here since the controller derives
+// them from the TWD spec and the version it is reconciling.
+type WorkerScalingConfig struct {
+	// MinReplicaCount sets MinReplicaCount on each per-version ScaledObject.
+	// Note: the controller still ensures Target/Ramping versions are pinned to
+	// at least 1 (regardless of this value) so Temporal can route new
+	// workflow executions to them on first launch — that's a correctness
+	// invariant, not a default.
+	// +optional
+	MinReplicaCount *int32 `json:"minReplicaCount,omitempty"`
+
+	// MaxReplicaCount sets MaxReplicaCount on each per-version ScaledObject.
+	// +optional
+	MaxReplicaCount *int32 `json:"maxReplicaCount,omitempty"`
+
+	// IdleReplicaCount sets IdleReplicaCount on each per-version ScaledObject.
+	// When set, KEDA scales down to this value (instead of MinReplicaCount)
+	// when no triggers are active. Must be strictly less than MinReplicaCount.
+	// +optional
+	IdleReplicaCount *int32 `json:"idleReplicaCount,omitempty"`
+
+	// PollingInterval is how often (in seconds) KEDA queries the scaler. Maps
+	// to ScaledObject.spec.pollingInterval. Lower values give faster reaction
+	// at the cost of more requests against Temporal.
+	// +optional
+	PollingInterval *int32 `json:"pollingInterval,omitempty"`
+
+	// CooldownPeriod is the duration (in seconds) to wait after the last
+	// trigger reported a non-active state before scaling down. Maps to
+	// ScaledObject.spec.cooldownPeriod.
+	// +optional
+	CooldownPeriod *int32 `json:"cooldownPeriod,omitempty"`
+
+	// InitialCooldownPeriod is the duration (in seconds) to wait before
+	// allowing the first scale-down after the ScaledObject is created. Maps
+	// to ScaledObject.spec.initialCooldownPeriod.
+	// +optional
+	InitialCooldownPeriod *int32 `json:"initialCooldownPeriod,omitempty"`
+
+	// Fallback configures the replica count and failure threshold to use when
+	// the scaler repeatedly fails. Maps to ScaledObject.spec.fallback.
+	// +optional
+	Fallback *ScalingFallback `json:"fallback,omitempty"`
+
+	// Advanced is a passthrough for ScaledObject.spec.advanced. Use this to
+	// configure HPA behavior (advanced.horizontalPodAutoscalerConfig.behavior)
+	// and other rarely-needed knobs without bumping this CRD when KEDA adds
+	// new fields. The contents are forwarded verbatim to the generated
+	// ScaledObject.
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Schemaless
+	Advanced *runtime.RawExtension `json:"advanced,omitempty"`
+
+	// TaskQueue is the actual Temporal task queue workers poll. Defaults to the
+	// chart-rendered `atlan-<app>-<deploymentName>` formula. Required: the
+	// controller cannot derive this from TWD spec alone (the worker-deployment-
+	// name `<namespace>:<twd-name>` is NOT the same as the task queue).
+	// +optional
+	TaskQueue string `json:"taskQueue,omitempty"`
+
+	// TargetQueueSize is the per-pod backlog target for the Temporal scaler.
+	// HPA computes: desiredReplicas = ceil(backlog / TargetQueueSize).
+	// Maps to the Temporal scaler's triggerMetadata.targetQueueSize.
+	// +optional
+	TargetQueueSize *int32 `json:"targetQueueSize,omitempty"`
+
+	// ActivationTargetQueueSize is the threshold at which KEDA considers the
+	// scaler "active" and scales from 0 to MinReplicaCount. Maps to the
+	// Temporal scaler's triggerMetadata.activationTargetQueueSize.
+	// +optional
+	ActivationTargetQueueSize *int32 `json:"activationTargetQueueSize,omitempty"`
+
+	// QueueTypes restricts which Temporal queue types the scaler observes
+	// (e.g. "workflow", "activity"). Maps to the Temporal scaler's
+	// triggerMetadata.queueTypes. When empty, the scaler observes both.
+	// +optional
+	QueueTypes []string `json:"queueTypes,omitempty"`
+
+	// IncludeRunningWorkflowCount, when true, includes the running workflow
+	// count in the backlog computation. Maps to the Temporal scaler's
+	// triggerMetadata.includeRunningWorkflowCount. Defaults to true upstream
+	// — only override if you have a reason. Pointer so unset != false.
+	// +optional
+	IncludeRunningWorkflowCount *bool `json:"includeRunningWorkflowCount,omitempty"`
+
+	// WorkflowTaskQueueForCount overrides the task queue name used for
+	// CountWorkflowExecutions when it differs from the worker task queue.
+	// Maps to triggerMetadata.workflowTaskQueueForCount.
+	// +optional
+	WorkflowTaskQueueForCount string `json:"workflowTaskQueueForCount,omitempty"`
+
+	// WorkerMetricsPort is the worker-side Prometheus port the scaler scrapes
+	// for slot metrics. Maps to triggerMetadata.workerMetricsPort.
+	// +optional
+	WorkerMetricsPort *int32 `json:"workerMetricsPort,omitempty"`
+
+	// MinConnectTimeout is the gRPC dial timeout (in seconds) for connecting
+	// to Temporal. Maps to triggerMetadata.minConnectTimeout.
+	// +optional
+	MinConnectTimeout *int32 `json:"minConnectTimeout,omitempty"`
+}
+
+// ScalingFallback mirrors keda.sh/v1alpha1 ScaledObject.spec.fallback. Used
+// when the scaler fails repeatedly: KEDA pins replicas to Fallback.Replicas
+// after FailureThreshold consecutive failures.
+type ScalingFallback struct {
+	// FailureThreshold is the number of consecutive scaler failures before the
+	// fallback activates. Maps to fallback.failureThreshold.
+	// +optional
+	FailureThreshold *int32 `json:"failureThreshold,omitempty"`
+
+	// Replicas is the replica count to pin to once the fallback activates.
+	// Maps to fallback.replicas.
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Behavior controls how the fallback replica count is applied. One of
+	// "static", "currentReplicas", "currentReplicasIfHigher",
+	// "currentReplicasIfLower". Maps to fallback.behavior.
+	// +optional
+	Behavior string `json:"behavior,omitempty"`
 }
 
 // VersionStatus indicates the status of a version.
