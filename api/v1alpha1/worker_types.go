@@ -187,6 +187,18 @@ type WorkerScalingConfig struct {
 	// +optional
 	ActivationTargetQueueSize *int32 `json:"activationTargetQueueSize,omitempty"`
 
+	// ActivitySlotsPerWorker is the worker's configured maxConcurrentActivities
+	// (the per-pod activity-slot ceiling). When set, the Temporal scaler derives
+	// real occupancy as max(0, limit - available) from task_slots_available
+	// instead of trusting raw used-slots — discounting the temporalio phantom
+	// used-slot (used + available > max) so a gate:false dedicated pool scales to
+	// zero when idle. Maps to the Temporal scaler's
+	// triggerMetadata.activitySlotsPerWorker. Set this equal to the pool worker's
+	// TEMPORAL_MAX_CONCURRENT_ACTIVITIES so the scaler's ceiling and the worker's
+	// real ceiling cannot drift.
+	// +optional
+	ActivitySlotsPerWorker *int32 `json:"activitySlotsPerWorker,omitempty"`
+
 	// QueueTypes restricts which Temporal queue types the scaler observes
 	// (e.g. "workflow", "activity"). Maps to the Temporal scaler's
 	// triggerMetadata.queueTypes. When empty, the scaler observes both.
