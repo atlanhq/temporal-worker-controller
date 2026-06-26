@@ -388,8 +388,8 @@ func TestBuildScaledObject_OmitsUnsetFields(t *testing.T) {
 	trigger := spec["triggers"].([]interface{})[0].(map[string]interface{})
 	meta := trigger["metadata"].(map[string]interface{})
 	for _, k := range []string{
-		"targetQueueSize", "activationTargetQueueSize", "queueTypes",
-		"includeRunningWorkflowCount", "workflowTaskQueueForCount",
+		"targetQueueSize", "activationTargetQueueSize", "activitySlotsPerWorker",
+		"queueTypes", "includeRunningWorkflowCount", "workflowTaskQueueForCount",
 		"workerMetricsPort", "minConnectTimeout",
 	} {
 		_, has := meta[k]
@@ -416,6 +416,7 @@ func TestBuildScaledObject_FullScalingConfig(t *testing.T) {
 				InitialCooldownPeriod:       int32Ptr(60),
 				TargetQueueSize:             int32Ptr(5),
 				ActivationTargetQueueSize:   int32Ptr(1),
+				ActivitySlotsPerWorker:      int32Ptr(6),
 				QueueTypes:                  []string{"workflow", "activity"},
 				IncludeRunningWorkflowCount: boolPtr(false),
 				WorkflowTaskQueueForCount:   "custom-wf-tq",
@@ -455,6 +456,7 @@ func TestBuildScaledObject_FullScalingConfig(t *testing.T) {
 	meta := spec["triggers"].([]interface{})[0].(map[string]interface{})["metadata"].(map[string]interface{})
 	assert.Equal(t, "5", meta["targetQueueSize"])
 	assert.Equal(t, "1", meta["activationTargetQueueSize"])
+	assert.Equal(t, "6", meta["activitySlotsPerWorker"])
 	assert.Equal(t, "workflow,activity", meta["queueTypes"])
 	assert.Equal(t, "false", meta["includeRunningWorkflowCount"])
 	assert.Equal(t, "custom-wf-tq", meta["workflowTaskQueueForCount"])

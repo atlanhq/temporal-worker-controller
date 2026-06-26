@@ -3966,6 +3966,9 @@ spec:
                   activationTargetQueueSize:
                     format: int32
                     type: integer
+                  activitySlotsPerWorker:
+                    format: int32
+                    type: integer
                   advanced:
                     x-kubernetes-preserve-unknown-fields: true
                   cooldownPeriod:
