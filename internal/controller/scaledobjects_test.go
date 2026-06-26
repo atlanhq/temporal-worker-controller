@@ -389,8 +389,8 @@ func TestBuildScaledObject_OmitsUnsetFields(t *testing.T) {
 	meta := trigger["metadata"].(map[string]interface{})
 	for _, k := range []string{
 		"targetQueueSize", "activationTargetQueueSize", "activitySlotsPerWorker",
-		"queueTypes", "includeRunningWorkflowCount", "workflowTaskQueueForCount",
-		"workerMetricsPort", "minConnectTimeout",
+		"gateSlotsOnRunningWorkflow", "queueTypes", "includeRunningWorkflowCount",
+		"workflowTaskQueueForCount", "workerMetricsPort", "minConnectTimeout",
 	} {
 		_, has := meta[k]
 		assert.False(t, has, "trigger.metadata.%s should be omitted when unset", k)
@@ -417,6 +417,7 @@ func TestBuildScaledObject_FullScalingConfig(t *testing.T) {
 				TargetQueueSize:             int32Ptr(5),
 				ActivationTargetQueueSize:   int32Ptr(1),
 				ActivitySlotsPerWorker:      int32Ptr(6),
+				GateSlotsOnRunningWorkflow:  boolPtr(false),
 				QueueTypes:                  []string{"workflow", "activity"},
 				IncludeRunningWorkflowCount: boolPtr(false),
 				WorkflowTaskQueueForCount:   "custom-wf-tq",
@@ -457,6 +458,7 @@ func TestBuildScaledObject_FullScalingConfig(t *testing.T) {
 	assert.Equal(t, "5", meta["targetQueueSize"])
 	assert.Equal(t, "1", meta["activationTargetQueueSize"])
 	assert.Equal(t, "6", meta["activitySlotsPerWorker"])
+	assert.Equal(t, "false", meta["gateSlotsOnRunningWorkflow"])
 	assert.Equal(t, "workflow,activity", meta["queueTypes"])
 	assert.Equal(t, "false", meta["includeRunningWorkflowCount"])
 	assert.Equal(t, "custom-wf-tq", meta["workflowTaskQueueForCount"])

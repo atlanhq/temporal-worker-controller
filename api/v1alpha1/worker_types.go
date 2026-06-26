@@ -199,6 +199,19 @@ type WorkerScalingConfig struct {
 	// +optional
 	ActivitySlotsPerWorker *int32 `json:"activitySlotsPerWorker,omitempty"`
 
+	// GateSlotsOnRunningWorkflow controls whether the Temporal scaler only adds a
+	// worker's used activity slots to the scale metric while a workflow is running
+	// on the queue. Maps to triggerMetadata.gateSlotsOnRunningWorkflow. Defaults
+	// to true upstream (the combined-pool behavior: a running workflow is the
+	// trusted signal that reported used-slots are real, so an idle combined pool
+	// can still scale to zero). Set to false for a dedicated activity-only pool,
+	// where no workflow ever runs on the queue — otherwise the scaler discards the
+	// pool's used-slot signal and can scale a pod to zero while a long activity is
+	// still running on it. When false, also set ActivitySlotsPerWorker so the idle
+	// phantom used-slot does not pin the pool. Pointer so unset != false.
+	// +optional
+	GateSlotsOnRunningWorkflow *bool `json:"gateSlotsOnRunningWorkflow,omitempty"`
+
 	// QueueTypes restricts which Temporal queue types the scaler observes
 	// (e.g. "workflow", "activity"). Maps to the Temporal scaler's
 	// triggerMetadata.queueTypes. When empty, the scaler observes both.

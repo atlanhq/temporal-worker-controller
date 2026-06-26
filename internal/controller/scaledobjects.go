@@ -566,6 +566,9 @@ func setTriggerMetadata(m map[string]interface{}, twd *temporaliov1alpha1.Tempor
 	if ws.ActivitySlotsPerWorker != nil {
 		m["activitySlotsPerWorker"] = strconv.FormatInt(int64(*ws.ActivitySlotsPerWorker), 10)
 	}
+	if ws.GateSlotsOnRunningWorkflow != nil {
+		m["gateSlotsOnRunningWorkflow"] = strconv.FormatBool(*ws.GateSlotsOnRunningWorkflow)
+	}
 	if len(ws.QueueTypes) > 0 {
 		m["queueTypes"] = strings.Join(ws.QueueTypes, ",")
 	}
