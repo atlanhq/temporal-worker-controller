@@ -3985,6 +3985,8 @@ spec:
                         format: int32
                         type: integer
                     type: object
+                  gateSlotsOnRunningWorkflow:
+                    type: boolean
                   idleReplicaCount:
                     format: int32
                     type: integer

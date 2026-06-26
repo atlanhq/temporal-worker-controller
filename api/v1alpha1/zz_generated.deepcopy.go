@@ -629,6 +629,11 @@ func (in *WorkerScalingConfig) DeepCopyInto(out *WorkerScalingConfig) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.GateSlotsOnRunningWorkflow != nil {
+		in, out := &in.GateSlotsOnRunningWorkflow, &out.GateSlotsOnRunningWorkflow
+		*out = new(bool)
+		**out = **in
+	}
 	if in.QueueTypes != nil {
 		in, out := &in.QueueTypes, &out.QueueTypes
 		*out = make([]string, len(*in))
