@@ -605,29 +605,3 @@ func TestBuildScaledObject_CurrentVersionCatchesUnassignedBacklog(t *testing.T) 
 		})
 	}
 }
-
-func TestSOSpecEqual(t *testing.T) {
-	int32Ptr := func(v int32) *int32 { return &v }
-	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "ns"},
-		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
-			WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
-			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
-				MaxReplicaCount: int32Ptr(5),
-			},
-		},
-	}
-	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
-	v := versionRef{
-		BuildID:    "v1",
-		Status:     temporaliov1alpha1.VersionStatusCurrent,
-		Deployment: &corev1.ObjectReference{Name: "d", Namespace: "ns"},
-	}
-
-	a := buildScaledObject(twd, v, "temporal:7233")
-	b := buildScaledObject(twd, v, "temporal:7233")
-	assert.True(t, soSpecEqual(a, b), "same inputs → equivalent SOs")
-
-	c := buildScaledObject(twd, v, "different-endpoint:7233")
-	assert.False(t, soSpecEqual(a, c), "different endpoint → not equivalent")
-}

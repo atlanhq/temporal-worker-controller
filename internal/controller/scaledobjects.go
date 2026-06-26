@@ -52,7 +52,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -95,6 +94,13 @@ const (
 
 	// scaledObjectSuffix appears on every per-version SO name.
 	scaledObjectSuffix = "-scale"
+
+	// scaledObjectFieldManager is the Server-Side Apply field manager under which
+	// the controller owns only the ScaledObject fields it sets. Fields it never
+	// sets — KEDA's keda.sh finalizer, the scaledobject.keda.sh/name label, and
+	// server-defaulted spec such as advanced.scalingModifiers — stay owned by
+	// KEDA and are left untouched.
+	scaledObjectFieldManager = "temporal-worker-controller"
 )
 
 // --- Naming -------------------------------------------------------------------
@@ -631,9 +637,14 @@ func setScaledObjectSpec(spec map[string]interface{}, twd *temporaliov1alpha1.Te
 	}
 }
 
-// applyDesiredScaledObject creates a missing SO or patches an existing one to
-// match `want`. Pre-existing SOs whose spec already matches are a no-op.
-// Caller passes `got` (may be nil) from the existing-SOs map.
+// applyDesiredScaledObject reconciles the per-version ScaledObject toward `want`
+// using Server-Side Apply with a dedicated field manager. The controller owns
+// only the fields buildScaledObject sets; fields it never sets — KEDA's keda.sh
+// finalizer, the scaledobject.keda.sh/name label, and server-defaulted spec such
+// as advanced.scalingModifiers — remain owned by KEDA and are left untouched.
+// In steady state the apply is a server-side no-op, so KEDA's finalizer and the
+// object's generation stay put rather than churning every reconcile. `got` only
+// selects the log verb.
 func (r *TemporalWorkerDeploymentReconciler) applyDesiredScaledObject(
 	ctx context.Context,
 	l logr.Logger,
@@ -643,20 +654,14 @@ func (r *TemporalWorkerDeploymentReconciler) applyDesiredScaledObject(
 ) error {
 	if got == nil {
 		l.Info("creating ScaledObject", "name", name, "buildId", v.BuildID)
-		if err := r.Create(ctx, want); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create scaledobject %s: %w", name, err)
-		}
-		return nil
+	} else {
+		l.V(1).Info("applying ScaledObject", "name", name, "buildId", v.BuildID)
 	}
-	if soSpecEqual(got, want) {
-		return nil
-	}
-	// Patch the spec/labels to match desired; preserve resourceVersion to
-	// avoid stale-write conflicts.
-	want.SetResourceVersion(got.GetResourceVersion())
-	l.Info("updating ScaledObject", "name", name, "buildId", v.BuildID)
-	if err := r.Update(ctx, want); err != nil {
-		return fmt.Errorf("update scaledobject %s: %w", name, err)
+	if err := r.Patch(ctx, want, client.Apply,
+		client.FieldOwner(scaledObjectFieldManager),
+		client.ForceOwnership,
+	); err != nil {
+		return fmt.Errorf("apply scaledobject %s: %w", name, err)
 	}
 	return nil
 }
@@ -685,17 +690,6 @@ func resolveWorkerDeployment(twd *temporaliov1alpha1.TemporalWorkerDeployment) s
 }
 
 // --- Helpers ------------------------------------------------------------------
-
-// soSpecEqual is a coarse equality used to decide whether to issue an update.
-// Compares the spec block and labels; ignores status, resourceVersion, etc.
-func soSpecEqual(a, b *unstructured.Unstructured) bool {
-	specA, _, _ := unstructured.NestedMap(a.Object, "spec")
-	specB, _, _ := unstructured.NestedMap(b.Object, "spec")
-	if !reflect.DeepEqual(specA, specB) {
-		return false
-	}
-	return reflect.DeepEqual(a.GetLabels(), b.GetLabels())
-}
 
 // scaleTargetRef extracts the Deployment name and namespace from an SO's
 // scaleTargetRef. Returns ok=false if any field is missing.
