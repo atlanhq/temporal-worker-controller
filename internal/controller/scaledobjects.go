@@ -138,6 +138,7 @@ type versionRef struct {
 	BuildID    string
 	Status     temporaliov1alpha1.VersionStatus
 	Deployment *corev1.ObjectReference
+	IsTarget   bool
 }
 
 // activeVersionsForScaling returns versions that should have a live SO.
@@ -162,6 +163,7 @@ func activeVersionsForScaling(
 			BuildID:    status.TargetVersion.BuildID,
 			Status:     status.TargetVersion.Status,
 			Deployment: status.TargetVersion.Deployment,
+			IsTarget:   true,
 		})
 	}
 	for _, v := range status.DeprecatedVersions {
@@ -184,11 +186,16 @@ func activeVersionsForScaling(
 // value should be set on the ScaledObject. Returns (_, false) when nothing
 // should be written (omit the field so KEDA's own default applies).
 //
-// Target/Ramping versions are pinned to at least 1 even when the user's
-// configured min is 0 — this is a correctness invariant so Temporal has
-// somewhere to route new workflow executions on first launch. Without it
-// we'd hit a cold-start chicken-and-egg (no workers → no traffic → never
-// scales up).
+// Some versions are floored at 1 even when the user's configured min is 0,
+// so Temporal always has somewhere to route work and we avoid a cold-start
+// chicken-and-egg (no workers → no traffic → never scales up). This applies
+// to Ramping and Inactive versions, and to a NotRegistered *target*: with no
+// worker it can never poll Temporal to register its build ID, so a
+// KEDA-managed target would read 0 backlog and stay at 0 forever - never
+// registered, never promoted. The NotRegistered floor is scoped to the
+// target so a stale version that was deleted server-side (also NotRegistered,
+// pending cleanup) is not pinned. Once a version becomes Current the floor is
+// released and the user's configured min applies.
 func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDeployment) (int64, bool) {
 	var base int32
 	var baseSet bool
@@ -199,7 +206,8 @@ func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDepl
 
 	// Warm-start invariant for new versions.
 	if v.Status == temporaliov1alpha1.VersionStatusRamping ||
-		v.Status == temporaliov1alpha1.VersionStatusInactive {
+		v.Status == temporaliov1alpha1.VersionStatusInactive ||
+		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) {
 		if !baseSet || base < 1 {
 			return 1, true
 		}
