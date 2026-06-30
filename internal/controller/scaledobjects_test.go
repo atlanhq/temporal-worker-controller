@@ -133,6 +133,14 @@ func TestActiveVersionsForScaling_ExcludesDrained(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{"current", "target", "inactive-one"}, buildIDs,
 		"drained version should be excluded; current/target/inactive included")
+
+	byID := make(map[string]versionRef, len(got))
+	for _, v := range got {
+		byID[v.BuildID] = v
+	}
+	assert.True(t, byID["target"].IsTarget, "target ref must be marked IsTarget")
+	assert.False(t, byID["current"].IsTarget, "current ref must not be marked IsTarget")
+	assert.False(t, byID["inactive-one"].IsTarget, "deprecated ref must not be marked IsTarget")
 }
 
 func TestActiveVersionsForScaling_TargetSameAsCurrent_NotDuplicated(t *testing.T) {
@@ -170,31 +178,44 @@ func TestResolveMinReplicas(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		twd     *temporaliov1alpha1.TemporalWorkerDeployment
-		status  temporaliov1alpha1.VersionStatus
-		wantVal int64
-		wantSet bool
+		name     string
+		twd      *temporaliov1alpha1.TemporalWorkerDeployment
+		status   temporaliov1alpha1.VersionStatus
+		isTarget bool
+		wantVal  int64
+		wantSet  bool
 	}{
 		// Nothing set → omitted entirely (KEDA default applies)
-		{"current, no config — omit", twdNoConfig, temporaliov1alpha1.VersionStatusCurrent, 0, false},
-		{"drained, no config — omit", twdNoConfig, temporaliov1alpha1.VersionStatusDrained, 0, false},
+		{"current, no config - omit", twdNoConfig, temporaliov1alpha1.VersionStatusCurrent, false, 0, false},
+		{"drained, no config - omit", twdNoConfig, temporaliov1alpha1.VersionStatusDrained, false, 0, false},
 
 		// Ramping/Inactive: warm-start invariant → at least 1
-		{"ramping, no config — warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusRamping, 1, true},
-		{"inactive, no config — warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusInactive, 1, true},
-		{"ramping, user min=0 — warm-start still bumps to 1", twdMin0, temporaliov1alpha1.VersionStatusRamping, 1, true},
+		{"ramping, no config - warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusRamping, false, 1, true},
+		{"inactive, no config - warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusInactive, false, 1, true},
+		{"ramping, user min=0 - warm-start still bumps to 1", twdMin0, temporaliov1alpha1.VersionStatusRamping, false, 1, true},
+
+		// NotRegistered target: floored to 1 so a worker can start, poll
+		// Temporal and register the build ID. Without this, a KEDA-managed
+		// target reads 0 backlog and is held at 0 forever (never registers,
+		// never promoted).
+		{"notregistered target, no config - warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusNotRegistered, true, 1, true},
+		{"notregistered target, user min=0 - warm-start still bumps to 1", twdMin0, temporaliov1alpha1.VersionStatusNotRegistered, true, 1, true},
+		{"notregistered target, user min=3 - uses 3", twdMin3, temporaliov1alpha1.VersionStatusNotRegistered, true, 3, true},
+
+		// NotRegistered but NOT the target (e.g. deleted server-side, pending
+		// cleanup): must NOT be pinned, or stale versions accumulate pods.
+		{"notregistered non-target - omit", twdNoConfig, temporaliov1alpha1.VersionStatusNotRegistered, false, 0, false},
 
 		// User-configured min: honored when above the warm-start floor
-		{"current, user min=3 — uses 3", twdMin3, temporaliov1alpha1.VersionStatusCurrent, 3, true},
-		{"ramping, user min=3 — uses 3 (above the warm-start floor of 1)", twdMin3, temporaliov1alpha1.VersionStatusRamping, 3, true},
+		{"current, user min=3 - uses 3", twdMin3, temporaliov1alpha1.VersionStatusCurrent, false, 3, true},
+		{"ramping, user min=3 - uses 3 (above the warm-start floor of 1)", twdMin3, temporaliov1alpha1.VersionStatusRamping, false, 3, true},
 
 		// Explicit 0 with user config: honored for non-ramping
-		{"current, user min=0 — uses 0", twdMin0, temporaliov1alpha1.VersionStatusCurrent, 0, true},
+		{"current, user min=0 - uses 0", twdMin0, temporaliov1alpha1.VersionStatusCurrent, false, 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotVal, gotSet := resolveMinReplicas(versionRef{Status: tc.status}, tc.twd)
+			gotVal, gotSet := resolveMinReplicas(versionRef{Status: tc.status, IsTarget: tc.isTarget}, tc.twd)
 			assert.Equal(t, tc.wantSet, gotSet, "set flag")
 			if tc.wantSet {
 				assert.Equal(t, tc.wantVal, gotVal)
