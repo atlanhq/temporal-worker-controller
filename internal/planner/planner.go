@@ -569,6 +569,30 @@ func getVersionConfigDiff(
 		return nil
 	}
 
+	// Promotion gate: when this reconcile would actually promote (target != current),
+	// require every task queue this version spans to have at least one versioned
+	// poller before we'd call SetCurrentVersion / SetRampingVersion. The local TWD's
+	// pods may be healthy, but if this deployment_name is shared with sibling TWDs
+	// (spec.workerOptions.workerDeploymentName), the sibling's pods may still be
+	// rolling out. Promoting now would create a window in which PINNED workflows
+	// started on this version have no pollers on a sibling's task queue, causing
+	// matching to drop the pin (independent pinned activity) or stall the activity
+	// entirely. In the single-TWD case this gate is satisfied as soon as our own
+	// pods register, so it costs nothing.
+	//
+	// Skipped when target == current — that path only resets a stale ramp on the
+	// already-current version and does not perform any new promotion.
+	isPromotion := status.CurrentVersion == nil ||
+		status.CurrentVersion.BuildID != status.TargetVersion.BuildID
+	if isPromotion {
+		if temporalState == nil {
+			return nil
+		}
+		if vInfo := temporalState.Versions[status.TargetVersion.BuildID]; vInfo == nil || !vInfo.AllTaskQueuesHaveVersionedPoller {
+			return nil
+		}
+	}
+
 	// Do nothing if the test workflows have not completed successfully
 	if strategy.Gate != nil {
 		if len(status.TargetVersion.TaskQueues) == 0 {

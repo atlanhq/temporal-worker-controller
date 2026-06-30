@@ -3957,6 +3957,10 @@ spec:
                     maxLength: 63
                     pattern: ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$
                     type: string
+                  workerDeploymentName:
+                    maxLength: 255
+                    pattern: ^[a-zA-Z0-9]([a-zA-Z0-9._/-]*[a-zA-Z0-9])?$
+                    type: string
                 required:
                 - connectionRef
                 - temporalNamespace
