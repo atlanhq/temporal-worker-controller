@@ -5,6 +5,7 @@ on:
     - v1.2.0-atlan
     - fix/twd-leaves-stale-versioning-data
     - sanil/per-version-scaledobjects
+    - feat/shared-deployment-name-and-promotion-gate
 jobs:
   build-image:
     runs-on: ubuntu-latest

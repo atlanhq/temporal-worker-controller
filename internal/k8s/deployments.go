@@ -135,9 +135,14 @@ func ComputeBuildID(w *temporaliov1alpha1.TemporalWorkerDeployment) string {
 	return utils.ComputeHash(&w.Spec.Template, nil, false)
 }
 
-// ComputeWorkerDeploymentName generates the base worker deployment name
+// ComputeWorkerDeploymentName returns the Temporal Worker Deployment name to register
+// this TWD's workers under. When the user has explicitly set spec.workerOptions.workerDeploymentName,
+// it overrides the auto-generated "<namespace>/<TWD-name>" so multiple TWDs can share a
+// deployment_name and be treated as one logical Worker Deployment by Temporal.
 func ComputeWorkerDeploymentName(w *temporaliov1alpha1.TemporalWorkerDeployment) string {
-	// Use the name and namespace to form the worker deployment name
+	if override := w.Spec.WorkerOptions.WorkerDeploymentName; override != "" {
+		return override
+	}
 	return w.GetNamespace() + WorkerDeploymentNameSeparator + w.GetName()
 }
 

@@ -534,6 +534,52 @@ func TestComputeWorkerDeploymentName_Integration_WithVersionedName(t *testing.T)
 	assert.True(t, strings.Contains(versionedName, k8s.CleanStringForDNS("v1.0.0")), "versioned name should contain cleaned image tag")
 }
 
+// TestComputeWorkerDeploymentName_Override verifies the spec.workerOptions.workerDeploymentName
+// override takes precedence over the auto-generated <namespace>/<name>. This is what lets
+// multiple TWDs share one Temporal Worker Deployment for cross-pool PINNED routing.
+func TestComputeWorkerDeploymentName_Override(t *testing.T) {
+	t.Run("override empty falls back to namespace/name", func(t *testing.T) {
+		twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "publish-app"},
+			Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				WorkerOptions: temporaliov1alpha1.WorkerOptions{
+					WorkerDeploymentName: "",
+				},
+			},
+		}
+		assert.Equal(t, "publish-app/main", k8s.ComputeWorkerDeploymentName(twd))
+	})
+
+	t.Run("override set replaces auto-generated name", func(t *testing.T) {
+		twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "publish-worker-twd", Namespace: "publish-app"},
+			Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				WorkerOptions: temporaliov1alpha1.WorkerOptions{
+					WorkerDeploymentName: "publish-app",
+				},
+			},
+		}
+		assert.Equal(t, "publish-app", k8s.ComputeWorkerDeploymentName(twd))
+	})
+
+	t.Run("two TWDs with same override produce same name", func(t *testing.T) {
+		twdMain := &temporaliov1alpha1.TemporalWorkerDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "publish-worker-twd", Namespace: "publish-app"},
+			Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				WorkerOptions: temporaliov1alpha1.WorkerOptions{WorkerDeploymentName: "publish-app"},
+			},
+		}
+		twdPool := &temporaliov1alpha1.TemporalWorkerDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "publish-metastore-od-twd", Namespace: "publish-app"},
+			Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				WorkerOptions: temporaliov1alpha1.WorkerOptions{WorkerDeploymentName: "publish-app"},
+			},
+		}
+		assert.Equal(t, k8s.ComputeWorkerDeploymentName(twdMain), k8s.ComputeWorkerDeploymentName(twdPool))
+		assert.Equal(t, "publish-app", k8s.ComputeWorkerDeploymentName(twdMain))
+	})
+}
+
 // TestNewDeploymentWithPodAnnotations tests that every new pod created has a connection spec hash annotation
 func TestNewDeploymentWithPodAnnotations(t *testing.T) {
 	connection := temporaliov1alpha1.TemporalConnectionSpec{

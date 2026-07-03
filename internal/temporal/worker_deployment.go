@@ -48,6 +48,14 @@ type VersionInfo struct {
 	// Only checked for Drained versions that don't have controller-managed Deployments.
 	// Used to compute status.VersionCountIneligibleForDeletion.
 	NoTaskQueuesHaveVersionedPoller bool
+	// True iff every task queue this version is registered on has at least one
+	// versioned poller right now. False could mean unknown / not yet checked /
+	// pollers missing on a sibling deployment.
+	// Only checked for the Target Version. Used as the promotion gate: the
+	// planner refuses to call SetCurrentVersion until this is true, so a version
+	// shared across multiple TWDs (via spec.workerOptions.workerDeploymentName)
+	// is only promoted once every pool's workers have rolled out and registered.
+	AllTaskQueuesHaveVersionedPoller bool
 }
 
 // TemporalWorkerState represents the state of a worker deployment in Temporal
@@ -207,6 +215,29 @@ func GetWorkerDeploymentState(
 				}
 			}
 
+		}
+
+		// Promotion gate: for the target version, check whether every task queue it
+		// spans currently has a versioned poller. Used by the planner to refuse
+		// SetCurrentVersion until pollers exist on every task queue — critical when
+		// multiple TWDs share a deployment_name (the rollout for one TWD's pods may
+		// outrun a sibling TWD's pods, and we must not promote until both register).
+		// Skipped for Draining/Drained statuses (a draining version has no business
+		// being a promotion target).
+		if version.Version.BuildId == targetBuildId &&
+			versionInfo.Status != temporaliov1alpha1.VersionStatusDraining &&
+			versionInfo.Status != temporaliov1alpha1.VersionStatusDrained &&
+			versionInfo.Status != temporaliov1alpha1.VersionStatusNotRegistered {
+			var desc temporalClient.WorkerDeploymentVersionDescription
+			describeVersion := func() error {
+				desc, err = deploymentHandler.DescribeVersion(ctx, temporalClient.WorkerDeploymentDescribeVersionOptions{
+					BuildID: version.Version.BuildId,
+				})
+				return err
+			}
+			if err = withBackoff(10*time.Second, 1*time.Second, describeVersion); err == nil { //revive:disable-line:max-control-nesting
+				versionInfo.AllTaskQueuesHaveVersionedPoller = allTaskQueuesHaveVersionedPoller(ctx, client, desc.Info.TaskQueuesInfos)
+			}
 		}
 
 		state.Versions[version.Version.BuildId] = versionInfo
@@ -407,6 +438,26 @@ func HasNoVersionedPollers(ctx context.Context,
 	return true, nil
 }
 
+// HasVersionedPoller returns true if at least one VERSIONED poller is currently
+// registered on the given task queue. Used to gate version promotion: we must not
+// promote a version until every task queue it spans has actually-polling versioned
+// workers. Symmetric to HasNoVersionedPollers (which is used for drain).
+func HasVersionedPoller(ctx context.Context,
+	client temporalClient.Client,
+	taskQueueInfo temporalClient.WorkerDeploymentTaskQueueInfo,
+) (bool, error) {
+	pollers, err := getPollers(ctx, client, taskQueueInfo)
+	if err != nil {
+		return false, fmt.Errorf("unable to confirm presence of versioned pollers: %w", err)
+	}
+	for _, p := range pollers {
+		if p.GetDeploymentOptions().GetWorkerVersioningMode() == temporalClient.WorkerVersioningModeVersioned {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func getPollers(ctx context.Context,
 	client temporalClient.Client,
 	taskQueueInfo temporalClient.WorkerDeploymentTaskQueueInfo,
@@ -453,4 +504,33 @@ func allTaskQueuesHaveUnversionedPoller(
 		}
 	}
 	return countHasUnversionedPoller == len(tqs)
+}
+
+// allTaskQueuesHaveVersionedPoller returns true iff every task queue in tqs has
+// at least one versioned poller registered. Used as the promotion gate so a
+// version is not declared current until workers for it actually exist on every
+// task queue it spans. In the single-TWD case this is trivially satisfied as
+// soon as the version's own pods are healthy. In the multi-TWD shared
+// deployment_name case it prevents promoting V_new while a sibling TWD's V_new
+// pods are still rolling out, which would otherwise create a window in which
+// PINNED workflows started on V_new have no V_new pollers on a sibling's queue.
+//
+// Returns false on the (degenerate) empty-tq input — a version with no task
+// queues registered should never be promoted.
+func allTaskQueuesHaveVersionedPoller(
+	ctx context.Context,
+	client temporalClient.Client,
+	tqs []temporalClient.WorkerDeploymentTaskQueueInfo,
+) bool {
+	if len(tqs) == 0 {
+		return false
+	}
+	countHasVersionedPoller := 0
+	for _, tqInfo := range tqs {
+		hasVersionedPoller, _ := HasVersionedPoller(ctx, client, tqInfo) // TODO: consider logging this error
+		if hasVersionedPoller {
+			countHasVersionedPoller++
+		}
+	}
+	return countHasVersionedPoller == len(tqs)
 }

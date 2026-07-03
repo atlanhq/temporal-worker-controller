@@ -46,6 +46,28 @@ type WorkerOptions struct {
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
 	UnsafeCustomBuildID string `json:"unsafeCustomBuildID,omitempty"`
+
+	// WorkerDeploymentName overrides the auto-generated Temporal Worker Deployment name
+	// (default: "<namespace>/<TWD-name>"). When multiple TemporalWorkerDeployments
+	// declare the same WorkerDeploymentName, Temporal treats them as one logical Worker
+	// Deployment whose workers happen to poll different task queues. Activities of a
+	// PINNED workflow then route correctly across all task queues registered to that
+	// deployment, because matching honors the workflow's pinned (deployment_name,
+	// build_id) regardless of which task queue the activity targets.
+	//
+	// REQUIREMENTS when sharing across multiple TWDs:
+	//   - All sharing TWDs MUST use identical UnsafeCustomBuildID (or otherwise produce
+	//     identical build_ids) so a single version exists across all pools at any moment.
+	//   - All sharing TWDs MUST be image-equivalent for workflow execution semantics.
+	//     A workflow PINNED to a (deployment_name, build_id) may have its activities
+	//     served by any TWD in the group; divergent code between pools = silent bugs.
+	//   - Version lifecycle (current / ramping / drain) is unified across the group.
+	//     You cannot independently roll one pool without the others.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._/-]*[a-zA-Z0-9])?$`
+	WorkerDeploymentName string `json:"workerDeploymentName,omitempty"`
 }
 
 // TemporalWorkerDeploymentSpec defines the desired state of TemporalWorkerDeployment

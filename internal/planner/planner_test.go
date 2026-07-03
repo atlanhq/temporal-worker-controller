@@ -1089,7 +1089,12 @@ func TestGetVersionConfigDiff(t *testing.T) {
 					},
 				},
 			},
-			spec:             &temporaliov1alpha1.TemporalWorkerDeploymentSpec{},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{},
+			state: &temporal.TemporalWorkerState{
+				Versions: map[string]*temporal.VersionInfo{
+					"test/namespace.123": {BuildID: "test/namespace.123", AllTaskQueuesHaveVersionedPoller: true},
+				},
+			},
 			expectConfig:     true,
 			expectSetCurrent: true,
 		},
@@ -1127,7 +1132,12 @@ func TestGetVersionConfigDiff(t *testing.T) {
 					},
 				},
 			},
-			spec:              &temporaliov1alpha1.TemporalWorkerDeploymentSpec{},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{},
+			state: &temporal.TemporalWorkerState{
+				Versions: map[string]*temporal.VersionInfo{
+					"123": {BuildID: "123", AllTaskQueuesHaveVersionedPoller: true},
+				},
+			},
 			expectConfig:      true,
 			expectSetCurrent:  false,
 			expectRampPercent: int32Ptr(25),
@@ -1200,7 +1210,12 @@ func TestGetVersionConfigDiff(t *testing.T) {
 					},
 				},
 			},
-			spec:              &temporaliov1alpha1.TemporalWorkerDeploymentSpec{},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{},
+			state: &temporal.TemporalWorkerState{
+				Versions: map[string]*temporal.VersionInfo{
+					"789": {BuildID: "789", AllTaskQueuesHaveVersionedPoller: true},
+				},
+			},
 			expectConfig:      true,
 			expectSetCurrent:  true,
 			expectRampPercent: func() *int32 { f := int32(0); return &f }(),
@@ -1235,7 +1250,7 @@ func TestGetVersionConfigDiff(t *testing.T) {
 			},
 			state: &temporal.TemporalWorkerState{
 				Versions: map[string]*temporal.VersionInfo{
-					"123": {BuildID: "123", AllTaskQueuesHaveUnversionedPoller: false},
+					"123": {BuildID: "123", AllTaskQueuesHaveUnversionedPoller: false, AllTaskQueuesHaveVersionedPoller: true},
 				},
 			},
 			expectConfig:     true,
@@ -1259,6 +1274,103 @@ func TestGetVersionConfigDiff(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetVersionConfigDiff_PromotionGate exercises the AllTaskQueuesHaveVersionedPoller
+// gate that prevents SetCurrentVersion until every task queue this version spans has
+// at least one versioned poller. Critical for multi-TWD shared-deployment-name setups
+// where a sibling pool's rollout may lag.
+func TestGetVersionConfigDiff_PromotionGate(t *testing.T) {
+	healthyStatus := func(targetBuildID, currentBuildID string) *temporaliov1alpha1.TemporalWorkerDeploymentStatus {
+		s := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+			TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID:      targetBuildID,
+					Status:       temporaliov1alpha1.VersionStatusInactive,
+					HealthySince: &metav1.Time{Time: time.Now().Add(-1 * time.Hour)},
+				},
+			},
+		}
+		if currentBuildID != "" {
+			s.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID: currentBuildID,
+					Status:  temporaliov1alpha1.VersionStatusCurrent,
+				},
+			}
+		}
+		return s
+	}
+
+	t.Run("promotion blocked when AllTaskQueuesHaveVersionedPoller is false", func(t *testing.T) {
+		config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+		state := &temporal.TemporalWorkerState{
+			Versions: map[string]*temporal.VersionInfo{
+				"v-new": {BuildID: "v-new", AllTaskQueuesHaveVersionedPoller: false},
+			},
+		}
+		got := getVersionConfigDiff(testlogr.New(t), healthyStatus("v-new", "v-old"), state, config, "test/ns")
+		assert.Nil(t, got, "promotion must be blocked while sibling pool's pollers are not yet registered")
+	})
+
+	t.Run("promotion proceeds when AllTaskQueuesHaveVersionedPoller is true", func(t *testing.T) {
+		config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+		state := &temporal.TemporalWorkerState{
+			Versions: map[string]*temporal.VersionInfo{
+				"v-new": {BuildID: "v-new", AllTaskQueuesHaveVersionedPoller: true},
+			},
+		}
+		got := getVersionConfigDiff(testlogr.New(t), healthyStatus("v-new", "v-old"), state, config, "test/ns")
+		assert.NotNil(t, got, "promotion should fire once pollers exist on all task queues")
+		assert.True(t, got.SetCurrent, "expected SetCurrent=true")
+	})
+
+	t.Run("gate is skipped when target equals current (ramp-reset path)", func(t *testing.T) {
+		// target == current means we're not actually promoting — just resetting a
+		// stale ramp. The gate must let this pass even when AllTaskQueuesHaveVersionedPoller
+		// is false (e.g., transient describe failure).
+		config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+		status := healthyStatus("v-current", "v-current")
+		status.TargetVersion.Status = temporaliov1alpha1.VersionStatusCurrent
+		state := &temporal.TemporalWorkerState{
+			RampingBuildID: "v-stale-ramp", // triggers reset
+			Versions: map[string]*temporal.VersionInfo{
+				"v-current": {BuildID: "v-current", AllTaskQueuesHaveVersionedPoller: false},
+			},
+		}
+		got := getVersionConfigDiff(testlogr.New(t), status, state, config, "test/ns")
+		assert.NotNil(t, got, "ramp reset should fire even when gate would block a promotion")
+		assert.False(t, got.SetCurrent, "ramp reset is not a SetCurrent")
+		assert.Equal(t, int32(0), got.RampPercentage)
+	})
+
+	t.Run("promotion blocked when target version is missing from state map", func(t *testing.T) {
+		// Conservative: if we don't have state info for the target, don't promote.
+		// Next reconcile will refresh state.
+		config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+		state := &temporal.TemporalWorkerState{Versions: map[string]*temporal.VersionInfo{}}
+		got := getVersionConfigDiff(testlogr.New(t), healthyStatus("v-new", "v-old"), state, config, "test/ns")
+		assert.Nil(t, got, "promotion must be blocked when target version is absent from state")
+	})
+
+	t.Run("promotion blocked when temporalState is nil", func(t *testing.T) {
+		config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+		got := getVersionConfigDiff(testlogr.New(t), healthyStatus("v-new", "v-old"), nil, config, "test/ns")
+		assert.Nil(t, got, "promotion must be blocked when temporalState is nil")
+	})
+
+	t.Run("first install (no current) is also gated", func(t *testing.T) {
+		// CurrentVersion=nil means isPromotion=true. The fast-track to set current
+		// must still wait for at least one versioned poller.
+		config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+		state := &temporal.TemporalWorkerState{
+			Versions: map[string]*temporal.VersionInfo{
+				"v-first": {BuildID: "v-first", AllTaskQueuesHaveVersionedPoller: false},
+			},
+		}
+		got := getVersionConfigDiff(testlogr.New(t), healthyStatus("v-first", ""), state, config, "test/ns")
+		assert.Nil(t, got, "first install should still wait for pollers before promotion")
+	})
 }
 
 func TestGetVersionConfig_ProgressiveRolloutEdgeCases(t *testing.T) {
@@ -1477,7 +1589,22 @@ func TestGetVersionConfig_ProgressiveRolloutEdgeCases(t *testing.T) {
 			config := &Config{
 				RolloutStrategy: tc.strategy,
 			}
-			versionConfig := getVersionConfigDiff(testlogr.New(t), tc.status, tc.state, config, "test/namespace")
+			// Default to a "healthy" temporal state where the target version has
+			// versioned pollers on every task queue it spans. Tests that want to
+			// exercise the promotion gate's "not ready" path should set their own
+			// state explicitly.
+			state := tc.state
+			if state == nil && tc.status != nil {
+				state = &temporal.TemporalWorkerState{
+					Versions: map[string]*temporal.VersionInfo{
+						tc.status.TargetVersion.BuildID: {
+							BuildID:                          tc.status.TargetVersion.BuildID,
+							AllTaskQueuesHaveVersionedPoller: true,
+						},
+					},
+				}
+			}
+			versionConfig := getVersionConfigDiff(testlogr.New(t), tc.status, state, config, "test/namespace")
 			assert.Equal(t, tc.expectConfig, versionConfig != nil, "unexpected version config presence")
 			if tc.expectConfig {
 				assert.Equal(t, tc.expectSetCurrent, versionConfig.SetCurrent, "unexpected set default value")
