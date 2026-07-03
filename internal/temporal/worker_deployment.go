@@ -217,17 +217,11 @@ func GetWorkerDeploymentState(
 
 		}
 
-		// Promotion gate: for the target version, check whether every task queue it
-		// spans currently has a versioned poller. Used by the planner to refuse
-		// SetCurrentVersion until pollers exist on every task queue — critical when
-		// multiple TWDs share a deployment_name (the rollout for one TWD's pods may
-		// outrun a sibling TWD's pods, and we must not promote until both register).
-		// Skipped for Draining/Drained statuses (a draining version has no business
-		// being a promotion target).
-		if version.Version.BuildId == targetBuildId &&
-			versionInfo.Status != temporaliov1alpha1.VersionStatusDraining &&
-			versionInfo.Status != temporaliov1alpha1.VersionStatusDrained &&
-			versionInfo.Status != temporaliov1alpha1.VersionStatusNotRegistered {
+		// Promotion gate input: populate AllTaskQueuesHaveVersionedPoller for the
+		// target version so the planner can refuse SetCurrentVersion until every task
+		// queue the version spans has a versioned poller. See shouldCheckVersionedPollerGate
+		// for which versions this is computed for, and why.
+		if shouldCheckVersionedPollerGate(version.Version.BuildId, targetBuildId, state.CurrentBuildID, versionInfo.Status) {
 			var desc temporalClient.WorkerDeploymentVersionDescription
 			describeVersion := func() error {
 				desc, err = deploymentHandler.DescribeVersion(ctx, temporalClient.WorkerDeploymentDescribeVersionOptions{
@@ -533,4 +527,33 @@ func allTaskQueuesHaveVersionedPoller(
 		}
 	}
 	return countHasVersionedPoller == len(tqs)
+}
+
+// shouldCheckVersionedPollerGate reports whether GetWorkerDeploymentState should
+// query poller presence to populate AllTaskQueuesHaveVersionedPoller for a version.
+//
+// The planner reads that field only on the promotion path (target != current, i.e.
+// isPromotion), so it is computed only for the target version and only while the
+// target is not already current. Describing an already-current version would issue a
+// wasted DescribeVersion plus one DescribeTaskQueue per task queue on every reconcile,
+// and a version stays current for weeks. Draining/Drained/NotRegistered versions are
+// never promotion targets.
+//
+// currentBuildID comes from the same Temporal snapshot the status mapper turns into
+// status.CurrentVersion, so this predicate matches the planner's isPromotion exactly.
+func shouldCheckVersionedPollerGate(buildID, targetBuildID, currentBuildID string, status temporaliov1alpha1.VersionStatus) bool {
+	if buildID != targetBuildID {
+		return false
+	}
+	// Target is already current: not a promotion, so the planner never reads the gate.
+	if targetBuildID == currentBuildID {
+		return false
+	}
+	switch status {
+	case temporaliov1alpha1.VersionStatusDraining,
+		temporaliov1alpha1.VersionStatusDrained,
+		temporaliov1alpha1.VersionStatusNotRegistered:
+		return false
+	}
+	return true
 }
