@@ -166,3 +166,30 @@ func eventually(t *testing.T, timeout, interval time.Duration, check func() erro
 		t.Fatalf("eventually failed after %s: %v", timeout, lastErr)
 	}
 }
+
+func TestShouldCheckVersionedPollerGate(t *testing.T) {
+	const target = "v-target"
+	cases := []struct {
+		name           string
+		buildID        string
+		targetBuildID  string
+		currentBuildID string
+		status         temporaliov1alpha1.VersionStatus
+		want           bool
+	}{
+		{"non-target version is never checked", "v-other", target, "v-old", temporaliov1alpha1.VersionStatusInactive, false},
+		{"target already current is skipped", target, target, target, temporaliov1alpha1.VersionStatusCurrent, false},
+		{"target promoting over an existing current is checked", target, target, "v-old", temporaliov1alpha1.VersionStatusInactive, true},
+		{"target on first install (no current) is checked", target, target, "", temporaliov1alpha1.VersionStatusInactive, true},
+		{"ramping target is checked", target, target, "v-old", temporaliov1alpha1.VersionStatusRamping, true},
+		{"draining target is skipped", target, target, "v-old", temporaliov1alpha1.VersionStatusDraining, false},
+		{"drained target is skipped", target, target, "v-old", temporaliov1alpha1.VersionStatusDrained, false},
+		{"not-registered target is skipped", target, target, "v-old", temporaliov1alpha1.VersionStatusNotRegistered, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldCheckVersionedPollerGate(tc.buildID, tc.targetBuildID, tc.currentBuildID, tc.status)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
