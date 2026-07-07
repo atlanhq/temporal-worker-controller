@@ -57,6 +57,7 @@ import (
 
 	"github.com/go-logr/logr"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
+	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -691,10 +692,16 @@ func resolveTaskQueue(twd *temporaliov1alpha1.TemporalWorkerDeployment) string {
 // in the trigger metadata. The KEDA Temporal scaler combines this with
 // buildId to query "TemporalWorkerDeploymentVersion = '<dep>:<bid>'" — the
 // canonical, non-deprecated way to count workflows pinned to / assigned to
-// a specific version. Format is "<namespace>/<twd-name>" matching the
-// TEMPORAL_DEPLOYMENT_NAME env on worker pods.
+// a specific version. This MUST match the TEMPORAL_DEPLOYMENT_NAME env on
+// worker pods (which comes from k8s.ComputeWorkerDeploymentName), otherwise
+// KEDA queries the wrong deployment and sees zero backlog — even though the
+// workers are registered and picking up tasks under the actual deployment
+// name. Delegates to k8s.ComputeWorkerDeploymentName so
+// spec.workerOptions.workerDeploymentName overrides (used to make several
+// TWDs share one Temporal Worker Deployment identity) are honored the same
+// way the deployment template already honors them.
 func resolveWorkerDeployment(twd *temporaliov1alpha1.TemporalWorkerDeployment) string {
-	return twd.Namespace + "/" + twd.Name
+	return k8s.ComputeWorkerDeploymentName(twd)
 }
 
 // --- Helpers ------------------------------------------------------------------
