@@ -6,6 +6,7 @@ on:
     - fix/twd-leaves-stale-versioning-data
     - sanil/per-version-scaledobjects
     - feat/shared-deployment-name-and-promotion-gate
+    - fix/scaledobject-honor-worker-deployment-name-override
 jobs:
   build-image:
     runs-on: ubuntu-latest
