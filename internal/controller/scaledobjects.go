@@ -52,6 +52,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -497,11 +498,18 @@ func buildScaledObject(
 	// Field names match upstream KEDA v2.20.1's schema (workerDeploymentName +
 	// workerDeploymentBuildId). The fork (atlanhq/keda 2.19.0-main) accepts
 	// these via the rename PR companion to this change.
+	resolvedWDN := resolveWorkerDeployment(twd)
+	fmt.Fprintf(os.Stderr,
+		"DBG-FIX buildScaledObject twdNS=%s twdName=%s specWDN=%q resolvedWDN=%q buildId=%s\n",
+		twd.Namespace, twd.Name,
+		twd.Spec.WorkerOptions.WorkerDeploymentName,
+		resolvedWDN, v.BuildID,
+	)
 	triggerMetadata := map[string]interface{}{
 		"endpoint":                temporalEndpoint,
 		"namespace":               twd.Spec.WorkerOptions.TemporalNamespace,
 		"taskQueue":               resolveTaskQueue(twd),
-		"workerDeploymentName":    resolveWorkerDeployment(twd),
+		"workerDeploymentName":    resolvedWDN,
 		"workerDeploymentBuildId": v.BuildID,
 	}
 	// Current and Ramping versions catch unassigned backlog so they can scale
