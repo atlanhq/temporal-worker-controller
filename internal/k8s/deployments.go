@@ -138,6 +138,12 @@ func ComputeBuildID(w *temporaliov1alpha1.TemporalWorkerDeployment) string {
 
 // ComputeWorkerDeploymentName generates the base worker deployment name
 func ComputeWorkerDeploymentName(w *temporaliov1alpha1.TemporalWorkerDeployment) string {
+	// Atlan: an explicit WorkerDeploymentName lets multiple TWDs share one logical
+	// Temporal Worker Deployment (see WorkerOptions.WorkerDeploymentName). When unset,
+	// derive from namespace/name.
+	if override := w.Spec.WorkerOptions.WorkerDeploymentName; override != "" {
+		return override
+	}
 	// Use the name and namespace to form the worker deployment name
 	return w.GetNamespace() + WorkerDeploymentNameSeparator + w.GetName()
 }
