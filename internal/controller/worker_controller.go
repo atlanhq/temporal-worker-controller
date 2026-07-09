@@ -53,6 +53,14 @@ const (
 	// ensures Temporal server-side versioning data is cleaned up. On TemporalConnection
 	// resources, it prevents deletion while any TWD still references the connection.
 	finalizerName = "temporal.io/delete-protection"
+
+	// legacyTWDFinalizer and legacyTCFinalizer are the pre-v1.6 finalizer names used by the
+	// atlanhq fork before #240 consolidated them into finalizerName. Objects created by the
+	// old fork still carry these; the reconciler strips them once finalizerName is present, so
+	// deletions are not blocked by a finalizer no controller recognizes. Transitional: remove
+	// these and migrateFinalizer once every cluster has migrated off the legacy names.
+	legacyTWDFinalizer = "temporal.io/worker-deployment-cleanup"
+	legacyTCFinalizer  = "temporal.io/connection-in-use"
 )
 
 // getAPIKeySecretName extracts the secret name from a SecretKeySelector
@@ -167,19 +175,34 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 				return ctrl.Result{}, err
 			}
 
-			// Cleanup succeeded, remove the finalizer so K8s can delete the resource
+			// Cleanup succeeded: remove delete-protection and the legacy fork finalizer so
+			// K8s can delete the resource.
 			controllerutil.RemoveFinalizer(&workerDeploy, finalizerName)
+			controllerutil.RemoveFinalizer(&workerDeploy, legacyTWDFinalizer)
 			if err := r.Update(ctx, &workerDeploy); err != nil {
 				return ctrl.Result{}, err
 			}
 			l.Info("Temporal server-side cleanup complete, finalizer removed")
+		} else if controllerutil.RemoveFinalizer(&workerDeploy, legacyTWDFinalizer) {
+			// Object was deleted under the old fork before this upgrade: only the legacy
+			// finalizer is present and delete-protection was never added, so upstream cleanup
+			// cannot run here (the API server forbids adding a finalizer to a deleting object).
+			// Strip the legacy finalizer to release the object for deletion.
+			l.Info("released deleting object by stripping orphaned legacy finalizer",
+				"finalizer", legacyTWDFinalizer)
+			if err := r.Update(ctx, &workerDeploy); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure finalizer is present on non-deleted resources
-	if !controllerutil.ContainsFinalizer(&workerDeploy, finalizerName) {
-		controllerutil.AddFinalizer(&workerDeploy, finalizerName)
+	// Ensure delete-protection is present and strip the legacy fork finalizer once it is
+	// (add-before-strip). Transitional migration off the old fork's finalizer name.
+	if changed, stripped := migrateFinalizer(&workerDeploy, legacyTWDFinalizer); changed {
+		if stripped {
+			l.Info("stripped legacy fork finalizer", "finalizer", legacyTWDFinalizer)
+		}
 		if err := r.Update(ctx, &workerDeploy); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -637,6 +660,21 @@ func (r *TemporalWorkerDeploymentReconciler) recordWarningAndSetBlocked(
 	_ = r.Status().Update(ctx, workerDeploy)
 }
 
+// migrateFinalizer ensures finalizerName is present on obj and, once it is, strips the given
+// legacy fork finalizer. It enforces add-before-strip (obj is never left without a cleanup
+// finalizer while deletable) and never adds a finalizer to an object being deleted (the API
+// server rejects that). Returns whether obj changed and whether a legacy finalizer was
+// stripped (for logging). Transitional: remove with the legacy* constants once migrated.
+func migrateFinalizer(obj client.Object, legacy string) (changed, strippedLegacy bool) {
+	if obj.GetDeletionTimestamp().IsZero() {
+		changed = controllerutil.AddFinalizer(obj, finalizerName)
+	}
+	if controllerutil.ContainsFinalizer(obj, finalizerName) {
+		strippedLegacy = controllerutil.RemoveFinalizer(obj, legacy)
+	}
+	return changed || strippedLegacy, strippedLegacy
+}
+
 // ensureConnectionFinalizer adds our finalizer to the TemporalConnection so it
 // cannot be deleted while this TWD still needs it for cleanup.
 func (r *TemporalWorkerDeploymentReconciler) ensureConnectionFinalizer(
@@ -644,11 +682,14 @@ func (r *TemporalWorkerDeploymentReconciler) ensureConnectionFinalizer(
 	l logr.Logger,
 	tc *temporaliov1alpha1.TemporalConnection,
 ) error {
-	if !controllerutil.ContainsFinalizer(tc, finalizerName) {
-		l.Info("Adding finalizer to TemporalConnection", "connection", tc.Name)
-		controllerutil.AddFinalizer(tc, finalizerName)
+	changed, stripped := migrateFinalizer(tc, legacyTCFinalizer)
+	if stripped {
+		l.Info("stripped legacy fork finalizer from TemporalConnection", "connection", tc.Name, "finalizer", legacyTCFinalizer)
+	}
+	if changed {
+		l.Info("updating finalizers on TemporalConnection", "connection", tc.Name)
 		if err := r.Update(ctx, tc); err != nil {
-			return fmt.Errorf("unable to add finalizer to TemporalConnection %q: %w", tc.Name, err)
+			return fmt.Errorf("unable to update finalizers on TemporalConnection %q: %w", tc.Name, err)
 		}
 	}
 	return nil
@@ -694,9 +735,10 @@ func (r *TemporalWorkerDeploymentReconciler) removeConnectionFinalizerIfUnused(
 		return fmt.Errorf("unable to fetch TemporalConnection %q: %w", connectionName, err)
 	}
 
-	if controllerutil.ContainsFinalizer(&tc, finalizerName) {
-		l.Info("Removing finalizer from TemporalConnection", "connection", connectionName)
-		controllerutil.RemoveFinalizer(&tc, finalizerName)
+	protectionRemoved := controllerutil.RemoveFinalizer(&tc, finalizerName)
+	legacyRemoved := controllerutil.RemoveFinalizer(&tc, legacyTCFinalizer)
+	if protectionRemoved || legacyRemoved {
+		l.Info("Removing finalizers from TemporalConnection", "connection", connectionName)
 		if err := r.Update(ctx, &tc); err != nil {
 			return fmt.Errorf("unable to remove finalizer from TemporalConnection %q: %w", connectionName, err)
 		}
