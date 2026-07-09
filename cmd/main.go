@@ -24,6 +24,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -59,7 +60,7 @@ func main() {
 	//ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	ctrl.SetLogger(zap.New(zap.JSONEncoder()))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	ctrlOpts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
@@ -78,7 +79,15 @@ func main() {
 		// if you are doing or is intended to do any operation such as perform cleanups
 		// after the manager stops then its usage might be unsafe.
 		// LeaderElectionReleaseOnCancel: true,
-	})
+	}
+	// WATCH_NAMESPACE, when set, scopes the controller's cache (and thus the resources it
+	// reconciles) to a single namespace. Empty (the default) watches all namespaces, so
+	// production behavior is unchanged. Used to isolate the controller to a test namespace
+	// for on-cluster validation.
+	if watchNs := os.Getenv("WATCH_NAMESPACE"); watchNs != "" {
+		ctrlOpts.Cache.DefaultNamespaces = map[string]cache.Config{watchNs: {}}
+	}
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrlOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
