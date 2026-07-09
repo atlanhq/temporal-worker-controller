@@ -125,6 +125,7 @@ type TemporalWorkerDeploymentReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=update
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=temporal.io,resources=workerresourcetemplates,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=temporal.io,resources=workerresourcetemplates/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
@@ -354,6 +355,15 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 	if err := workerDeploy.Default(ctx, &workerDeploy); err != nil {
 		l.Error(err, "TemporalWorkerDeployment defaulter failed")
 		return ctrl.Result{}, err
+	}
+
+	// Reconcile per-version KEDA ScaledObjects before planning: this labels the
+	// child Deployments that have a managed ScaledObject, which getScaleDeployments
+	// reads to decide whether to skip .spec.replicas writes (KEDA owns them).
+	// Don't block the rest of the reconcile on SO failures - the planner's fallback
+	// (writing .spec.replicas on unlabelled Deployments) keeps the system functional.
+	if err := r.reconcileScaledObjects(ctx, l, &workerDeploy, temporalConnection.Spec.HostPort); err != nil {
+		l.Error(err, "scaled-object reconcile failed; continuing with legacy path")
 	}
 
 	// Generate a plan to get to desired spec from current status
