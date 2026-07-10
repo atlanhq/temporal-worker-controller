@@ -32,3 +32,24 @@ jobs:
           tags: |
             ghcr.io/atlanhq/temporal-worker-controller:${{ steps.chart.outputs.version }}-${{ github.sha }}
             ghcr.io/atlanhq/temporal-worker-controller:${{ steps.chart.outputs.version }}
+
+  push-chart:
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        run: echo "${{ secrets.ORG_PAT_GITHUB }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Package and push Helm charts
+        run: |
+          CHART_VERSION=$(grep '^version:' helm/temporal-worker-controller/Chart.yaml | awk '{print $2}')
+          helm package helm/temporal-worker-controller
+          helm push "temporal-worker-controller-${CHART_VERSION}.tgz" oci://ghcr.io/atlanhq/charts
+          # v1.6.0 splits CRDs into their own chart; publish it too, or the controller
+          # crash-loops on the missing WorkerResourceTemplate CRD (validated on-cluster).
+          CRDS_VERSION=$(grep '^version:' helm/temporal-worker-controller-crds/Chart.yaml | awk '{print $2}')
+          helm package helm/temporal-worker-controller-crds
+          helm push "temporal-worker-controller-crds-${CRDS_VERSION}.tgz" oci://ghcr.io/atlanhq/charts
