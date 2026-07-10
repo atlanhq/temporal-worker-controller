@@ -46,6 +46,10 @@ jobs:
       - name: Package and push Helm charts
         run: |
           CHART_VERSION=$(grep '^version:' helm/temporal-worker-controller/Chart.yaml | awk '{print $2}')
+          # The controller chart declares a condition-gated cert-manager subchart dep;
+          # helm package requires every dep vendored even though Atlan sets certmanager.install=false.
+          helm repo add jetstack https://charts.jetstack.io
+          helm dependency build helm/temporal-worker-controller
           helm package helm/temporal-worker-controller
           helm push "temporal-worker-controller-${CHART_VERSION}.tgz" oci://ghcr.io/atlanhq/charts
           # v1.6.0 splits CRDs into their own chart; publish it too, or the controller
