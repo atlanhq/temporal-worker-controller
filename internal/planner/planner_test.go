@@ -434,6 +434,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 		config                    *Config
 		expectDeletes             int
 		foundDeploymentInTemporal bool
+		workerDeploymentName      string
 	}{
 		{
 			name: "drained version should be deleted",
@@ -562,13 +563,84 @@ func TestGetDeleteDeployments(t *testing.T) {
 			expectDeletes:             0,
 			foundDeploymentInTemporal: false,
 		},
+		{
+			// Regression: a NotRegistered version whose Deployment was registered under
+			// a *different* worker deployment name (e.g. after spec.workerOptions.workerDeploymentName
+			// was changed to a shared name) must not be deleted. The controller only knows the drainage
+			// state of the currently-resolved worker deployment name, so deleting a Deployment that belongs
+			// to another one can strand still-open pinned workflows on that other deployment.
+			name: "not registered version under a different workerDeploymentName should NOT be deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": createDeploymentWithWorkerDeploymentName(1, "publish-app/publish-worker-twd"),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectDeletes:             0,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
+		{
+			// Control: a NotRegistered version registered under the *current* worker deployment name
+			// is a genuine phantom (created but never registered, now superseded) and is still deleted.
+			name: "not registered version under the current workerDeploymentName should be deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": createDeploymentWithWorkerDeploymentName(1, "publish-app/shared"),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectDeletes:             1,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.spec.Default(context.Background())
 			require.NoError(t, err)
-			deletes := getDeleteDeployments(tc.k8sState, tc.status, tc.spec, tc.foundDeploymentInTemporal)
+			deletes := getDeleteDeployments(tc.k8sState, tc.status, tc.spec, tc.foundDeploymentInTemporal, tc.workerDeploymentName)
 			assert.Equal(t, tc.expectDeletes, len(deletes), "unexpected number of deletes")
 		})
 	}
@@ -2515,6 +2587,36 @@ func createDeploymentWithDefaultConnectionSpecHash(replicas int32) *appsv1.Deplo
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
 						k8s.ConnectionSpecHashAnnotation: k8s.ComputeConnectionSpecHash(createDefaultConnectionSpec()),
+					},
+				},
+			},
+		},
+	}
+}
+
+// Helper function to create a deployment whose pod spec records the given worker deployment name
+// via the TEMPORAL_DEPLOYMENT_NAME env var, mirroring what the controller sets at creation time.
+func createDeploymentWithWorkerDeploymentName(replicas int32, workerDeploymentName string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-deployment",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						k8s.ConnectionSpecHashAnnotation: k8s.ComputeConnectionSpecHash(createDefaultConnectionSpec()),
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "worker",
+							Env: []corev1.EnvVar{
+								{Name: "TEMPORAL_DEPLOYMENT_NAME", Value: workerDeploymentName},
+							},
+						},
 					},
 				},
 			},

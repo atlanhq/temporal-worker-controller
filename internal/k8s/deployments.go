@@ -35,6 +35,9 @@ const (
 	MaxBuildIdLen                 = 63
 	ConnectionSpecHashAnnotation  = "temporal.io/connection-spec-hash"
 	PodTemplateSpecHashAnnotation = "temporal.io/pod-template-spec-hash"
+	// TemporalDeploymentNameEnvVar names the env var that records, on each worker pod, the
+	// Temporal worker deployment name its version was registered under at creation time.
+	TemporalDeploymentNameEnvVar = "TEMPORAL_DEPLOYMENT_NAME"
 )
 
 // DeploymentState represents the Kubernetes state of all deployments for a temporal worker deployment
@@ -144,6 +147,25 @@ func ComputeWorkerDeploymentName(w *temporaliov1alpha1.TemporalWorkerDeployment)
 		return override
 	}
 	return w.GetNamespace() + WorkerDeploymentNameSeparator + w.GetName()
+}
+
+// WorkerDeploymentNameFromDeployment returns the Temporal worker deployment name that the given
+// Deployment's workers were registered under, read from the TemporalDeploymentNameEnvVar set at
+// creation time. It returns "" if no container records the env var. This is the reliable signal
+// for detecting a Deployment left behind by a spec.workerOptions.workerDeploymentName change: its
+// recorded name differs from the currently-resolved one.
+func WorkerDeploymentNameFromDeployment(d *appsv1.Deployment) string {
+	if d == nil {
+		return ""
+	}
+	for _, container := range d.Spec.Template.Spec.Containers {
+		for _, env := range container.Env {
+			if env.Name == TemporalDeploymentNameEnvVar {
+				return env.Value
+			}
+		}
+	}
+	return ""
 }
 
 // ComputeVersionedDeploymentName generates a name for a versioned deployment
@@ -341,7 +363,7 @@ func ApplyControllerPodSpecModifications(
 				Value: temporalNamespace,
 			},
 			corev1.EnvVar{
-				Name:  "TEMPORAL_DEPLOYMENT_NAME",
+				Name:  TemporalDeploymentNameEnvVar,
 				Value: workerDeploymentName,
 			},
 			corev1.EnvVar{
