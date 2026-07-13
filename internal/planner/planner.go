@@ -89,7 +89,7 @@ func GeneratePlan(
 	foundDeploymentInTemporal := temporalState != nil && len(temporalState.Versions) > 0
 
 	// Add delete/scale operations based on version status
-	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal)
+	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal, workerDeploymentName)
 	plan.ScaleDeployments = getScaleDeployments(k8sState, status, spec)
 	plan.ShouldCreateDeployment = shouldCreateDeployment(status, maxVersionsIneligibleForDeletion)
 	plan.UpdateDeployments = getUpdateDeployments(k8sState, status, spec, connection)
@@ -335,6 +335,7 @@ func getDeleteDeployments(
 	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
 	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
 	foundDeploymentInTemporal bool,
+	workerDeploymentName string,
 ) []*appsv1.Deployment {
 	var deleteDeployments []*appsv1.Deployment
 
@@ -359,6 +360,14 @@ func getDeleteDeployments(
 				deleteDeployments = append(deleteDeployments, d)
 			}
 		case temporaliov1alpha1.VersionStatusNotRegistered:
+			// A Deployment left behind by a spec.workerOptions.workerDeploymentName change reads as
+			// NotRegistered here, because the controller only describes the currently-resolved worker
+			// deployment name and this Deployment was registered under a different one. Deleting it
+			// would strand any still-open pinned workflows on that other deployment, whose drainage
+			// the controller cannot observe. Skip it when its own recorded name differs.
+			if recorded := k8s.WorkerDeploymentNameFromDeployment(d); recorded != "" && recorded != workerDeploymentName {
+				continue
+			}
 			// Only delete Deployments of NotRegistered versions if temporalState was not empty
 			if foundDeploymentInTemporal &&
 				// NotRegistered versions are versions that the server doesn't know about.
