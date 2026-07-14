@@ -38,6 +38,13 @@ const (
 	// TemporalDeploymentNameEnvVar names the env var that records, on each worker pod, the
 	// Temporal worker deployment name its version was registered under at creation time.
 	TemporalDeploymentNameEnvVar = "TEMPORAL_DEPLOYMENT_NAME"
+
+	// DeleteAfterAnnotation holds an RFC3339 timestamp after which the planner may delete
+	// the Deployment. Set on Deployments orphaned by a spec.workerOptions.workerDeploymentName
+	// change: their drainage cannot be observed under the currently-resolved name, so instead
+	// of preserving them forever they get a TTL-bounded grace window to drain their pinned
+	// workflows before deletion.
+	DeleteAfterAnnotation = "temporal.io/delete-after"
 )
 
 // DeploymentState represents the Kubernetes state of all deployments for a temporal worker deployment

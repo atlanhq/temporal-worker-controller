@@ -89,10 +89,13 @@ func GeneratePlan(
 	foundDeploymentInTemporal := temporalState != nil && len(temporalState.Versions) > 0
 
 	// Add delete/scale operations based on version status
-	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal, workerDeploymentName)
+	deleteDeployments, annotateDeployments := getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal, workerDeploymentName)
+	plan.DeleteDeployments = deleteDeployments
 	plan.ScaleDeployments = getScaleDeployments(k8sState, status, spec)
 	plan.ShouldCreateDeployment = shouldCreateDeployment(status, maxVersionsIneligibleForDeletion)
 	plan.UpdateDeployments = getUpdateDeployments(k8sState, status, spec, connection)
+	// Rename-orphan TTL stamps ride the same update path as spec-drift updates.
+	plan.UpdateDeployments = append(plan.UpdateDeployments, annotateDeployments...)
 
 	// Determine if we need to start any test workflows
 	plan.TestWorkflows = getTestWorkflows(status, config, workerDeploymentName, gateInput, isGateInputSecret)
@@ -329,15 +332,23 @@ func getUpdateDeployments(
 	return updateDeployments
 }
 
-// getDeleteDeployments determines which deployments should be deleted
+// renameOrphanDeleteTTL is the grace window granted to a Deployment orphaned by a
+// workerDeploymentName change before it becomes eligible for deletion. Long enough
+// for its pinned workflows to drain or hit their own execution timeouts.
+const renameOrphanDeleteTTL = 24 * time.Hour
+
+// getDeleteDeployments determines which deployments should be deleted. Deployments
+// orphaned by a workerDeploymentName change are instead returned in the second slice
+// with a fresh DeleteAfterAnnotation stamp, to be applied via plan.UpdateDeployments;
+// they become deletable once the stamp expires.
 func getDeleteDeployments(
 	k8sState *k8s.DeploymentState,
 	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
 	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
 	foundDeploymentInTemporal bool,
 	workerDeploymentName string,
-) []*appsv1.Deployment {
-	var deleteDeployments []*appsv1.Deployment
+) (deletes []*appsv1.Deployment, annotates []*appsv1.Deployment) {
+	var deleteDeployments, annotateDeployments []*appsv1.Deployment
 
 	for _, version := range status.DeprecatedVersions {
 		if version.Deployment == nil {
@@ -363,9 +374,30 @@ func getDeleteDeployments(
 			// A Deployment left behind by a spec.workerOptions.workerDeploymentName change reads as
 			// NotRegistered here, because the controller only describes the currently-resolved worker
 			// deployment name and this Deployment was registered under a different one. Deleting it
-			// would strand any still-open pinned workflows on that other deployment, whose drainage
-			// the controller cannot observe. Skip it when its own recorded name differs.
+			// immediately would strand any still-open pinned workflows on that other deployment,
+			// whose drainage the controller cannot observe. Instead of preserving it forever, give
+			// it a TTL-bounded grace window: on first sight stamp DeleteAfterAnnotation
+			// (now + renameOrphanDeleteTTL) via an update; once the stamped time passes, delete.
+			// The window lets the orphan's pinned workflows drain (its ScaledObject keeps scaling
+			// it — aimed at the recorded name) or hit their own workflow timeouts.
 			if recorded := k8s.WorkerDeploymentNameFromDeployment(d); recorded != "" && recorded != workerDeploymentName {
+				if raw, ok := d.Annotations[k8s.DeleteAfterAnnotation]; ok {
+					if deleteAfter, err := time.Parse(time.RFC3339, raw); err == nil {
+						if time.Now().After(deleteAfter) {
+							deleteDeployments = append(deleteDeployments, d)
+						}
+						// Stamped and not yet expired — leave it alone.
+						continue
+					}
+					// Unparsable stamp: fall through and re-stamp rather than
+					// guessing, so a corrupted value cannot trigger deletion.
+				}
+				stamped := d.DeepCopy()
+				if stamped.Annotations == nil {
+					stamped.Annotations = map[string]string{}
+				}
+				stamped.Annotations[k8s.DeleteAfterAnnotation] = time.Now().Add(renameOrphanDeleteTTL).UTC().Format(time.RFC3339)
+				annotateDeployments = append(annotateDeployments, stamped)
 				continue
 			}
 			// Only delete Deployments of NotRegistered versions if temporalState was not empty
@@ -378,7 +410,7 @@ func getDeleteDeployments(
 		}
 	}
 
-	return deleteDeployments
+	return deleteDeployments, annotateDeployments
 }
 
 // kedaManagedLabel mirrors the label set by internal/controller/scaledobjects.go.

@@ -433,6 +433,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 		spec                      *temporaliov1alpha1.TemporalWorkerDeploymentSpec
 		config                    *Config
 		expectDeletes             int
+		expectAnnotates           int
 		foundDeploymentInTemporal bool
 		workerDeploymentName      string
 	}{
@@ -569,7 +570,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 			// was changed to a shared name) must not be deleted. The controller only knows the drainage
 			// state of the currently-resolved worker deployment name, so deleting a Deployment that belongs
 			// to another one can strand still-open pinned workflows on that other deployment.
-			name: "not registered version under a different workerDeploymentName should NOT be deleted",
+			name: "not registered version under a different workerDeploymentName gets a TTL stamp, not deleted",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
 					"456": createDeploymentWithWorkerDeploymentName(1, "publish-app/publish-worker-twd"),
@@ -597,6 +598,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 				Replicas: func() *int32 { r := int32(1); return &r }(),
 			},
 			expectDeletes:             0,
+			expectAnnotates:           1,
 			foundDeploymentInTemporal: true,
 			workerDeploymentName:      "publish-app/shared",
 		},
@@ -642,7 +644,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 			// open pinned workflows (they poll nothing; their workflow tasks just
 			// time out). Keeping the Deployment lets the (recorded-name-targeted)
 			// ScaledObject scale it back up to drain them.
-			name: "not registered version under a different workerDeploymentName at ZERO replicas should NOT be deleted",
+			name: "not registered version under a different workerDeploymentName at ZERO replicas gets a TTL stamp, not deleted",
 			k8sState: &k8s.DeploymentState{
 				Deployments: map[string]*appsv1.Deployment{
 					"456": createDeploymentWithWorkerDeploymentName(0, "publish-app/publish-worker-twd"),
@@ -670,6 +672,53 @@ func TestGetDeleteDeployments(t *testing.T) {
 				Replicas: func() *int32 { r := int32(1); return &r }(),
 			},
 			expectDeletes:             0,
+			expectAnnotates:           1,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
+		{
+			// Already stamped with a future delete-after: leave it alone — no delete,
+			// no re-stamp (the TTL must not slide on every reconcile).
+			name: "rename-orphan with unexpired TTL stamp is left alone",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": stampDeleteAfter(createDeploymentWithWorkerDeploymentName(1, "publish-app/publish-worker-twd"), "2100-01-01T00:00:00Z"),
+				},
+			},
+			status:                    renameOrphanStatus(),
+			spec:                      &temporaliov1alpha1.TemporalWorkerDeploymentSpec{Replicas: func() *int32 { r := int32(1); return &r }()},
+			expectDeletes:             0,
+			expectAnnotates:           0,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
+		{
+			// Stamp expired: the grace window is over — delete.
+			name: "rename-orphan with expired TTL stamp is deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": stampDeleteAfter(createDeploymentWithWorkerDeploymentName(0, "publish-app/publish-worker-twd"), "2020-01-01T00:00:00Z"),
+				},
+			},
+			status:                    renameOrphanStatus(),
+			spec:                      &temporaliov1alpha1.TemporalWorkerDeploymentSpec{Replicas: func() *int32 { r := int32(1); return &r }()},
+			expectDeletes:             1,
+			expectAnnotates:           0,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
+		{
+			// Corrupted stamp: never treat garbage as expired — re-stamp instead.
+			name: "rename-orphan with malformed TTL stamp is re-stamped, not deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": stampDeleteAfter(createDeploymentWithWorkerDeploymentName(1, "publish-app/publish-worker-twd"), "not-a-timestamp"),
+				},
+			},
+			status:                    renameOrphanStatus(),
+			spec:                      &temporaliov1alpha1.TemporalWorkerDeploymentSpec{Replicas: func() *int32 { r := int32(1); return &r }()},
+			expectDeletes:             0,
+			expectAnnotates:           1,
 			foundDeploymentInTemporal: true,
 			workerDeploymentName:      "publish-app/shared",
 		},
@@ -679,8 +728,16 @@ func TestGetDeleteDeployments(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.spec.Default(context.Background())
 			require.NoError(t, err)
-			deletes := getDeleteDeployments(tc.k8sState, tc.status, tc.spec, tc.foundDeploymentInTemporal, tc.workerDeploymentName)
+			deletes, annotates := getDeleteDeployments(tc.k8sState, tc.status, tc.spec, tc.foundDeploymentInTemporal, tc.workerDeploymentName)
 			assert.Equal(t, tc.expectDeletes, len(deletes), "unexpected number of deletes")
+			assert.Equal(t, tc.expectAnnotates, len(annotates), "unexpected number of TTL annotations")
+			for _, a := range annotates {
+				raw, ok := a.Annotations[k8s.DeleteAfterAnnotation]
+				assert.True(t, ok, "annotated Deployment missing DeleteAfterAnnotation")
+				stamp, err := time.Parse(time.RFC3339, raw)
+				assert.NoError(t, err, "DeleteAfterAnnotation must be RFC3339")
+				assert.True(t, stamp.After(time.Now()), "fresh stamp must be in the future")
+			}
 		})
 	}
 }
@@ -2635,6 +2692,39 @@ func createDeploymentWithDefaultConnectionSpecHash(replicas int32) *appsv1.Deplo
 
 // Helper function to create a deployment whose pod spec records the given worker deployment name
 // via the TEMPORAL_DEPLOYMENT_NAME env var, mirroring what the controller sets at creation time.
+// stampDeleteAfter sets the planner's TTL annotation on a Deployment (object-level,
+// not pod template) and returns it, for table-test construction.
+func stampDeleteAfter(d *appsv1.Deployment, ts string) *appsv1.Deployment {
+	if d.Annotations == nil {
+		d.Annotations = map[string]string{}
+	}
+	d.Annotations[k8s.DeleteAfterAnnotation] = ts
+	return d
+}
+
+// renameOrphanStatus is the recurring status fixture for rename-orphan cases: a
+// current target plus one NotRegistered deprecated version (buildID 456).
+func renameOrphanStatus() *temporaliov1alpha1.TemporalWorkerDeploymentStatus {
+	return &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID:    "123",
+				Status:     temporaliov1alpha1.VersionStatusCurrent,
+				Deployment: &corev1.ObjectReference{Name: "test-123"},
+			},
+		},
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+			{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID:    "456",
+					Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+					Deployment: &corev1.ObjectReference{Name: "test-456"},
+				},
+			},
+		},
+	}
+}
+
 func createDeploymentWithWorkerDeploymentName(replicas int32, workerDeploymentName string) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3099,10 +3189,10 @@ func TestResolveGateInput(t *testing.T) {
 // across a workerDeploymentName change — getScaleDeployments has no
 // NotRegistered case at all. Its replicas are therefore owned exclusively by
 // its per-version ScaledObject (kept alive by activeVersionsForScaling and
-// aimed at the version's RECORDED name), and nothing ever reclaims the
-// Deployment after its pinned workflows drain. Identity-aware drainage —
-// describing the recorded name and running the normal sunset path on DRAINED —
-// is the missing follow-up; until then this test documents the intended
+// aimed at the version's RECORDED name). Reclamation happens via the planner's
+// TTL stamp (DeleteAfterAnnotation + renameOrphanDeleteTTL) rather than replica
+// writes; identity-aware drainage — describing the recorded name and sunsetting
+// on DRAINED — remains the more precise follow-up. This test documents the
 // division of labor so neither half regresses silently.
 func TestGetScaleDeployments_RenameOrphanLeftToItsScaledObject(t *testing.T) {
 	k8sState := &k8s.DeploymentState{
