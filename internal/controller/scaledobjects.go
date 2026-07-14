@@ -140,6 +140,14 @@ type versionRef struct {
 	Status     temporaliov1alpha1.VersionStatus
 	Deployment *corev1.ObjectReference
 	IsTarget   bool
+	// RecordedWDN is the Temporal worker deployment name this version's pods
+	// actually registered under, read from the TEMPORAL_DEPLOYMENT_NAME env
+	// var recorded on its Deployment at creation time. For versions left
+	// behind by a spec.workerOptions.workerDeploymentName change this differs
+	// from the currently-resolved name, and their per-version Temporal stats
+	// live under the recorded name — KEDA's queries must be aimed there.
+	// Empty when the Deployment couldn't be read.
+	RecordedWDN string
 }
 
 // activeVersionsForScaling returns versions that should have a live SO.
@@ -268,6 +276,20 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 	desired := make(map[string]*unstructured.Unstructured, len(versions))
 	desiredVersionsByName := make(map[string]versionRef, len(versions))
 	for _, v := range versions {
+		// Resolve the worker deployment name this version's pods actually
+		// registered under. A version preserved across a
+		// spec.workerOptions.workerDeploymentName change (see the planner's
+		// NotRegistered guard) reports its backlog and running pinned
+		// workflows under its *recorded* name; building its SO against the
+		// newly-resolved name would point KEDA at a version that does not
+		// exist, its metrics would read zero forever, and the preserved
+		// Deployment would be scaled to min while pinned workflows starve.
+		if v.Deployment != nil {
+			var dep appsv1.Deployment
+			if err := r.Get(ctx, types.NamespacedName{Namespace: v.Deployment.Namespace, Name: v.Deployment.Name}, &dep); err == nil {
+				v.RecordedWDN = k8s.WorkerDeploymentNameFromDeployment(&dep)
+			}
+		}
 		so := buildScaledObject(twd, v, temporalEndpoint)
 		desired[so.GetName()] = so
 		desiredVersionsByName[so.GetName()] = v
@@ -498,11 +520,22 @@ func buildScaledObject(
 	// workerDeploymentBuildId). The fork (atlanhq/keda 2.19.0-main) accepts
 	// these via the rename PR companion to this change.
 	resolvedWDN := resolveWorkerDeployment(twd)
+	// Aim the per-version query at the worker deployment name this version's
+	// pods actually registered under. For versions preserved across a
+	// workerDeploymentName change, that is the RECORDED (pre-change) name —
+	// querying the resolved name would target a version Temporal has never
+	// seen, read zero forever, and starve the version's pinned workflows of
+	// workers. For everything else RecordedWDN either matches resolvedWDN or
+	// is empty (Deployment unreadable), and the resolved name is used.
+	triggerWDN := resolvedWDN
+	if v.RecordedWDN != "" && v.RecordedWDN != resolvedWDN {
+		triggerWDN = v.RecordedWDN
+	}
 	triggerMetadata := map[string]interface{}{
 		"endpoint":                temporalEndpoint,
 		"namespace":               twd.Spec.WorkerOptions.TemporalNamespace,
 		"taskQueue":               resolveTaskQueue(twd),
-		"workerDeploymentName":    resolvedWDN,
+		"workerDeploymentName":    triggerWDN,
 		"workerDeploymentBuildId": v.BuildID,
 	}
 	// Current and Ramping versions catch unassigned backlog so they can scale
