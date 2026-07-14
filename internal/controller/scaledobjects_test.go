@@ -626,3 +626,124 @@ func TestBuildScaledObject_CurrentVersionCatchesUnassignedBacklog(t *testing.T) 
 		})
 	}
 }
+
+// triggerMetadataOf extracts the temporal trigger's metadata map from a built SO.
+func triggerMetadataOf(t *testing.T, so *unstructured.Unstructured) map[string]interface{} {
+	t.Helper()
+	triggers, found, err := unstructured.NestedSlice(so.Object, "spec", "triggers")
+	assert.NoError(t, err)
+	assert.True(t, found)
+	assert.Len(t, triggers, 1)
+	trigger := triggers[0].(map[string]interface{})
+	return trigger["metadata"].(map[string]interface{})
+}
+
+// A version preserved across a spec.workerOptions.workerDeploymentName change
+// registered its workers (and therefore its backlog + running pinned
+// workflows) under the OLD name recorded on its Deployment. Its ScaledObject
+// must query Temporal under that recorded name: aiming it at the
+// newly-resolved name targets a version Temporal has never seen, the metrics
+// read zero forever, KEDA holds the preserved Deployment at min replicas, and
+// the version's pinned workflows starve — the Deployment-preservation guard in
+// the planner (805cd49) alone does not keep them running.
+func TestBuildScaledObject_RecordedWDNAimsTriggerAtOldName(t *testing.T) {
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "publish-worker-twd",
+			Namespace: "publish-app",
+			UID:       "abc-uid",
+		},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerOptions: temporaliov1alpha1.WorkerOptions{
+				TemporalNamespace: "default",
+				// The rename that strands old versions:
+				WorkerDeploymentName: "publish-app/shared",
+			},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+				TaskQueue: "atlan-publish-production",
+			},
+		},
+	}
+	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+
+	cases := []struct {
+		name        string
+		recordedWDN string
+		wantTrigger string
+	}{
+		{
+			// The incident shape: version created before the rename.
+			name:        "recorded name differs from resolved -> trigger uses recorded",
+			recordedWDN: "publish-app/publish-worker-twd",
+			wantTrigger: "publish-app/publish-worker-twd",
+		},
+		{
+			name:        "recorded name equals resolved -> trigger uses resolved",
+			recordedWDN: "publish-app/shared",
+			wantTrigger: "publish-app/shared",
+		},
+		{
+			// Deployment unreadable (or pre-env-var Deployment): fall back to
+			// resolved rather than guessing.
+			name:        "recorded name empty -> trigger uses resolved",
+			recordedWDN: "",
+			wantTrigger: "publish-app/shared",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := versionRef{
+				BuildID: "feat-publish-app-enable-pinned-04b0570",
+				Status:  temporaliov1alpha1.VersionStatusNotRegistered,
+				Deployment: &corev1.ObjectReference{
+					Name:      "publish-worker-twd-feat-publish-app-enable-pinned-04b0570",
+					Namespace: "publish-app",
+				},
+				RecordedWDN: tc.recordedWDN,
+			}
+			so := buildScaledObject(twd, v, "temporal:7233")
+			meta := triggerMetadataOf(t, so)
+			assert.Equal(t, tc.wantTrigger, meta["workerDeploymentName"])
+			assert.Equal(t, "feat-publish-app-enable-pinned-04b0570", meta["workerDeploymentBuildId"])
+		})
+	}
+}
+
+// Guards the SO-preservation half of the rename story: a NotRegistered
+// deprecated version (the classification a rename-orphaned version gets, since
+// the controller only describes the currently-resolved name) must stay in the
+// active-for-scaling set so its ScaledObject is kept and step 5 does not sweep
+// it. Excluding it the way Drained versions are excluded would delete its SO,
+// strip the keda-managed label, and leave the preserved Deployment frozen at
+// whatever replica count it happened to have (possibly zero) with no scaler.
+func TestActiveVersionsForScaling_KeepsNotRegisteredDeprecated(t *testing.T) {
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		CurrentVersion: &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID:    "new-build",
+				Status:     temporaliov1alpha1.VersionStatusCurrent,
+				Deployment: &corev1.ObjectReference{Name: "d-new", Namespace: "publish-app"},
+			},
+		},
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+			{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID:    "old-build-under-old-wdn",
+					Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+					Deployment: &corev1.ObjectReference{Name: "d-old", Namespace: "publish-app"},
+				},
+			},
+		},
+	}
+
+	out := activeVersionsForScaling(status)
+
+	builds := make([]string, 0, len(out))
+	for _, v := range out {
+		builds = append(builds, v.BuildID)
+	}
+	assert.Contains(t, builds, "new-build")
+	assert.Contains(t, builds, "old-build-under-old-wdn",
+		"rename-orphaned (NotRegistered) versions must keep their ScaledObject")
+}
