@@ -130,7 +130,7 @@ certmanager:
 
   # caBundle is only used when enabled: false (i.e. you are managing webhook TLS yourself).
   # Set this to the base64-encoded PEM CA certificate that signed the TLS certificate in
-  # the "webhook-server-cert" Secret. The Kubernetes API server uses this to verify the
+  # the "<release-name>-webhook-server-cert" Secret. The Kubernetes API server uses this to verify the
   # webhook server's TLS certificate.
   # Leave empty when enabled: true — cert-manager injects the CA bundle automatically.
   caBundle: ""
