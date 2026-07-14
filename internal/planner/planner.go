@@ -147,7 +147,7 @@ func GeneratePlan(
 	foundDeploymentInTemporal := temporalState != nil && len(temporalState.Versions) > 0
 
 	// Add delete/scale operations based on version status
-	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal)
+	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal, workerDeploymentName)
 	plan.ScaleDeployments = getScaleDeployments(k8sState, status, spec)
 	plan.ShouldCreateDeployment = shouldCreateDeployment(status, maxVersionsIneligibleForDeletion)
 	plan.UpdateDeployments = getUpdateDeployments(k8sState, status, spec, connection)
@@ -560,6 +560,7 @@ func getDeleteDeployments(
 	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
 	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
 	foundDeploymentInTemporal bool,
+	workerDeploymentName string,
 ) []*appsv1.Deployment {
 	var deleteDeployments []*appsv1.Deployment
 
@@ -585,6 +586,14 @@ func getDeleteDeployments(
 				deleteDeployments = append(deleteDeployments, d)
 			}
 		case temporaliov1alpha1.VersionStatusNotRegistered:
+			// A Deployment left behind by a spec.workerOptions.workerDeploymentName change reads as
+			// NotRegistered here, because the controller only describes the currently-resolved worker
+			// deployment name and this Deployment was registered under a different one. Deleting it
+			// would strand any still-open pinned workflows on that other deployment, whose drainage
+			// the controller cannot observe. Skip it when its own recorded name differs.
+			if recorded := k8s.WorkerDeploymentNameFromDeployment(d); recorded != "" && recorded != workerDeploymentName {
+				continue
+			}
 			// Only delete Deployments of NotRegistered versions if temporalState was not empty
 			if foundDeploymentInTemporal &&
 				// NotRegistered versions are versions that the server doesn't know about.
@@ -601,6 +610,23 @@ func getDeleteDeployments(
 // getScaleDeployments determines which deployments should be explicitly scaled and to what size.
 // It only runs when spec.Replicas is set (controller-managed mode). Drained versions and inactive
 // versions that are not the rollout target are always scaled to zero during sunset.
+// kedaManagedLabel mirrors ManagedByLabel in internal/controller/scaledobjects.go.
+// Duplicated as a const here to avoid a controller->planner import cycle.
+const kedaManagedLabel = "twd.temporal.io/keda-managed"
+
+// isDeploymentKEDAManaged reports whether the given Deployment is owned by a
+// per-version KEDA ScaledObject. When true, the planner skips spec.replicas
+// writes for it: KEDA's HPA owns the value, and writing here would fight it
+// every reconcile (the databricks-app oscillation/deadlock). The per-version
+// ScaledObject's minReplicaCount handles warm-start (incl. the target-scoped
+// and NotRegistered-target floors) instead.
+func isDeploymentKEDAManaged(d *appsv1.Deployment) bool {
+	if d == nil || d.Labels == nil {
+		return false
+	}
+	return d.Labels[kedaManagedLabel] == "true"
+}
+
 func getScaleDeployments(
 	k8sState *k8s.DeploymentState,
 	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
@@ -616,7 +642,7 @@ func getScaleDeployments(
 			replicas := *spec.Replicas
 			ref := status.CurrentVersion.Deployment
 			if d, exists := k8sState.Deployments[status.CurrentVersion.BuildID]; exists {
-				if d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
+				if !isDeploymentKEDAManaged(d) && d.Spec.Replicas != nil && *d.Spec.Replicas != replicas {
 					scaleDeployments[ref] = uint32(replicas)
 				}
 			}
@@ -632,7 +658,7 @@ func getScaleDeployments(
 			// due to Sunset Policy, and the TWD has nil replicas because a scaler is managing the replicas, then
 			// no one will scale the Target Version back up, so we need to scale it back to 1 replica, which is what
 			// would happen if the Deployment was being created from scratch with nil replicas.
-			if spec.Replicas != nil || (spec.Replicas == nil && d.Spec.Replicas != nil && *d.Spec.Replicas == 0) {
+			if !isDeploymentKEDAManaged(d) && (spec.Replicas != nil || (spec.Replicas == nil && d.Spec.Replicas != nil && *d.Spec.Replicas == 0)) {
 				replicas := int32(1) // just scale up to 1 if we are in the spec.Replicas == nil && d.Spec.Replicas == 0 case.
 				if spec.Replicas != nil {
 					replicas = *spec.Replicas
@@ -652,6 +678,13 @@ func getScaleDeployments(
 
 		d, exists := k8sState.Deployments[version.BuildID]
 		if !exists {
+			continue
+		}
+
+		// KEDA owns .spec.replicas for versions with a per-version ScaledObject
+		// (incl. scale-to-zero on drain, once reconcileScaledObjects tears the SO
+		// down and removes the label). Skip planner writes while it is managed.
+		if isDeploymentKEDAManaged(d) {
 			continue
 		}
 

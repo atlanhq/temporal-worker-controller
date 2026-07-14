@@ -21,6 +21,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,6 +54,14 @@ const (
 	// ensures Temporal server-side versioning data is cleaned up. On TemporalConnection
 	// resources, it prevents deletion while any TWD still references the connection.
 	finalizerName = "temporal.io/delete-protection"
+
+	// legacyTWDFinalizer and legacyTCFinalizer are the pre-v1.6 finalizer names used by the
+	// atlanhq fork before #240 consolidated them into finalizerName. Objects created by the
+	// old fork still carry these; the reconciler strips them once finalizerName is present, so
+	// deletions are not blocked by a finalizer no controller recognizes. Transitional: remove
+	// these and migrateFinalizer once every cluster has migrated off the legacy names.
+	legacyTWDFinalizer = "temporal.io/worker-deployment-cleanup"
+	legacyTCFinalizer  = "temporal.io/connection-in-use"
 )
 
 // getAPIKeySecretName extracts the secret name from a SecretKeySelector
@@ -117,6 +126,7 @@ type TemporalWorkerDeploymentReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=update
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=temporal.io,resources=workerresourcetemplates,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=temporal.io,resources=workerresourcetemplates/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
@@ -151,6 +161,12 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		return ctrl.Result{}, r.markWRTsTWDNotFound(ctx, req.NamespacedName)
 	}
 
+	// Snapshot the persisted status so the final write can be skipped when this
+	// reconcile does not change it. The reconciler requeues every ~10s per TWD,
+	// so an unconditional Status().Update is a large, avoidable source of
+	// apiserver write load (and the SubjectAccessReviews each write triggers).
+	originalStatus := *workerDeploy.Status.DeepCopy()
+
 	// Handle deletion: clean up Temporal server-side versioning data before allowing
 	// the CRD to be deleted. Without this, stale build ID routing persists in Temporal
 	// and prevents unversioned workers from picking up tasks on the same task queue.
@@ -167,19 +183,34 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 				return ctrl.Result{}, err
 			}
 
-			// Cleanup succeeded, remove the finalizer so K8s can delete the resource
+			// Cleanup succeeded: remove delete-protection and the legacy fork finalizer so
+			// K8s can delete the resource.
 			controllerutil.RemoveFinalizer(&workerDeploy, finalizerName)
+			controllerutil.RemoveFinalizer(&workerDeploy, legacyTWDFinalizer)
 			if err := r.Update(ctx, &workerDeploy); err != nil {
 				return ctrl.Result{}, err
 			}
 			l.Info("Temporal server-side cleanup complete, finalizer removed")
+		} else if controllerutil.RemoveFinalizer(&workerDeploy, legacyTWDFinalizer) {
+			// Object was deleted under the old fork before this upgrade: only the legacy
+			// finalizer is present and delete-protection was never added, so upstream cleanup
+			// cannot run here (the API server forbids adding a finalizer to a deleting object).
+			// Strip the legacy finalizer to release the object for deletion.
+			l.Info("released deleting object by stripping orphaned legacy finalizer",
+				"finalizer", legacyTWDFinalizer)
+			if err := r.Update(ctx, &workerDeploy); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure finalizer is present on non-deleted resources
-	if !controllerutil.ContainsFinalizer(&workerDeploy, finalizerName) {
-		controllerutil.AddFinalizer(&workerDeploy, finalizerName)
+	// Ensure delete-protection is present and strip the legacy fork finalizer once it is
+	// (add-before-strip). Transitional migration off the old fork's finalizer name.
+	if changed, stripped := migrateFinalizer(&workerDeploy, legacyTWDFinalizer); changed {
+		if stripped {
+			l.Info("stripped legacy fork finalizer", "finalizer", legacyTWDFinalizer)
+		}
 		if err := r.Update(ctx, &workerDeploy); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -333,6 +364,15 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile per-version KEDA ScaledObjects before planning: this labels the
+	// child Deployments that have a managed ScaledObject, which getScaleDeployments
+	// reads to decide whether to skip .spec.replicas writes (KEDA owns them).
+	// Don't block the rest of the reconcile on SO failures - the planner's fallback
+	// (writing .spec.replicas on unlabelled Deployments) keeps the system functional.
+	if err := r.reconcileScaledObjects(ctx, l, &workerDeploy, temporalConnection.Spec.HostPort); err != nil {
+		l.Error(err, "scaled-object reconcile failed; continuing with legacy path")
+	}
+
 	// Generate a plan to get to desired spec from current status
 	plan, err := r.generatePlan(ctx, l, &workerDeploy, temporalConnection.Spec, temporalState)
 	if err != nil {
@@ -359,16 +399,21 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 	r.syncConditions(&workerDeploy)
 
 	// Single status write per reconcile: persists the generated status and
-	// conditions set during this loop (Ready, Progressing).
-	if err := r.Status().Update(ctx, &workerDeploy); err != nil {
-		if apierrors.IsConflict(err) {
-			return ctrl.Result{
-				Requeue:      true,
-				RequeueAfter: time.Second,
-			}, nil
+	// conditions set during this loop (Ready, Progressing). Skip the write
+	// entirely when nothing changed - the reconciler requeues every ~10s, and
+	// writing an identical status each time is pure apiserver churn. DeepEqual
+	// is exact, so this never suppresses a real change.
+	if !equality.Semantic.DeepEqual(originalStatus, workerDeploy.Status) {
+		if err := r.Status().Update(ctx, &workerDeploy); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{
+					Requeue:      true,
+					RequeueAfter: time.Second,
+				}, nil
+			}
+			l.Error(err, "unable to update TemporalWorker status")
+			return ctrl.Result{}, err
 		}
-		l.Error(err, "unable to update TemporalWorker status")
-		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{
@@ -637,6 +682,21 @@ func (r *TemporalWorkerDeploymentReconciler) recordWarningAndSetBlocked(
 	_ = r.Status().Update(ctx, workerDeploy)
 }
 
+// migrateFinalizer ensures finalizerName is present on obj and, once it is, strips the given
+// legacy fork finalizer. It enforces add-before-strip (obj is never left without a cleanup
+// finalizer while deletable) and never adds a finalizer to an object being deleted (the API
+// server rejects that). Returns whether obj changed and whether a legacy finalizer was
+// stripped (for logging). Transitional: remove with the legacy* constants once migrated.
+func migrateFinalizer(obj client.Object, legacy string) (changed, strippedLegacy bool) {
+	if obj.GetDeletionTimestamp().IsZero() {
+		changed = controllerutil.AddFinalizer(obj, finalizerName)
+	}
+	if controllerutil.ContainsFinalizer(obj, finalizerName) {
+		strippedLegacy = controllerutil.RemoveFinalizer(obj, legacy)
+	}
+	return changed || strippedLegacy, strippedLegacy
+}
+
 // ensureConnectionFinalizer adds our finalizer to the TemporalConnection so it
 // cannot be deleted while this TWD still needs it for cleanup.
 func (r *TemporalWorkerDeploymentReconciler) ensureConnectionFinalizer(
@@ -644,11 +704,14 @@ func (r *TemporalWorkerDeploymentReconciler) ensureConnectionFinalizer(
 	l logr.Logger,
 	tc *temporaliov1alpha1.TemporalConnection,
 ) error {
-	if !controllerutil.ContainsFinalizer(tc, finalizerName) {
-		l.Info("Adding finalizer to TemporalConnection", "connection", tc.Name)
-		controllerutil.AddFinalizer(tc, finalizerName)
+	changed, stripped := migrateFinalizer(tc, legacyTCFinalizer)
+	if stripped {
+		l.Info("stripped legacy fork finalizer from TemporalConnection", "connection", tc.Name, "finalizer", legacyTCFinalizer)
+	}
+	if changed {
+		l.Info("updating finalizers on TemporalConnection", "connection", tc.Name)
 		if err := r.Update(ctx, tc); err != nil {
-			return fmt.Errorf("unable to add finalizer to TemporalConnection %q: %w", tc.Name, err)
+			return fmt.Errorf("unable to update finalizers on TemporalConnection %q: %w", tc.Name, err)
 		}
 	}
 	return nil
@@ -694,9 +757,10 @@ func (r *TemporalWorkerDeploymentReconciler) removeConnectionFinalizerIfUnused(
 		return fmt.Errorf("unable to fetch TemporalConnection %q: %w", connectionName, err)
 	}
 
-	if controllerutil.ContainsFinalizer(&tc, finalizerName) {
-		l.Info("Removing finalizer from TemporalConnection", "connection", connectionName)
-		controllerutil.RemoveFinalizer(&tc, finalizerName)
+	protectionRemoved := controllerutil.RemoveFinalizer(&tc, finalizerName)
+	legacyRemoved := controllerutil.RemoveFinalizer(&tc, legacyTCFinalizer)
+	if protectionRemoved || legacyRemoved {
+		l.Info("Removing finalizers from TemporalConnection", "connection", connectionName)
 		if err := r.Update(ctx, &tc); err != nil {
 			return fmt.Errorf("unable to remove finalizer from TemporalConnection %q: %w", connectionName, err)
 		}
@@ -746,7 +810,13 @@ func (r *TemporalWorkerDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) 
 		Watches(&temporaliov1alpha1.TemporalConnection{}, handler.EnqueueRequestsFromMapFunc(r.findTWDsUsingConnection)).
 		Watches(&temporaliov1alpha1.WorkerResourceTemplate{}, handler.EnqueueRequestsFromMapFunc(r.reconcileRequestForWRT)).
 		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 100,
+			// Bounded concurrency. At 100, a single TemporalConnection change
+			// (which fans out to every TWD) or a restart could launch ~100
+			// simultaneous reconciles, each issuing apiserver writes - enough
+			// to trip HighApiServerRequestCount and starve leader-election lease
+			// renewal. 4 keeps steady-state throughput ample for dozens of TWDs
+			// at a 10s requeue while capping the burst.
+			MaxConcurrentReconciles: 4,
 			RecoverPanic:            &recoverPanic,
 		}).
 		Complete(r)

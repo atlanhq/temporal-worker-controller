@@ -599,6 +599,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 		config                    *Config
 		expectDeletes             int
 		foundDeploymentInTemporal bool
+		workerDeploymentName      string
 	}{
 		{
 			name: "drained version should be deleted",
@@ -727,13 +728,123 @@ func TestGetDeleteDeployments(t *testing.T) {
 			expectDeletes:             0,
 			foundDeploymentInTemporal: false,
 		},
+		{
+			// Regression: a NotRegistered version whose Deployment was registered under
+			// a *different* worker deployment name (e.g. after spec.workerOptions.workerDeploymentName
+			// was changed to a shared name) must not be deleted. The controller only knows the drainage
+			// state of the currently-resolved worker deployment name, so deleting a Deployment that belongs
+			// to another one can strand still-open pinned workflows on that other deployment.
+			name: "not registered version under a different workerDeploymentName should NOT be deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": createDeploymentWithWorkerDeploymentName(1, "publish-app/publish-worker-twd"),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectDeletes:             0,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
+		{
+			// Control: a NotRegistered version registered under the *current* worker deployment name
+			// is a genuine phantom (created but never registered, now superseded) and is still deleted.
+			name: "not registered version under the current workerDeploymentName should be deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": createDeploymentWithWorkerDeploymentName(1, "publish-app/shared"),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectDeletes:             1,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
+		{
+			// The starvation window: a rename-orphaned version that KEDA had already
+			// scaled to zero when the workerDeploymentName change landed. It must
+			// STILL not be deleted — its drainage state lives under the old name the
+			// controller no longer describes, so zero replicas proves nothing about
+			// open pinned workflows (they poll nothing; their workflow tasks just
+			// time out). Keeping the Deployment lets the (recorded-name-targeted)
+			// ScaledObject scale it back up to drain them.
+			name: "not registered version under a different workerDeploymentName at ZERO replicas should NOT be deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"456": createDeploymentWithWorkerDeploymentName(0, "publish-app/publish-worker-twd"),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+						BuildID:    "123",
+						Status:     temporaliov1alpha1.VersionStatusCurrent,
+						Deployment: &corev1.ObjectReference{Name: "test-123"},
+					},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "456",
+							Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+							Deployment: &corev1.ObjectReference{Name: "test-456"},
+						},
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectDeletes:             0,
+			foundDeploymentInTemporal: true,
+			workerDeploymentName:      "publish-app/shared",
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.spec.Default(context.Background())
 			require.NoError(t, err)
-			deletes := getDeleteDeployments(tc.k8sState, tc.status, tc.spec, tc.foundDeploymentInTemporal)
+			deletes := getDeleteDeployments(tc.k8sState, tc.status, tc.spec, tc.foundDeploymentInTemporal, tc.workerDeploymentName)
 			assert.Equal(t, tc.expectDeletes, len(deletes), "unexpected number of deletes")
 		})
 	}
@@ -2665,6 +2776,36 @@ func createDeploymentWithDefaultConnectionSpecHash(replicas int32) *appsv1.Deplo
 	}
 }
 
+// Helper function to create a deployment whose pod spec records the given worker deployment name
+// via the TEMPORAL_DEPLOYMENT_NAME env var, mirroring what the controller sets at creation time.
+func createDeploymentWithWorkerDeploymentName(replicas int32, workerDeploymentName string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-deployment",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						k8s.ConnectionSpecHashAnnotation: k8s.ComputeConnectionSpecHash(createDefaultConnectionSpec()),
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "worker",
+							Env: []corev1.EnvVar{
+								{Name: "TEMPORAL_DEPLOYMENT_NAME", Value: workerDeploymentName},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 // Helper function to create a deployment with the specified replicas and with a non-default connection spec hash
 func createDeploymentWithExpiredConnectionSpecHash(replicas int32) *appsv1.Deployment {
 	return &appsv1.Deployment{
@@ -3580,4 +3721,46 @@ func TestGetWRTOwnerRefPatches(t *testing.T) {
 		// controller=false with matching UID should still get the controller ref added
 		require.Len(t, patches, 1)
 	})
+}
+
+// Characterization of the rename-orphan lifecycle gap: the planner neither
+// deletes (the NotRegistered guard) nor scales a version preserved across a
+// workerDeploymentName change — getScaleDeployments has no NotRegistered case
+// at all. Its replicas are therefore owned exclusively by its per-version
+// ScaledObject (kept alive by activeVersionsForScaling and aimed at the
+// version's RECORDED name), and nothing ever reclaims the Deployment after
+// its pinned workflows drain. Identity-aware drainage — describing the
+// recorded name and running the normal sunset path on DRAINED — is the
+// missing follow-up; until then this test documents the intended division of
+// labor so neither half regresses silently.
+func TestGetScaleDeployments_RenameOrphanLeftToItsScaledObject(t *testing.T) {
+	k8sState := &k8s.DeploymentState{
+		Deployments: map[string]*appsv1.Deployment{
+			"456": createDeploymentWithWorkerDeploymentName(0, "publish-app/publish-worker-twd"),
+		},
+		DeploymentRefs: map[string]*corev1.ObjectReference{
+			"456": {Name: "test-456"},
+		},
+	}
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+			{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID:    "456",
+					Status:     temporaliov1alpha1.VersionStatusNotRegistered,
+					Deployment: &corev1.ObjectReference{Name: "test-456"},
+				},
+			},
+		},
+	}
+	spec := &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+		Replicas: func() *int32 { r := int32(1); return &r }(),
+	}
+
+	scales := getScaleDeployments(k8sState, status, spec)
+
+	for ref := range scales {
+		assert.NotEqual(t, "test-456", ref.Name,
+			"planner must not fight the rename-orphan's ScaledObject for replica ownership")
+	}
 }

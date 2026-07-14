@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
@@ -45,6 +46,28 @@ type WorkerOptions struct {
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
 	UnsafeCustomBuildID string `json:"unsafeCustomBuildID,omitempty"`
+
+	// WorkerDeploymentName overrides the auto-generated Temporal Worker Deployment name
+	// (default: "<namespace>/<TWD-name>"). When multiple TemporalWorkerDeployments
+	// declare the same WorkerDeploymentName, Temporal treats them as one logical Worker
+	// Deployment whose workers happen to poll different task queues. Activities of a
+	// PINNED workflow then route correctly across all task queues registered to that
+	// deployment, because matching honors the workflow's pinned (deployment_name,
+	// build_id) regardless of which task queue the activity targets.
+	//
+	// REQUIREMENTS when sharing across multiple TWDs:
+	//   - All sharing TWDs MUST use identical UnsafeCustomBuildID (or otherwise produce
+	//     identical build_ids) so a single version exists across all pools at any moment.
+	//   - All sharing TWDs MUST be image-equivalent for workflow execution semantics.
+	//     A workflow PINNED to a (deployment_name, build_id) may have its activities
+	//     served by any TWD in the group; divergent code between pools = silent bugs.
+	//   - Version lifecycle (current / ramping / drain) is unified across the group.
+	//     You cannot independently roll one pool without the others.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._/-]*[a-zA-Z0-9])?$`
+	WorkerDeploymentName string `json:"workerDeploymentName,omitempty"`
 }
 
 // TemporalWorkerDeploymentSpec defines the desired state of TemporalWorkerDeployment
@@ -88,6 +111,125 @@ type TemporalWorkerDeploymentSpec struct {
 
 	// WorkerOptions configures the worker's connection to Temporal.
 	WorkerOptions WorkerOptions `json:"workerOptions"`
+
+	// WorkerScaling configures per-version KEDA ScaledObject parameters for
+	// worker autoscaling. The controller creates one KEDA ScaledObject per
+	// active worker-deployment-version, each targeting only that version's
+	// child Deployment. Fields here flow through to each per-version SO.
+	//
+	// Defaults: all fields are optional. When unset, the corresponding field
+	// is omitted from the generated ScaledObject, falling back to KEDA's own
+	// defaults.
+	//
+	// +optional
+	WorkerScaling *WorkerScalingConfig `json:"workerScaling,omitempty"`
+}
+
+// WorkerScalingConfig holds the per-version KEDA scaling knobs that flow
+// through to each generated ScaledObject. Values are intentionally pointers
+// so the controller can distinguish "not set" from "explicit zero".
+type WorkerScalingConfig struct {
+	// MinReplicaCount sets MinReplicaCount on each per-version ScaledObject.
+	// Note: the controller still ensures Target/Ramping versions are pinned to
+	// at least 1 (regardless of this value) so Temporal can route new
+	// workflow executions to them on first launch.
+	// +optional
+	MinReplicaCount *int32 `json:"minReplicaCount,omitempty"`
+
+	// MaxReplicaCount sets MaxReplicaCount on each per-version ScaledObject.
+	// +optional
+	MaxReplicaCount *int32 `json:"maxReplicaCount,omitempty"`
+
+	// IdleReplicaCount sets IdleReplicaCount on each per-version ScaledObject.
+	// Must be strictly less than MinReplicaCount.
+	// +optional
+	IdleReplicaCount *int32 `json:"idleReplicaCount,omitempty"`
+
+	// PollingInterval is how often (in seconds) KEDA queries the scaler.
+	// +optional
+	PollingInterval *int32 `json:"pollingInterval,omitempty"`
+
+	// CooldownPeriod is the duration (in seconds) to wait after the last
+	// trigger reported a non-active state before scaling down.
+	// +optional
+	CooldownPeriod *int32 `json:"cooldownPeriod,omitempty"`
+
+	// InitialCooldownPeriod is the duration (in seconds) to wait before
+	// allowing the first scale-down after the ScaledObject is created.
+	// +optional
+	InitialCooldownPeriod *int32 `json:"initialCooldownPeriod,omitempty"`
+
+	// Fallback configures the replica count and failure threshold to use when
+	// the scaler repeatedly fails.
+	// +optional
+	Fallback *ScalingFallback `json:"fallback,omitempty"`
+
+	// Advanced is a passthrough for ScaledObject.spec.advanced.
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Schemaless
+	Advanced *runtime.RawExtension `json:"advanced,omitempty"`
+
+	// TaskQueue is the actual Temporal task queue workers poll.
+	// +optional
+	TaskQueue string `json:"taskQueue,omitempty"`
+
+	// TargetQueueSize is the per-pod backlog target for the Temporal scaler.
+	// +optional
+	TargetQueueSize *int32 `json:"targetQueueSize,omitempty"`
+
+	// ActivationTargetQueueSize is the threshold at which KEDA considers the
+	// scaler "active" and scales from 0 to MinReplicaCount.
+	// +optional
+	ActivationTargetQueueSize *int32 `json:"activationTargetQueueSize,omitempty"`
+
+	// ActivitySlotsPerWorker is the worker's configured maxConcurrentActivities.
+	// +optional
+	ActivitySlotsPerWorker *int32 `json:"activitySlotsPerWorker,omitempty"`
+
+	// GateSlotsOnRunningWorkflow controls whether the Temporal scaler only adds a
+	// worker's used activity slots to the scale metric while a workflow is running
+	// on the queue. Pointer so unset != false.
+	// +optional
+	GateSlotsOnRunningWorkflow *bool `json:"gateSlotsOnRunningWorkflow,omitempty"`
+
+	// QueueTypes restricts which Temporal queue types the scaler observes.
+	// +optional
+	QueueTypes []string `json:"queueTypes,omitempty"`
+
+	// IncludeRunningWorkflowCount, when true, includes the running workflow
+	// count in the backlog computation. Pointer so unset != false.
+	// +optional
+	IncludeRunningWorkflowCount *bool `json:"includeRunningWorkflowCount,omitempty"`
+
+	// WorkflowTaskQueueForCount overrides the task queue name used for
+	// CountWorkflowExecutions when it differs from the worker task queue.
+	// +optional
+	WorkflowTaskQueueForCount string `json:"workflowTaskQueueForCount,omitempty"`
+
+	// WorkerMetricsPort is the worker-side Prometheus port the scaler scrapes.
+	// +optional
+	WorkerMetricsPort *int32 `json:"workerMetricsPort,omitempty"`
+
+	// MinConnectTimeout is the gRPC dial timeout (in seconds).
+	// +optional
+	MinConnectTimeout *int32 `json:"minConnectTimeout,omitempty"`
+}
+
+// ScalingFallback mirrors keda.sh/v1alpha1 ScaledObject.spec.fallback.
+type ScalingFallback struct {
+	// FailureThreshold is the number of consecutive scaler failures before the
+	// fallback activates.
+	// +optional
+	FailureThreshold *int32 `json:"failureThreshold,omitempty"`
+
+	// Replicas is the replica count to pin to once the fallback activates.
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Behavior controls how the fallback replica count is applied.
+	// +optional
+	Behavior string `json:"behavior,omitempty"`
 }
 
 // Condition reason constants for TemporalWorkerDeployment.
