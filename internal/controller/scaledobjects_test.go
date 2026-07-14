@@ -747,3 +747,48 @@ func TestActiveVersionsForScaling_KeepsNotRegisteredDeprecated(t *testing.T) {
 	assert.Contains(t, builds, "old-build-under-old-wdn",
 		"rename-orphaned (NotRegistered) versions must keep their ScaledObject")
 }
+
+// TestBuildScaledObject_SpecHashStableAndSensitive verifies the spec-hash
+// annotation that applyDesiredScaledObject uses to skip redundant applies:
+// it must be stable for identical input (so a converged SO is not re-applied
+// every requeue) and change whenever a managed field changes (so a real
+// change is still applied).
+func TestBuildScaledObject_SpecHashStableAndSensitive(t *testing.T) {
+	int32Ptr := func(v int32) *int32 { return &v }
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "publish", Namespace: "publish-app", UID: "abc-uid"},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+				MinReplicaCount: int32Ptr(1),
+				MaxReplicaCount: int32Ptr(7),
+				TaskQueue:       "atlan-publish-production",
+			},
+		},
+	}
+	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+	v := versionRef{
+		BuildID: "main-f085195",
+		Status:  temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{
+			Name:      "publish-worker-twd-main-f085195",
+			Namespace: "publish-app",
+		},
+	}
+	hashOf := func(so *unstructured.Unstructured) string {
+		return so.GetAnnotations()[specHashAnnotation]
+	}
+
+	base := hashOf(buildScaledObject(twd, v, "temporal:7233"))
+	assert.Len(t, base, 40, "sha1 hex digest is 40 chars")
+
+	// Stable: identical input yields an identical hash across builds.
+	assert.Equal(t, base, hashOf(buildScaledObject(twd, v, "temporal:7233")))
+
+	// Sensitive: a managed trigger field (endpoint) changes the hash.
+	assert.NotEqual(t, base, hashOf(buildScaledObject(twd, v, "temporal:9999")))
+
+	// Sensitive: a managed spec field (maxReplicas) changes the hash.
+	twd.Spec.WorkerScaling.MaxReplicaCount = int32Ptr(99)
+	assert.NotEqual(t, base, hashOf(buildScaledObject(twd, v, "temporal:7233")))
+}

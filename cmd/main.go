@@ -44,13 +44,16 @@ func init() {
 
 func main() {
 	var metricsAddr string
-	var enableLeaderElection bool
 	var probeAddr string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+	// Leader election has been removed: the controller runs as a single replica,
+	// so there is no second manager to coordinate with, and removing it drops the
+	// lease-renewal calls to the apiserver (whose timeouts were crash-looping the
+	// controller under load). The --leader-elect flag is retained as an accepted
+	// no-op so manifests that still pass it do not fail with "flag provided but
+	// not defined".
+	_ = flag.Bool("leader-elect", false, "Deprecated: no-op. Leader election has been removed (single-replica controller).")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -66,19 +69,6 @@ func main() {
 			BindAddress: metricsAddr,
 		},
 		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "98e39f52.temporal.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
 	}
 	// WATCH_NAMESPACE, when set, scopes the controller's cache (and thus the resources it
 	// reconciles) to a single namespace. Empty (the default) watches all namespaces, so
