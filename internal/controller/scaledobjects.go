@@ -285,10 +285,26 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 		// newly-resolved name would point KEDA at a version that does not
 		// exist, its metrics would read zero forever, and the preserved
 		// Deployment would be scaled to min while pinned workflows starve.
+		//
+		// The same Get doubles as a liveness check: an SO must never outlive
+		// its target Deployment (deleted by the planner — drain, TTL expiry —
+		// or by hand). When the Deployment is gone, leave the version out of
+		// the desired set even if the (possibly stale) status still carries a
+		// reference; the step-5 sweep below then deletes its SO in this same
+		// pass instead of step 4 re-applying it against a vanished target.
 		if v.Deployment != nil {
 			var dep appsv1.Deployment
-			if err := r.Get(ctx, types.NamespacedName{Namespace: v.Deployment.Namespace, Name: v.Deployment.Name}, &dep); err == nil {
+			err := r.Get(ctx, types.NamespacedName{Namespace: v.Deployment.Namespace, Name: v.Deployment.Name}, &dep)
+			switch {
+			case err == nil:
 				v.RecordedWDN = k8s.WorkerDeploymentNameFromDeployment(&dep)
+			case apierrors.IsNotFound(err):
+				l.Info("skipping ScaledObject for version whose Deployment is gone",
+					"buildId", v.BuildID, "deployment", v.Deployment.Name)
+				continue
+			default:
+				// Transient read error: keep current behavior (SO retained,
+				// resolved-name fallback) rather than churning SOs on flakes.
 			}
 		}
 		so := buildScaledObject(twd, v, temporalEndpoint)

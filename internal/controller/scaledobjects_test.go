@@ -6,8 +6,10 @@
 package controller
 
 import (
+	"context"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -15,6 +17,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestScaledObjectName(t *testing.T) {
@@ -746,4 +750,64 @@ func TestActiveVersionsForScaling_KeepsNotRegisteredDeprecated(t *testing.T) {
 	assert.Contains(t, builds, "new-build")
 	assert.Contains(t, builds, "old-build-under-old-wdn",
 		"rename-orphaned (NotRegistered) versions must keep their ScaledObject")
+}
+
+// An SO must never outlive its target Deployment. When a version's Deployment
+// is deleted (planner drain, rename-orphan TTL expiry, or by hand) but the TWD
+// status still references it (status is regenerated before the plan executes,
+// so it lags by one cycle), the reconcile must NOT re-apply the SO against the
+// vanished target — it must fall through to the stale sweep and delete it in
+// the same pass.
+func TestReconcileScaledObjects_SweepsSOWhoseDeploymentIsGone(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, temporaliov1alpha1.AddToScheme(scheme))
+	assert.NoError(t, appsv1.AddToScheme(scheme))
+	assert.NoError(t, corev1.AddToScheme(scheme))
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObjectList"}, &unstructured.UnstructuredList{})
+
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "publish-worker-twd",
+			Namespace: "publish-app",
+			UID:       "uid-1",
+		},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerOptions: temporaliov1alpha1.WorkerOptions{TemporalNamespace: "default"},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "atlan-publish-production"},
+		},
+		Status: temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+			CurrentVersion: &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID: "gone-build",
+					Status:  temporaliov1alpha1.VersionStatusCurrent,
+					// Deployment referenced by (stale) status but absent from the cluster.
+					Deployment: &corev1.ObjectReference{Name: "dep-gone", Namespace: "publish-app"},
+				},
+			},
+		},
+	}
+	twd.SetGroupVersionKind(temporaliov1alpha1.GroupVersion.WithKind("TemporalWorkerDeployment"))
+
+	// Existing SO for that version, built exactly as the controller would
+	// (correct name, labels, ownerRef) so listOwnedScaledObjects returns it.
+	so := buildScaledObject(twd, versionRef{
+		BuildID:    "gone-build",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "dep-gone", Namespace: "publish-app"},
+	}, "temporal:7233")
+
+	fakeClient := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(twd).
+		WithRuntimeObjects(so).
+		Build()
+	r := &TemporalWorkerDeploymentReconciler{Client: fakeClient, Scheme: scheme}
+
+	assert.NoError(t, r.reconcileScaledObjects(context.Background(), logr.Discard(), twd, "temporal:7233"))
+
+	var list unstructured.UnstructuredList
+	list.SetGroupVersionKind(schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObjectList"})
+	assert.NoError(t, fakeClient.List(context.Background(), &list))
+	assert.Empty(t, list.Items, "SO whose target Deployment is gone must be swept in the same pass")
 }
