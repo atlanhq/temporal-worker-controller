@@ -21,6 +21,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -159,6 +160,12 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		// status updates fail (transient API errors), return the error to requeue with backoff.
 		return ctrl.Result{}, r.markWRTsTWDNotFound(ctx, req.NamespacedName)
 	}
+
+	// Snapshot the persisted status so the final write can be skipped when this
+	// reconcile does not change it. The reconciler requeues every ~10s per TWD,
+	// so an unconditional Status().Update is a large, avoidable source of
+	// apiserver write load (and the SubjectAccessReviews each write triggers).
+	originalStatus := *workerDeploy.Status.DeepCopy()
 
 	// Handle deletion: clean up Temporal server-side versioning data before allowing
 	// the CRD to be deleted. Without this, stale build ID routing persists in Temporal
@@ -392,16 +399,21 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 	r.syncConditions(&workerDeploy)
 
 	// Single status write per reconcile: persists the generated status and
-	// conditions set during this loop (Ready, Progressing).
-	if err := r.Status().Update(ctx, &workerDeploy); err != nil {
-		if apierrors.IsConflict(err) {
-			return ctrl.Result{
-				Requeue:      true,
-				RequeueAfter: time.Second,
-			}, nil
+	// conditions set during this loop (Ready, Progressing). Skip the write
+	// entirely when nothing changed - the reconciler requeues every ~10s, and
+	// writing an identical status each time is pure apiserver churn. DeepEqual
+	// is exact, so this never suppresses a real change.
+	if !equality.Semantic.DeepEqual(originalStatus, workerDeploy.Status) {
+		if err := r.Status().Update(ctx, &workerDeploy); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{
+					Requeue:      true,
+					RequeueAfter: time.Second,
+				}, nil
+			}
+			l.Error(err, "unable to update TemporalWorker status")
+			return ctrl.Result{}, err
 		}
-		l.Error(err, "unable to update TemporalWorker status")
-		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{
@@ -798,7 +810,13 @@ func (r *TemporalWorkerDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) 
 		Watches(&temporaliov1alpha1.TemporalConnection{}, handler.EnqueueRequestsFromMapFunc(r.findTWDsUsingConnection)).
 		Watches(&temporaliov1alpha1.WorkerResourceTemplate{}, handler.EnqueueRequestsFromMapFunc(r.reconcileRequestForWRT)).
 		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 100,
+			// Bounded concurrency. At 100, a single TemporalConnection change
+			// (which fans out to every TWD) or a restart could launch ~100
+			// simultaneous reconciles, each issuing apiserver writes - enough
+			// to trip HighApiServerRequestCount and starve leader-election lease
+			// renewal. 4 keeps steady-state throughput ample for dozens of TWDs
+			// at a 10s requeue while capping the burst.
+			MaxConcurrentReconciles: 4,
 			RecoverPanic:            &recoverPanic,
 		}).
 		Complete(r)

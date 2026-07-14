@@ -58,8 +58,10 @@ securityContext:
 # pods across nodes. For strict HA, switch to requiredDuringSchedulingIgnoredDuringExecution.
 affinity: {}
 
-# More than one replica is required for high availability.
-replicas: 2
+# Single replica: leader election has been removed, so running more than one
+# replica would start multiple active controllers that double-write to the
+# apiserver and race on status/ConflictToken. Keep this at 1.
+replicas: 1
 
 # deprecated. disable authenticated metrics endpoint access with the
 # metrics.disableAuth value.

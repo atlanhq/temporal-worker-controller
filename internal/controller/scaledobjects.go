@@ -84,6 +84,12 @@ const (
 	// listing query can scope to one TWD's SOs.
 	OwnerTWDLabel = "twd.temporal.io/owner"
 
+	// specHashAnnotation stores a hash of the controller-managed content
+	// (labels + spec) that buildScaledObject produces. It lets the reconciler
+	// skip the server-side apply when the live object already carries the same
+	// hash, so a converged SO is not PATCHed on every ~10s requeue.
+	specHashAnnotation = "twd.temporal.io/spec-hash"
+
 	// scaledObjectKind / scaledObjectAPIVersion identify the KEDA CRD without
 	// importing the heavy KEDA module — we manipulate it as Unstructured.
 	scaledObjectAPIVersion = "keda.sh/v1alpha1"
@@ -594,7 +600,32 @@ func buildScaledObject(
 	setScaledObjectSpec(spec, twd)
 
 	_ = unstructured.SetNestedField(so.Object, spec, "spec")
+
+	// Stamp a hash of the controller-managed content so applyDesiredScaledObject
+	// can skip the server-side apply when the live object is already converged.
+	so.SetAnnotations(map[string]string{
+		specHashAnnotation: scaledObjectSpecHash(so.GetLabels(), spec),
+	})
 	return so
+}
+
+// scaledObjectSpecHash returns a stable hash over the controller-managed
+// ScaledObject content (labels + spec). json.Marshal sorts map keys at every
+// level, so the encoding - and thus the hash - is deterministic for equal
+// input. It is a change-detection digest, not a security primitive.
+func scaledObjectSpecHash(labels map[string]string, spec map[string]interface{}) string {
+	payload := map[string]interface{}{
+		"labels": labels,
+		"spec":   spec,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		// A marshal failure should be impossible for this shape; fall back to a
+		// sentinel so the apply is never skipped rather than skipped wrongly.
+		return ""
+	}
+	sum := sha1.Sum(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // setTriggerMetadata writes the optional Temporal-scaler triggerMetadata
@@ -698,6 +729,15 @@ func (r *TemporalWorkerDeploymentReconciler) applyDesiredScaledObject(
 	if got == nil {
 		l.Info("creating ScaledObject", "name", name, "buildId", v.BuildID)
 	} else {
+		// Skip the apply when the live object already carries the hash of the
+		// desired content. A converged SO would otherwise be server-side
+		// applied on every ~10s requeue - a no-op on the object but still a
+		// PATCH request against the apiserver for every version of every TWD.
+		if h := want.GetAnnotations()[specHashAnnotation]; h != "" &&
+			got.GetAnnotations()[specHashAnnotation] == h {
+			l.V(1).Info("scaledobject unchanged; skipping apply", "name", name, "buildId", v.BuildID)
+			return nil
+		}
 		l.V(1).Info("applying ScaledObject", "name", name, "buildId", v.BuildID)
 	}
 	if err := r.Patch(ctx, want, client.Apply,
