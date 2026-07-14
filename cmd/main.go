@@ -25,6 +25,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -69,6 +70,19 @@ func main() {
 			BindAddress: metricsAddr,
 		},
 		HealthProbeBindAddress: probeAddr,
+		// Serve unstructured reads from the informer cache. Without this,
+		// controller-runtime routes every unstructured Get/List straight to the
+		// apiserver, so the per-version KEDA reconcile re-lists ScaledObjects on
+		// every ~10s requeue of every TWD - apiserver LIST load that grows with
+		// the TWD count. ScaledObject is the only type currently read unstructured
+		// (WRT-rendered resources are write-only), so in practice this caches only
+		// ScaledObjects, whose CRD is a platform prerequisite and always present
+		// for the informer to sync.
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				Unstructured: true,
+			},
+		},
 	}
 	// WATCH_NAMESPACE, when set, scopes the controller's cache (and thus the resources it
 	// reconciles) to a single namespace. Empty (the default) watches all namespaces, so
