@@ -157,7 +157,7 @@ spec:
         - name: cert
           secret:
             defaultMode: 420
-            secretName: webhook-server-cert
+            secretName: {{ .Release.Name }}-webhook-server-cert
       serviceAccountName: {{ .Values.serviceAccount.name | default (printf "%s-service-account" .Release.Name) }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.nodeSelector }}
