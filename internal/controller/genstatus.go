@@ -54,5 +54,19 @@ func (r *TemporalWorkerDeploymentReconciler) generateStatus(
 	stateMapper := newStateMapper(k8sState, temporalState, workerDeploymentName)
 	status := stateMapper.mapToStatus(targetBuildID)
 
+	// Scale subresource: total ready replicas across the TWD's versioned Deployments,
+	// plus the pod selector, so an external autoscaler (VPA/HPA) targeting the TWD can
+	// read its current scale and discover the pods to act on. The selector uses the TWD's
+	// own name to match the version-independent pod label, independent of any
+	// workerDeploymentName override.
+	var readyReplicas int32
+	for _, d := range k8sState.Deployments {
+		if d != nil {
+			readyReplicas += d.Status.ReadyReplicas
+		}
+	}
+	status.Replicas = readyReplicas
+	status.Selector = k8s.TWDNameSelector(workerDeploy.Name)
+
 	return status, nil
 }

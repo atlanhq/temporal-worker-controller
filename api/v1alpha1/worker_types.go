@@ -327,6 +327,16 @@ type TemporalWorkerDeploymentStatus struct {
 	// so it's generally not a good idea to read from the status of the root object.
 	// Instead, you should reconstruct it every run.
 
+	// Replicas is the total number of ready replicas across all versioned Deployments
+	// managed by this TemporalWorkerDeployment. Exposed via the scale subresource
+	// (statuspath) so external autoscalers can read the current scale.
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Selector is a label query matching all pods managed by this TemporalWorkerDeployment
+	// across every version. It is the scale subresource's selectorpath: a VPA or HPA
+	// targeting the TWD reads it to discover the pods to act on.
+	Selector string `json:"selector,omitempty"`
+
 	// TargetVersion is the desired next version. If TargetVersion.Deployment is nil,
 	// then the controller should create it. If not nil, the controller should
 	// wait for it to become healthy and then move it to the CurrentVersion.
@@ -583,6 +593,7 @@ type ManualRolloutStrategy struct{}
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:resource:shortName=twd;twdeployment;tworkerdeployment
 //+kubebuilder:printcolumn:name="Current",type="string",JSONPath=".status.currentVersion.buildID",description="Current build ID"
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".status.targetVersion.buildID",description="Target build ID"
