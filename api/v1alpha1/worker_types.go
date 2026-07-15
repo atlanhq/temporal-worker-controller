@@ -73,15 +73,16 @@ type WorkerOptions struct {
 // TemporalWorkerDeploymentSpec defines the desired state of TemporalWorkerDeployment
 type TemporalWorkerDeploymentSpec struct {
 
-	// Number of desired pods. When set, the controller manages replicas for all active
-	// worker versions. When omitted (nil), the controller creates versioned Deployments
-	// with nil replicas and never calls UpdateScale on active versions — following the
-	// Kubernetes-recommended pattern for HPA and other external autoscalers
-	// (https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
-	// The controller still scales drained versions (and inactive versions that are not
-	// the rollout target) to zero regardless.
-	// This field makes TemporalWorkerDeploymentSpec implement the scale subresource, which is compatible with auto-scalers.
+	// Number of desired pods, defaulted to 1 so the value is always present. The
+	// controller manages replicas for active worker versions EXCEPT those owned by a
+	// per-version KEDA ScaledObject (Deployments labelled twd.temporal.io/keda-managed),
+	// which KEDA scales instead; drained and inactive non-target versions are scaled to
+	// zero regardless. Defaulted rather than left nil (upstream's scaler-managed
+	// sentinel) so the scale subresource always resolves: a VPA or HPA targeting the TWD
+	// reads .spec.replicas via /scale, which errors when the field is absent. In this
+	// fork the keda-managed label, not a nil replicas, is the scaler-managed signal.
 	// +optional
+	// +kubebuilder:default=1
 	Replicas *int32 `json:"replicas,omitempty" protobuf:"varint,1,opt,name=replicas"`
 
 	// Template describes the pods that will be created.
