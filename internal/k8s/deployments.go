@@ -248,6 +248,14 @@ func ComputeSelectorLabels(twdName, buildID string) map[string]string {
 	}
 }
 
+// TWDNameSelector returns the label-selector string matching every pod managed by the
+// named TemporalWorkerDeployment across all versions (the version-independent twdNameLabel,
+// without the per-version BuildIDLabel). The controller writes this to status.selector for
+// the scale subresource so a VPA or HPA targeting the TWD can discover its pods.
+func TWDNameSelector(twdName string) string {
+	return fmt.Sprintf("%s=%s", twdNameLabel, TruncateString(CleanStringForDNS(twdName), 63))
+}
+
 // NewDeploymentWithOwnerRef creates a new deployment resource, including owner references
 func NewDeploymentWithOwnerRef(
 	typeMeta *metav1.TypeMeta,

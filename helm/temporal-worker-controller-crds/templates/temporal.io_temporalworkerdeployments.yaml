@@ -4192,6 +4192,11 @@ spec:
                 type: string
               managerIdentity:
                 type: string
+              replicas:
+                format: int32
+                type: integer
+              selector:
+                type: string
               targetVersion:
                 properties:
                   buildID:
@@ -4279,4 +4284,8 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        labelSelectorPath: .status.selector
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
       status: {}

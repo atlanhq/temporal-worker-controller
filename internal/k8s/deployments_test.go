@@ -580,6 +580,43 @@ func TestNewDeploymentWithPodAnnotations(t *testing.T) {
 	assert.Equal(t, expectedHash, actualHash, "Deployment should have correct connection spec hash annotation")
 }
 
+func TestTWDNameSelector(t *testing.T) {
+	const label = "temporal.io/deployment-name"
+	cases := []struct {
+		name     string
+		twdName  string
+		expected string
+	}{
+		{
+			name:     "plain name",
+			twdName:  "publish-worker-twd",
+			expected: label + "=publish-worker-twd",
+		},
+		{
+			name:     "name is cleaned for DNS",
+			twdName:  "Publish_Worker",
+			expected: label + "=" + k8s.CleanStringForDNS("Publish_Worker"),
+		},
+		{
+			name:     "long name truncated to 63",
+			twdName:  strings.Repeat("a", 80),
+			expected: label + "=" + k8s.TruncateString(k8s.CleanStringForDNS(strings.Repeat("a", 80)), 63),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := k8s.TWDNameSelector(tc.twdName)
+			assert.Equal(t, tc.expected, got)
+			// Version-independent: must not carry the per-version build-id label, so it
+			// matches the TWD's pods across every version.
+			assert.NotContains(t, got, k8s.BuildIDLabel)
+			// Must agree with the version-independent label the versioned Deployments
+			// actually carry, so a VPA/HPA using this selector finds the real pods.
+			assert.Equal(t, tc.expected, label+"="+k8s.ComputeSelectorLabels(tc.twdName, "any-build")[label])
+		})
+	}
+}
+
 func TestComputeConnectionSpecHash(t *testing.T) {
 	t.Run("generates non-empty hash for valid connection spec", func(t *testing.T) {
 		spec := temporaliov1alpha1.TemporalConnectionSpec{
