@@ -84,6 +84,10 @@ const (
 	// listing query can scope to one TWD's SOs.
 	OwnerTWDLabel = "twd.temporal.io/owner"
 
+	// VariantSOLabel records the spec.variants name on a variant's per-version
+	// ScaledObject (absent on base SOs).
+	VariantSOLabel = "twd.temporal.io/variant"
+
 	// specHashAnnotation stores a hash of the controller-managed content
 	// (labels + spec) that buildScaledObject produces. It lets the reconciler
 	// skip the server-side apply when the live object already carries the same
@@ -154,6 +158,11 @@ type versionRef struct {
 	// live under the recorded name — KEDA's queries must be aimed there.
 	// Empty when the Deployment couldn't be read.
 	RecordedWDN string
+	// Variant, when non-nil, marks this ref as a spec.variants child of the
+	// version: Deployment points at the variant's Deployment and the generated
+	// SO watches <taskQueue><variant.TaskQueueSuffix> under the SAME
+	// {workerDeploymentName, buildID}. Nil for the base.
+	Variant *temporaliov1alpha1.WorkerVariant
 }
 
 // activeVersionsForScaling returns versions that should have a live SO.
@@ -197,6 +206,58 @@ func activeVersionsForScaling(
 	return out
 }
 
+// variantVersionsForScaling expands the base version refs with one ref per
+// (version, spec.variant) pair whose variant Deployment exists in status. A
+// status variant no longer declared in the spec is skipped - its SO then falls
+// out of the desired set and is deleted as stale.
+func variantVersionsForScaling(
+	baseVersions []versionRef,
+	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+) []versionRef {
+	if len(twd.Spec.Variants) == 0 {
+		return nil
+	}
+	specVariants := make(map[string]*temporaliov1alpha1.WorkerVariant, len(twd.Spec.Variants))
+	for i := range twd.Spec.Variants {
+		specVariants[twd.Spec.Variants[i].Name] = &twd.Spec.Variants[i]
+	}
+	statusVariants := func(buildID string) []temporaliov1alpha1.VariantStatus {
+		if status.CurrentVersion != nil && status.CurrentVersion.BuildID == buildID {
+			return status.CurrentVersion.Variants
+		}
+		if status.TargetVersion.BuildID == buildID {
+			return status.TargetVersion.Variants
+		}
+		for _, dv := range status.DeprecatedVersions {
+			if dv != nil && dv.BuildID == buildID {
+				return dv.Variants
+			}
+		}
+		return nil
+	}
+	var out []versionRef
+	for _, base := range baseVersions {
+		for _, vs := range statusVariants(base.BuildID) {
+			if vs.Deployment == nil {
+				continue
+			}
+			variant, declared := specVariants[vs.Name]
+			if !declared {
+				continue
+			}
+			out = append(out, versionRef{
+				BuildID:    base.BuildID,
+				Status:     base.Status,
+				Deployment: vs.Deployment,
+				IsTarget:   base.IsTarget,
+				Variant:    variant,
+			})
+		}
+	}
+	return out
+}
+
 // resolveMinReplicas returns the per-version MinReplicaCount and whether the
 // value should be set on the ScaledObject. Returns (_, false) when nothing
 // should be written (omit the field so KEDA's own default applies).
@@ -216,6 +277,13 @@ func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDepl
 	var baseSet bool
 	if twd.Spec.WorkerScaling != nil && twd.Spec.WorkerScaling.MinReplicaCount != nil {
 		base = *twd.Spec.WorkerScaling.MinReplicaCount
+		baseSet = true
+	}
+	// A variant's own scaling override wins over the shared workerScaling value.
+	// The warm-start floor below still applies: a variant's queue must register
+	// before its version can be promoted.
+	if v.Variant != nil && v.Variant.Scaling != nil && v.Variant.Scaling.MinReplicaCount != nil {
+		base = *v.Variant.Scaling.MinReplicaCount
 		baseSet = true
 	}
 
@@ -277,8 +345,9 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 		return r.disablePerVersionScaling(ctx, l, twd)
 	}
 
-	// Step 1 — enumerate desired SOs from active versions.
+	// Step 1 — enumerate desired SOs from active versions (base + variants).
 	versions := activeVersionsForScaling(&twd.Status)
+	versions = append(versions, variantVersionsForScaling(versions, &twd.Status, twd)...)
 	desired := make(map[string]*unstructured.Unstructured, len(versions))
 	desiredVersionsByName := make(map[string]versionRef, len(versions))
 	for _, v := range versions {
@@ -502,12 +571,20 @@ func buildScaledObject(
 		Version: "v1alpha1",
 		Kind:    scaledObjectKind,
 	})
-	so.SetName(ScaledObjectName(twd.Name, v.BuildID))
-	so.SetNamespace(twd.Namespace)
-	so.SetLabels(map[string]string{
+	soLabels := map[string]string{
 		OwnerTWDLabel: twd.Name,
 		BuildIDLabel:  v.BuildID,
-	})
+	}
+	if v.Variant != nil {
+		// Variant SOs get their own name (variant folded into the twd prefix so
+		// the hash fallback keeps names distinct) and a discriminator label.
+		so.SetName(ScaledObjectName(twd.Name+"-"+v.Variant.Name, v.BuildID))
+		soLabels[VariantSOLabel] = v.Variant.Name
+	} else {
+		so.SetName(ScaledObjectName(twd.Name, v.BuildID))
+	}
+	so.SetNamespace(twd.Namespace)
+	so.SetLabels(soLabels)
 	so.SetOwnerReferences([]metav1.OwnerReference{
 		*metav1.NewControllerRef(twd, twd.GroupVersionKind()),
 	})
@@ -537,10 +614,16 @@ func buildScaledObject(
 	if v.RecordedWDN != "" && v.RecordedWDN != resolvedWDN {
 		triggerWDN = v.RecordedWDN
 	}
+	taskQueue := resolveTaskQueue(twd)
+	if v.Variant != nil {
+		// The variant polls (and its SO watches) the suffixed queue; the
+		// version identity {workerDeploymentName, buildID} stays the base's.
+		taskQueue += v.Variant.TaskQueueSuffix
+	}
 	triggerMetadata := map[string]interface{}{
 		"endpoint":                temporalEndpoint,
 		"namespace":               twd.Spec.WorkerOptions.TemporalNamespace,
-		"taskQueue":               resolveTaskQueue(twd),
+		"taskQueue":               taskQueue,
 		"workerDeploymentName":    triggerWDN,
 		"workerDeploymentBuildId": v.BuildID,
 	}
@@ -577,6 +660,14 @@ func buildScaledObject(
 		triggerMetadata["selectUnversioned"] = "true"
 	}
 	setTriggerMetadata(triggerMetadata, twd)
+	if v.Variant != nil && v.Variant.TaskQueueSuffix != "" {
+		// A workflowTaskQueueForCount inherited from workerScaling names the BASE
+		// workflow queue; the variant's version-scoped workflow count lives on the
+		// suffixed queue (mirroring how the variant's own worker derives it).
+		if wtqfc, ok := triggerMetadata["workflowTaskQueueForCount"].(string); ok && wtqfc != "" {
+			triggerMetadata["workflowTaskQueueForCount"] = wtqfc + v.Variant.TaskQueueSuffix
+		}
+	}
 
 	spec := map[string]interface{}{
 		"scaleTargetRef": map[string]interface{}{
@@ -594,7 +685,9 @@ func buildScaledObject(
 	if minR, ok := resolveMinReplicas(v, twd); ok {
 		spec["minReplicaCount"] = minR
 	}
-	if maxR, ok := resolveMaxReplicas(twd); ok {
+	if v.Variant != nil && v.Variant.Scaling != nil && v.Variant.Scaling.MaxReplicaCount != nil {
+		spec["maxReplicaCount"] = int64(*v.Variant.Scaling.MaxReplicaCount)
+	} else if maxR, ok := resolveMaxReplicas(twd); ok {
 		spec["maxReplicaCount"] = maxR
 	}
 	setScaledObjectSpec(spec, twd)

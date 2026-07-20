@@ -124,6 +124,100 @@ type TemporalWorkerDeploymentSpec struct {
 	//
 	// +optional
 	WorkerScaling *WorkerScalingConfig `json:"workerScaling,omitempty"`
+
+	// Variants declares additional pod-shape variants of this worker. For each
+	// active worker deployment version the controller reconciles one extra child
+	// Deployment (and, when WorkerScaling is set, one extra KEDA ScaledObject) per
+	// variant. A variant Deployment is the base template plus the bounded delta
+	// declared here, registers the SAME Temporal worker deployment version
+	// {workerDeploymentName, buildID} as the base, and polls
+	// <workerScaling.taskQueue><taskQueueSuffix>.
+	//
+	// The first consumer is the on-demand ("-od") mirror worker: a copy of the
+	// base pinned to on-demand nodes polling the base queue + "-od", so the
+	// activity rerouter can move spot-reclaimed work onto stable capacity while
+	// pinned workflows keep dispatching (shared build ID satisfies the pin).
+	//
+	// Because the TWD scale-subresource selector is version- and variant-
+	// independent, an autoscaler (e.g. VPA) targeting the TWD observes and sizes
+	// base and variant pods together.
+	//
+	// Variants materialize only on versions created after they are configured:
+	// a pre-existing version's base Deployment has an immutable selector without
+	// the variant discriminator label, so the controller skips variant creation
+	// for it and picks them up on the next version rollout.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxItems=4
+	Variants []WorkerVariant `json:"variants,omitempty"`
+}
+
+// WorkerVariant declares one additional pod-shape variant of the worker as a
+// bounded delta over spec.template. Deliberately NOT a full template or a
+// strategic-merge patch: two full templates drift, and strategic merge corrupts
+// env lists. The fields here are exactly the axes a capacity-tier mirror varies
+// on (placement, resources, queue identity).
+type WorkerVariant struct {
+	// Name identifies the variant. Used in the child Deployment / ScaledObject
+	// names and the temporal.io/variant label. "base" is reserved.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=20
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// TaskQueueSuffix is appended to workerScaling.taskQueue to form the task
+	// queue this variant's ScaledObject watches, and to the values of the env
+	// vars listed in EnvValueSuffixes. Empty means the variant polls the same
+	// queue as the base (e.g. a warm standby on different capacity).
+	// +optional
+	// +kubebuilder:validation:MaxLength=20
+	TaskQueueSuffix string `json:"taskQueueSuffix,omitempty"`
+
+	// EnvValueSuffixes lists container env var NAMES whose VALUES get
+	// TaskQueueSuffix appended in the variant's pod template. This is how the
+	// variant worker derives its own task queue when the queue is derived from
+	// an env var (e.g. ATLAN_DEPLOYMENT_NAME) rather than set directly. Only
+	// env vars with a literal Value are transformed; valueFrom entries are
+	// left untouched.
+	// +optional
+	EnvValueSuffixes []string `json:"envValueSuffixes,omitempty"`
+
+	// Affinity, when set, REPLACES the base template's affinity for this
+	// variant (e.g. pin to on-demand capacity).
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// NodeSelector, when set, REPLACES the base template's nodeSelector.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations, when set, REPLACES the base template's tolerations.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// Resources, when set, REPLACES the first container's resources.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Scaling overrides per-variant ScaledObject bounds. Unset fields inherit
+	// from workerScaling.
+	// +optional
+	Scaling *VariantScaling `json:"scaling,omitempty"`
+}
+
+// VariantScaling overrides the replica bounds of a variant's per-version
+// ScaledObject. All other scaling knobs inherit from spec.workerScaling.
+type VariantScaling struct {
+	// MinReplicaCount overrides workerScaling.minReplicaCount for this variant.
+	// The controller still floors Ramping/Inactive/NotRegistered-target
+	// versions at 1 so their task queues register before promotion.
+	// +optional
+	MinReplicaCount *int32 `json:"minReplicaCount,omitempty"`
+
+	// MaxReplicaCount overrides workerScaling.maxReplicaCount for this variant.
+	// +optional
+	MaxReplicaCount *int32 `json:"maxReplicaCount,omitempty"`
 }
 
 // WorkerScalingConfig holds the per-version KEDA scaling knobs that flow
@@ -432,6 +526,27 @@ type BaseWorkerDeploymentVersion struct {
 	// ManagedBy is the identity of the client that is managing the rollout of this version.
 	// +optional
 	ManagedBy string `json:"managedBy,omitempty"`
+
+	// Variants lists this version's variant child Deployments (see
+	// spec.variants). The base Deployment stays in Deployment above; variant
+	// health never gates promotion.
+	// +optional
+	Variants []VariantStatus `json:"variants,omitempty"`
+}
+
+// VariantStatus records one variant child Deployment of a version.
+type VariantStatus struct {
+	// Name is the variant name from spec.variants.
+	Name string `json:"name"`
+
+	// A pointer to the variant's managed k8s deployment.
+	// +optional
+	Deployment *corev1.ObjectReference `json:"deployment,omitempty"`
+
+	// HealthySince indicates when the variant deployment became available.
+	// Informational only - it does not gate promotion.
+	// +optional
+	HealthySince *metav1.Time `json:"healthySince,omitempty"`
 }
 
 // CurrentWorkerDeploymentVersion represents a worker deployment version that is currently

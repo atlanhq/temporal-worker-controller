@@ -5,6 +5,8 @@
 package controller
 
 import (
+	"sort"
+
 	"github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
@@ -73,6 +75,34 @@ func (m *stateMapper) mapToStatus(targetBuildID string) *v1alpha1.TemporalWorker
 	return status
 }
 
+// mapVariants returns the VariantStatus entries for a version's variant child
+// Deployments, sorted by name for deterministic status output. Variant health is
+// informational only - it never gates promotion (that reads the base's
+// HealthySince).
+func (m *stateMapper) mapVariants(buildID string) []v1alpha1.VariantStatus {
+	variants := m.k8sState.VariantDeployments[buildID]
+	if len(variants) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(variants))
+	for name := range variants {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]v1alpha1.VariantStatus, 0, len(names))
+	for _, name := range names {
+		vs := v1alpha1.VariantStatus{
+			Name:       name,
+			Deployment: m.k8sState.VariantDeploymentRefs[buildID][name],
+		}
+		if healthy, healthySince := k8s.IsDeploymentHealthy(variants[name]); healthy {
+			vs.HealthySince = healthySince
+		}
+		out = append(out, vs)
+	}
+	return out
+}
+
 // mapCurrentWorkerDeploymentVersionByBuildID creates a current version status from the states using buildID
 func (m *stateMapper) mapCurrentWorkerDeploymentVersionByBuildID(buildID string) *v1alpha1.CurrentWorkerDeploymentVersion {
 	if buildID == "" {
@@ -96,6 +126,7 @@ func (m *stateMapper) mapCurrentWorkerDeploymentVersionByBuildID(buildID string)
 			version.HealthySince = healthySince
 		}
 	}
+	version.Variants = m.mapVariants(buildID)
 
 	// Set version status from temporal state
 	if temporalVersion, exists := m.temporalState.Versions[buildID]; exists {
@@ -131,6 +162,7 @@ func (m *stateMapper) mapTargetWorkerDeploymentVersionByBuildID(buildID string) 
 			version.HealthySince = healthySince
 		}
 	}
+	version.Variants = m.mapVariants(buildID)
 
 	// Set version status from temporal state
 	if temporalVersion, exists := m.temporalState.Versions[buildID]; exists {
@@ -191,6 +223,7 @@ func (m *stateMapper) mapDeprecatedWorkerDeploymentVersionByBuildID(buildID stri
 			version.HealthySince = healthySince
 		}
 	}
+	version.Variants = m.mapVariants(buildID)
 
 	// Set version status from temporal state
 	if temporalVersion, exists := m.temporalState.Versions[buildID]; exists {

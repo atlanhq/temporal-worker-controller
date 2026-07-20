@@ -48,8 +48,14 @@ type Plan struct {
 	ScaleDeployments       map[*corev1.ObjectReference]uint32
 	UpdateDeployments      []*appsv1.Deployment
 	ShouldCreateDeployment bool
-	VersionConfig          *VersionConfig
-	TestWorkflows          []WorkflowConfig
+	// CreateVariants names the spec.variants entries whose child Deployment is
+	// missing for the target version and should be created this cycle. Empty
+	// when the TWD declares no variants, when the target's base Deployment
+	// predates variant mode (immutable legacy selector - variants materialize
+	// on the next version), or when everything already exists.
+	CreateVariants []string
+	VersionConfig  *VersionConfig
+	TestWorkflows  []WorkflowConfig
 
 	// ApplyWorkerResources holds resources to apply via SSA, one per (WRT × Build ID) pair.
 	ApplyWorkerResources []WorkerResourceApply
@@ -150,6 +156,7 @@ func GeneratePlan(
 	plan.DeleteDeployments = getDeleteDeployments(k8sState, status, spec, foundDeploymentInTemporal, workerDeploymentName)
 	plan.ScaleDeployments = getScaleDeployments(k8sState, status, spec)
 	plan.ShouldCreateDeployment = shouldCreateDeployment(status, maxVersionsIneligibleForDeletion)
+	plan.CreateVariants = getCreateVariants(k8sState, status, spec, plan.ShouldCreateDeployment)
 	plan.UpdateDeployments = getUpdateDeployments(k8sState, status, spec, connection)
 
 	// Determine if we need to start any test workflows
@@ -551,7 +558,143 @@ func getUpdateDeployments(
 		}
 	}
 
+	// Variant deployments: pod-template/variant-delta drift on the target version
+	// (mirroring the base's stable-buildID drift path), and connection-spec drift
+	// everywhere. Tracked separately from updatedBuildIDs since a buildID now maps
+	// to several Deployments.
+	updatedVariants := make(map[string]bool)
+	if status.TargetVersion.BuildID != "" {
+		for i := range spec.Variants {
+			variant := &spec.Variants[i]
+			d, exists := k8sState.VariantDeployments[status.TargetVersion.BuildID][variant.Name]
+			if !exists {
+				continue
+			}
+			if updated := checkAndUpdateVariantPodTemplateSpec(d, spec, connection, variant); updated != nil {
+				updateDeployments = append(updateDeployments, updated)
+				updatedVariants[d.Name] = true
+			}
+		}
+	}
+	for _, variants := range k8sState.VariantDeployments {
+		for _, d := range variants {
+			if updatedVariants[d.Name] {
+				continue
+			}
+			if updated := checkAndUpdateConnectionSpecOn(d, connection); updated != nil {
+				updateDeployments = append(updateDeployments, updated)
+				updatedVariants[d.Name] = true
+			}
+		}
+	}
+
 	return updateDeployments
+}
+
+// checkAndUpdateConnectionSpecOn is the deployment-scoped core of
+// checkAndUpdateDeploymentConnectionSpec, usable for variant Deployments that
+// are not in the buildID-keyed base map.
+func checkAndUpdateConnectionSpecOn(
+	existingDeployment *appsv1.Deployment,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+) *appsv1.Deployment {
+	currentHash := k8s.ComputeConnectionSpecHash(connection)
+	if currentHash != existingDeployment.Spec.Template.Annotations[k8s.ConnectionSpecHashAnnotation] {
+		updateDeploymentWithConnection(existingDeployment, connection)
+		return existingDeployment
+	}
+	return nil
+}
+
+// checkAndUpdateVariantPodTemplateSpec mirrors checkAndUpdateDeploymentPodTemplateSpec
+// for a variant Deployment: with a stable UnsafeCustomBuildID, drift in either the
+// shared user template OR the variant's own delta triggers an in-place rebuild.
+func checkAndUpdateVariantPodTemplateSpec(
+	existingDeployment *appsv1.Deployment,
+	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	variant *temporaliov1alpha1.WorkerVariant,
+) *appsv1.Deployment {
+	// Only check for drift when UnsafeCustomBuildID is explicitly set by the user.
+	// If buildID is auto-generated, any spec change would generate a new buildID anyway.
+	if spec.WorkerOptions.UnsafeCustomBuildID == "" {
+		return nil
+	}
+
+	annotations := existingDeployment.Spec.Template.Annotations
+	if annotations == nil {
+		return nil
+	}
+	storedTemplateHash := annotations[k8s.PodTemplateSpecHashAnnotation]
+	storedVariantHash := annotations[k8s.VariantSpecHashAnnotation]
+	// Backwards compatibility: no hash annotations - don't trigger an update.
+	if storedTemplateHash == "" && storedVariantHash == "" {
+		return nil
+	}
+
+	if storedTemplateHash == k8s.ComputePodTemplateSpecHash(spec.Template) &&
+		storedVariantHash == k8s.ComputeVariantSpecHash(variant) {
+		return nil
+	}
+
+	updateVariantDeploymentWithPodTemplateSpec(existingDeployment, spec, connection, variant)
+	return existingDeployment
+}
+
+// updateVariantDeploymentWithPodTemplateSpec rebuilds a variant Deployment's pod
+// template from the TWD spec: the base rebuild plus the variant's bounded delta,
+// refreshing both drift-hash annotations.
+func updateVariantDeploymentWithPodTemplateSpec(
+	deployment *appsv1.Deployment,
+	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	variant *temporaliov1alpha1.WorkerVariant,
+) {
+	podSpec := spec.Template.Spec.DeepCopy()
+	k8s.ApplyVariantDelta(podSpec, variant)
+
+	var buildID string
+	if deployment.Labels != nil {
+		buildID = deployment.Labels[k8s.BuildIDLabel]
+	}
+	var workerDeploymentName string
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		for _, env := range container.Env {
+			if env.Name == k8s.TemporalDeploymentNameEnvVar {
+				workerDeploymentName = env.Value
+				break
+			}
+		}
+		if workerDeploymentName != "" {
+			break
+		}
+	}
+	k8s.ApplyControllerPodSpecModifications(podSpec, connection, spec.WorkerOptions.TemporalNamespace, workerDeploymentName, buildID)
+
+	podAnnotations := make(map[string]string)
+	for k, v := range spec.Template.Annotations {
+		podAnnotations[k] = v
+	}
+	podAnnotations[k8s.ConnectionSpecHashAnnotation] = k8s.ComputeConnectionSpecHash(connection)
+	podAnnotations[k8s.PodTemplateSpecHashAnnotation] = k8s.ComputePodTemplateSpecHash(spec.Template)
+	podAnnotations[k8s.VariantSpecHashAnnotation] = k8s.ComputeVariantSpecHash(variant)
+
+	podLabels := make(map[string]string)
+	for k, v := range spec.Template.Labels {
+		podLabels[k] = v
+	}
+	for k, v := range deployment.Spec.Selector.MatchLabels {
+		podLabels[k] = v
+	}
+
+	deployment.Spec.Template.ObjectMeta.Labels = podLabels
+	deployment.Spec.Template.ObjectMeta.Annotations = podAnnotations
+	deployment.Spec.Template.Spec = *podSpec
+
+	if spec.Replicas != nil {
+		deployment.Spec.Replicas = spec.Replicas
+	}
+	deployment.Spec.MinReadySeconds = spec.MinReadySeconds
 }
 
 // getDeleteDeployments determines which deployments should be deleted
@@ -563,6 +706,15 @@ func getDeleteDeployments(
 	workerDeploymentName string,
 ) []*appsv1.Deployment {
 	var deleteDeployments []*appsv1.Deployment
+
+	// deleteWithVariants appends a version's base Deployment and cascades to its
+	// variant Deployments: a variant must never outlive its version's base.
+	deleteWithVariants := func(d *appsv1.Deployment, buildID string) {
+		deleteDeployments = append(deleteDeployments, d)
+		for _, vd := range k8sState.VariantDeployments[buildID] {
+			deleteDeployments = append(deleteDeployments, vd)
+		}
+	}
 
 	for _, version := range status.DeprecatedVersions {
 		if version.Deployment == nil {
@@ -591,7 +743,7 @@ func getDeleteDeployments(
 				(time.Since(version.DrainedSince.Time) > spec.SunsetStrategy.DeleteDelay.Duration+spec.SunsetStrategy.ScaledownDelay.Duration) &&
 				d.Spec.Replicas != nil && *d.Spec.Replicas == 0 &&
 				version.EligibleForDeletion {
-				deleteDeployments = append(deleteDeployments, d)
+				deleteWithVariants(d, version.BuildID)
 			}
 		case temporaliov1alpha1.VersionStatusNotRegistered:
 			// A Deployment left behind by a spec.workerOptions.workerDeploymentName change reads as
@@ -607,8 +759,20 @@ func getDeleteDeployments(
 				// NotRegistered versions are versions that the server doesn't know about.
 				// Only delete if it's not the target version.
 				status.TargetVersion.BuildID != version.BuildID {
-				deleteDeployments = append(deleteDeployments, d)
+				deleteWithVariants(d, version.BuildID)
 			}
+		}
+	}
+
+	// Orphan sweep: variants removed from the spec, or whose base is gone.
+	seen := make(map[string]struct{}, len(deleteDeployments))
+	for _, d := range deleteDeployments {
+		seen[d.Name] = struct{}{}
+	}
+	for _, d := range getDeleteVariantDeployments(k8sState, spec) {
+		if _, dup := seen[d.Name]; !dup {
+			deleteDeployments = append(deleteDeployments, d)
+			seen[d.Name] = struct{}{}
 		}
 	}
 
@@ -696,6 +860,22 @@ func getScaleDeployments(
 			continue
 		}
 
+		// scaleVariantsToZero mirrors a version's scale-to-zero decision onto its
+		// variant Deployments (skipping KEDA-managed ones, same as the base).
+		scaleVariantsToZero := func(buildID string) {
+			for name, vd := range k8sState.VariantDeployments[buildID] {
+				if isDeploymentKEDAManaged(vd) {
+					continue
+				}
+				if vd.Spec.Replicas != nil && *vd.Spec.Replicas == 0 {
+					continue
+				}
+				if ref := k8sState.VariantDeploymentRefs[buildID][name]; ref != nil {
+					scaleDeployments[ref] = 0
+				}
+			}
+		}
+
 		switch version.Status {
 		case temporaliov1alpha1.VersionStatusInactive:
 			// Scale down inactive versions that are not the target
@@ -709,6 +889,7 @@ func getScaleDeployments(
 				}
 			} else if !(d.Spec.Replicas != nil && *d.Spec.Replicas == 0) { // these are non-target inactive versions with nil replicas or >0 replicas
 				scaleDeployments[version.Deployment] = 0
+				scaleVariantsToZero(version.BuildID)
 			}
 		case temporaliov1alpha1.VersionStatusRamping, temporaliov1alpha1.VersionStatusCurrent:
 			// TODO(carlydf): Also not convinced this case actually happens, because Target and Current Versions are excluded from DeprecatedVersions. Leaving it unchanged since I don't want to add to this PRs scope.
@@ -725,11 +906,74 @@ func getScaleDeployments(
 				if !(d.Spec.Replicas != nil && *d.Spec.Replicas == 0) { // these are non-target drained versions with nil replicas or >0 replicas
 					scaleDeployments[version.Deployment] = 0
 				}
+				scaleVariantsToZero(version.BuildID)
 			}
 		}
 	}
 
 	return scaleDeployments
+}
+
+// getCreateVariants returns the spec.variants entries whose child Deployment is
+// missing for the target version. Variants only materialize alongside a base
+// Deployment that carries the VariantLabel discriminator: a base created before
+// variants were configured has an immutable legacy selector that would overlap
+// the variant pods, so those versions are skipped and variants appear on the
+// next version rollout.
+func getCreateVariants(
+	k8sState *k8s.DeploymentState,
+	status *temporaliov1alpha1.TemporalWorkerDeploymentStatus,
+	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
+	willCreateBase bool,
+) []string {
+	if len(spec.Variants) == 0 {
+		return nil
+	}
+	targetBuildID := status.TargetVersion.BuildID
+	if targetBuildID == "" {
+		return nil
+	}
+	if !willCreateBase {
+		base, exists := k8sState.Deployments[targetBuildID]
+		if !exists {
+			// No base and not creating one this cycle (e.g. version cap) - variants
+			// must never exist without their base.
+			return nil
+		}
+		if base.Spec.Selector.MatchLabels[k8s.VariantLabel] != k8s.BaseVariantName {
+			return nil // legacy base: wait for the next version rollout
+		}
+	}
+	var create []string
+	for _, v := range spec.Variants {
+		if _, exists := k8sState.VariantDeployments[targetBuildID][v.Name]; !exists {
+			create = append(create, v.Name)
+		}
+	}
+	return create
+}
+
+// getDeleteVariantDeployments returns variant Deployments to delete beyond the
+// version-sunset cascade handled in getDeleteDeployments: variants removed from
+// the spec, and variants whose base Deployment is gone entirely.
+func getDeleteVariantDeployments(
+	k8sState *k8s.DeploymentState,
+	spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec,
+) []*appsv1.Deployment {
+	specVariants := make(map[string]struct{}, len(spec.Variants))
+	for _, v := range spec.Variants {
+		specVariants[v.Name] = struct{}{}
+	}
+	var out []*appsv1.Deployment
+	for buildID, variants := range k8sState.VariantDeployments {
+		_, baseExists := k8sState.Deployments[buildID]
+		for name, d := range variants {
+			if _, inSpec := specVariants[name]; !inSpec || !baseExists {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
 }
 
 // shouldCreateDeployment determines if a new deployment needs to be created
