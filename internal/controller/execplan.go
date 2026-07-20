@@ -7,12 +7,15 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	appsv1 "k8s.io/api/apps/v1"
@@ -22,6 +25,9 @@ import (
 )
 
 func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, temporalClient sdkclient.Client, p *plan) error {
+	// Get deployment handler
+	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(p.WorkerDeploymentName)
+
 	// Create deployment
 	if p.CreateDeployment != nil {
 		l.Info("creating deployment", "deployment", p.CreateDeployment)
@@ -31,12 +37,46 @@ func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l 
 		}
 	}
 
-	// Delete deployments
+	// Delete deployments. Each of these is a drained, no-longer-polling version
+	// (see planner.getDeleteDeployments, which now requires EligibleForDeletion
+	// before adding a Drained version here). Deleting the Kubernetes object
+	// alone would leave the corresponding Temporal server-side Worker
+	// Deployment Version registered forever — the only other cleanup path is
+	// the CRD-deletion finalizer, which never runs during normal rollout. This
+	// is also the only point that can reliably do so: a deprecated version's
+	// status entry only exists in status.DeprecatedVersions while its
+	// Deployment still exists (see state_mapper.go), so there's no way to
+	// retry this on a later reconcile once the Deployment is gone. Left
+	// unpruned, these accumulate one per rollout indefinitely and eventually
+	// hit the server's per-deployment version cap, at which point every future
+	// rollout fails to register a new build ID (#377).
 	for _, d := range p.DeleteDeployments {
 		l.Info("deleting deployment", "deployment", d)
 		if err := r.Delete(ctx, d); err != nil {
 			l.Error(err, "unable to delete deployment", "deployment", d)
 			return err
+		}
+
+		buildID, ok := d.GetLabels()[k8s.BuildIDLabel]
+		if !ok {
+			l.Info("deployment has no build ID label, skipping Temporal server-side version cleanup", "deployment", d.Name)
+			continue
+		}
+		l.Info("deleting drained worker deployment version", "buildID", buildID)
+		if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
+			BuildID:  buildID,
+			Identity: getControllerIdentity(),
+		}); err != nil {
+			var notFound *serviceerror.NotFound
+			if errors.As(err, &notFound) {
+				continue
+			}
+			// Best-effort: the Kubernetes Deployment is already gone, which is
+			// the primary action. A failure here (e.g. a transient RPC error,
+			// or the poller-expiry race described above outlasting even
+			// deleteDelay) means the Temporal-side record lingers until an
+			// operator prunes it manually or the CRD itself is deleted.
+			l.Info("could not delete worker deployment version, may require manual cleanup", "buildID", buildID, "error", err)
 		}
 	}
 	// Scale deployments
@@ -64,9 +104,6 @@ func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l 
 			return fmt.Errorf("unable to update deployment: %w", err)
 		}
 	}
-
-	// Get deployment handler
-	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(p.WorkerDeploymentName)
 
 	for _, wf := range p.startTestWorkflows {
 		// Log workflow start details

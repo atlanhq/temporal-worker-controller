@@ -354,8 +354,16 @@ func getDeleteDeployments(
 			// Deleting a deployment is only possible when:
 			// 1. The deployment has been drained for deleteDelay + scaledownDelay.
 			// 2. The deployment is scaled to 0 replicas.
+			// 3. The version is eligible for deletion on the Temporal server
+			//    (no versioned pollers remain on any of its task queues).
+			//    Requiring this alongside the delay lets execplan delete the
+			//    Temporal-side version record in the same step as the
+			//    Deployment: EligibleForDeletion is only computable while the
+			//    Deployment (and thus this DeprecatedVersions entry) still
+			//    exists, so this is the only point that can reliably prune it.
 			if (time.Since(version.DrainedSince.Time) > spec.SunsetStrategy.DeleteDelay.Duration+spec.SunsetStrategy.ScaledownDelay.Duration) &&
-				*d.Spec.Replicas == 0 {
+				*d.Spec.Replicas == 0 &&
+				version.EligibleForDeletion {
 				deleteDeployments = append(deleteDeployments, d)
 			}
 		case temporaliov1alpha1.VersionStatusNotRegistered:

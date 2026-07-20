@@ -95,6 +95,7 @@ func TestGeneratePlan(t *testing.T) {
 						DrainedSince: &metav1.Time{
 							Time: time.Now().Add(-24 * time.Hour),
 						},
+						EligibleForDeletion: true,
 					},
 				},
 			},
@@ -453,6 +454,7 @@ func TestGetDeleteDeployments(t *testing.T) {
 						DrainedSince: &metav1.Time{
 							Time: time.Now().Add(-24 * time.Hour),
 						},
+						EligibleForDeletion: true,
 					},
 				},
 			},
@@ -486,6 +488,44 @@ func TestGetDeleteDeployments(t *testing.T) {
 						DrainedSince: &metav1.Time{
 							Time: time.Now().Add(-1 * time.Hour),
 						},
+						EligibleForDeletion: true,
+					},
+				},
+			},
+			spec: &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+				SunsetStrategy: temporaliov1alpha1.SunsetStrategy{
+					DeleteDelay: &metav1.Duration{Duration: 4 * time.Hour},
+				},
+				Replicas: func() *int32 { r := int32(1); return &r }(),
+			},
+			expectDeletes:             0,
+			foundDeploymentInTemporal: true,
+		},
+		{
+			name: "drained long enough and scaled to zero, but still has versioned pollers - not deleted",
+			k8sState: &k8s.DeploymentState{
+				Deployments: map[string]*appsv1.Deployment{
+					"789": createDeploymentWithDefaultConnectionSpecHash(0),
+				},
+			},
+			status: &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+					{
+						BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+							BuildID:    "789",
+							Status:     temporaliov1alpha1.VersionStatusDrained,
+							Deployment: &corev1.ObjectReference{Name: "test-789"},
+						},
+						DrainedSince: &metav1.Time{
+							Time: time.Now().Add(-24 * time.Hour),
+						},
+						// EligibleForDeletion defaults to false here: the drainage
+						// status check and the server's versioned-poller registry
+						// can disagree briefly (e.g. right after a poller's last
+						// long-poll request completes). Deleting the Deployment
+						// before EligibleForDeletion is true would make the
+						// subsequent Temporal-side DeleteVersion call fail with
+						// "active pollers" (see execplan.go).
 					},
 				},
 			},
@@ -1996,6 +2036,7 @@ func TestComplexVersionStateScenarios(t *testing.T) {
 						DrainedSince: &metav1.Time{
 							Time: time.Now().Add(-48 * time.Hour), // Long time drained
 						},
+						EligibleForDeletion: true,
 					},
 				},
 			},
