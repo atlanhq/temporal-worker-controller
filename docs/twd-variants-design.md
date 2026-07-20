@@ -69,7 +69,7 @@ Cons: list validation (unique names, name-length budget), a slightly larger stat
 
 The load-bearing refactor is identical for A and B; written here in B's terms.
 
-1. **CRD + webhook** - `api/v1alpha1/worker_types.go:74-127`: add `Variants []WorkerVariant`. Webhook (`temporalworker_webhook.go:46-56, 82-117`): default `taskQueueSuffix`, validate unique DNS-safe names, reserved `base`, `workerScaling.taskQueue` set when any variant has a suffix. Regenerate deepcopy + CRD.
+1. **CRD + webhook** - `api/v1alpha1/worker_types.go:74-127`: add `Variants []WorkerVariant`. Webhook (`temporalworker_webhook.go:46-56, 82-117`): validate unique DNS-safe names, reserved `base`, `workerScaling.taskQueue` set when any variant has a non-empty suffix (no global suffix default - `""` means poll the base queue). Regenerate deepcopy + CRD.
 2. **Re-key `DeploymentState`** - `internal/k8s/deployments.go:45-52, 86-92`: `map[buildID]*Deployment` -> `map[buildID]map[variant]*Deployment` (variant `""`/`base` = base). Discriminator label `temporal.io/variant: <name>` on each Deployment + its pod template; read back on list. **Two same-build Deployments currently collide in this map - this is the central bug-by-construction to remove.**
 3. **Selector** - `ComputeSelectorLabels` (`deployments.go:244-249`) gains the variant label -> per-Deployment selectors `{deployment-name, build-id, variant}` are disjoint; `TWDNameSelector` (`deployments.go:255-257`) is **untouched** so `/scale` (declared `worker_types.go:597`) spans all variants - the VPA payoff. Consumers: `deployments.go:268`, `workerresourcetemplates.go:90` (WorkerResourceTemplate applies go to all variants).
    - **Selector immutability:** existing base Deployments (2-label selector) cannot gain the variant label. Policy: 3-label selectors only on Deployments created after variants are configured -> variants materialize at the **next version rollout**, never retrofitted onto the live buildID. Zero migration; atlan apps roll constantly.
@@ -84,6 +84,20 @@ The load-bearing refactor is identical for A and B; written here in B's terms.
 - Temporal version lifecycle: one version, N queues is native; no extra versions are minted (variants inherit `unsafeCustomBuildID`), so no interaction with the 100-version GC wedge.
 - `TWDNameSelector` / scale subresource / VPA wiring - byte-identical.
 - No variants configured -> desired state is byte-identical to today (regression gate for every phase).
+
+## Performance impact
+
+Net neutral-to-positive at the control plane; zero impact on the data path (task queues, pollers, and dispatch are identical either way - the same pods poll the same queues).
+
+**Cheaper, fleet-wide:**
+- **TWD count halves** (2 -> 1 per split+TWD app; ~123 apps on the test tenant alone). Each TWD is its own reconcile loop with its own Temporal describe polling, and TWC reconcile pressure is a known incident class (the ~10s-per-TWD hot-loop, fleet-wide ~580 tenants). Fewer TWDs = fewer reconciles, fewer TWC->Temporal RPCs, fewer status writes.
+- **Temporal worker-deployment count halves** - today base and od are two WDNs server-side, each accumulating version records per release. One WDN with two queues halves version-record accumulation and shrinks the 100-version GC-wedge surface (per-WDN churn rate unchanged; half as many WDNs churning).
+- Per-reconcile work grows slightly (build/diff 2 Deployments + 2 SOs instead of 1+1) - in-memory, noise against the RPC-bound loop. KEDA SO count and trigger polling are unchanged (the od twin already has its own SO today). VPA recommender load is unchanged (it already watches all pods; merging od pods into one histogram is trivial).
+
+**Watch-items:**
+1. **Rollout latency (the open validation item).** If `SetCurrentVersion`'s missing-task-queues check ends up waiting for the od queue to be polled, promotion inherits on-demand node provisioning latency (~1-2 min Karpenter spin-up) on every release. The >=1 floor during ramp exists to register the queue early; whether promotion can still race it is the phase-6 live test.
+2. **VPA eviction churn now reaches od pods.** Today od pods are never VPA-evicted (no VPA). Under `updateMode: Auto` the updater may evict an od pod mid-activity to resize it - and od pods run already-disrupted rerouted work, so an eviction costs another attempt. Partly this is the fix working (evict-to-grow during an OOM loop); residual churn shrinks as VPA's in-place-resize path matures. Sanity-check PDB/minReplicas at rollout.
+3. **On-demand capacity when od is active** rises from static ~256Mi requests to VPA-sized ones. That is the point of the change, but it is a real cost delta on the expensive tier - bounded by od being scale-to-zero and intermittent.
 
 ## Ripples (separate PRs, same release window)
 
@@ -103,6 +117,52 @@ The load-bearing refactor is identical for A and B; written here in B's terms.
 | 6 | envtest integration + live markeznp25 | 2 Deployments + 2 SOs + status; rollout v1->v2 with a variant (validates the SetCurrentVersion missing-task-queues subtlety); VPA observes od pods; ballooned od pod's OOM bumps `status.recommendation` |
 
 Estimated effort unchanged from the flag design: the core is phases 1+3+4 (~15 call sites on the hottest reconcile path); the generalized API adds list validation and removes od special-casing - roughly a wash.
+
+## Test plan
+
+### Unit (TDD - written before the code they gate)
+
+| Area | Cases |
+|---|---|
+| webhook / CRD | variant names unique + DNS-safe + short; `base`/empty reserved; no global suffix default - each variant declares its own (`""` = poll the base queue); variant with non-empty suffix requires `workerScaling.taskQueue`; `envValueSuffixes` names non-empty; CRD round-trip with and without variants |
+| deployments state | two Deployments of one buildID with distinct `temporal.io/variant` labels do NOT collide (the central bug today); unlabeled (pre-feature) Deployment maps to base; unknown variant label -> surfaced, not silently adopted |
+| build path | golden-object diff base vs variant: name (`<twd>-<variant>-<build>`, hash-fallback when >47 chars), 3-label selector + pod labels, affinity/nodeSelector/tolerations/resources deltas applied, `envValueSuffixes` appends to the right env values and only those, identical `TEMPORAL_DEPLOYMENT_NAME`/`TEMPORAL_WORKER_BUILD_ID` injection |
+| planner | create decisions per variant (base exists / variant missing -> create variant only, and vice versa); drift in a variant delta rolls only that variant's Deployment; drift in the shared template rolls all; scale ops target the right variant; sunset deletes every variant of the version |
+| state mapper / status | version with variants: base ref unchanged, `variantDeployments` populated; readyReplicas = sum over variants; health/promotion gates on base only (variant unhealthy must NOT block `HealthySince`) |
+| scaledobjects | one SO per variant per active version; trigger queue = `resolveTaskQueue(twd)+suffix`; empty suffix -> same queue as base; same WDN/buildID in trigger metadata; per-variant `scaling` overrides merge over `workerScaling`; managed label ensured on every variant's Deployment; 63-char SO name fallback |
+
+### Regression gate (every phase)
+
+- No variants configured -> desired objects byte-identical to `v1.6.0-atlan` (golden render diff), and the existing unit + envtest suites pass **unmodified**.
+- `TWDNameSelector` stays 1-label (existing `deployments_test.go:583-617` must keep passing untouched).
+
+### Integration (envtest)
+
+- Reconcile a TWD with one `od` variant: 2 Deployments + 2 SOs created, status shape correct, `/scale` selector spans both pod sets.
+- Rollout v1 -> v2: both variants get new Deployments; old version's variants sunset together; no orphaned SOs.
+- Variant added to an existing TWD: nothing retrofitted onto the live buildID; next version materializes the variant (selector-immutability policy).
+- Variant removed: its Deployments/SOs are swept on the next version (or per chosen policy), base untouched.
+
+### Live functional (markeznp25; reuses the BLDX-1532 harness - versioned e2eworker image, heartbeating Sleep activity, `rerouter-e2e` ns)
+
+| # | Test | Pass criteria |
+|---|---|---|
+| F1 | dual registration | one TWD + od variant -> both pods register the same `{workerDeploymentName, buildID}`; `temporal worker deployment describe` shows ONE version with BOTH queues |
+| F2 | pinned dispatch across variants (case-F analog) | pinned workflow on the base queue; reroute its activity to `<base>-od` (rerouter e2e path, `dryRun:false` window) -> runs on the od variant pod with the pin intact |
+| F3 | rollout + promotion | bump buildID -> promotion succeeds; **measure** whether `SetCurrentVersion` waits on od-queue registration (the open validation item); od floored >=1 during ramp; scales to zero after Current |
+| F4 | VPA spanning (the point of the change) | VPA targets the TWD -> `status.recommendation` reflects od pod usage; balloon the od pod -> OOMKilled -> recommendation memory bumps; next od pod admission gets the bumped requests |
+| F5 | per-variant KEDA | backlog on `<base>-od` scales od 0->1 while base replica count is unaffected, and vice versa |
+| F6 | rerouter lockstep | reworked registry sees the variant-declared od tier -> `HasODTier=true`, reroute e2e passes on a consolidated app; negative control: app without an od variant -> `skip{no-od-tier}` |
+| F7 | resource patch without version churn | patch the od variant's `resources` -> only the od Deployment rolls; buildID/version count unchanged (`unsafeCustomBuildID` pins identity) |
+| F8 | chart equivalence | consolidated chart (1 TWD + variants) vs today's two-TWD render: pod-level equivalence on env, affinity, tolerations, queues (helm template diff) |
+
+Harness cautions carried over from the live suite: untaint `karpenter.sh/disrupted` within seconds (held ~90s it deletes the node); the reclaim target pod needs `karpenter.sh/do-not-disrupt: "true"`; config flips are global - keep `dryRun:false` windows short.
+
+### Performance / soak (canary tenant, before/after)
+
+- TWC reconcile duration + TWC->Temporal RPC rate (expect a drop with halved TWD count).
+- Rollout wall-time delta across ~5 releases (watch-item 1).
+- VPA eviction count on od pods over a week (watch-item 2).
 
 ## Decisions
 
