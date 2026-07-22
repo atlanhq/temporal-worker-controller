@@ -81,6 +81,17 @@ Context: PR #23 rebased onto v1.6.0-atlan @ fb9d67a (#25 sunset prune); tenant f
 3. **Workflows started while matching rolls can spool invisibly**: a workflow started mid-roll sat with a SCHEDULED workflow task that neither the queue stats nor the KEDA scaler could see; restarting the workflow after the roll behaved normally. Worth knowing for any maintenance window.
 4. Round-1 finding confirmed by accident: the plain base-image controller (tenant was rolled to it by the team between rounds) ignores `spec.variants` harmlessly - base reconciles fine, the field no-ops (CRD forward-compat holds).
 
+
+## Coverage mapping: additional scenarios (2026-07-22)
+
+Three scenarios raised in review, mapped to existing evidence plus two variant-side unit tests added to close thin gaps (`scaledobjects_variants_test.go`).
+
+| Scenario | Verdict | Evidence |
+|---|---|---|
+| Deprecated worker version -> its SOs deprecated too | COVERED, with deliberate timing: SOs are removed at **Drained**, not at deprecated - a Draining version keeps its SOs because pinned work still runs on it and KEDA must keep scaling those workers | Live V6 (drain swept both tiers' SOs 4->2, then scaled 0 + deleted both Deployments); unit `TestActiveVersionsForScaling_ExcludesDrained` (base) + `TestVariantSOsDeprecatedWithVersion` (variant set derives from the drained-excluding base set - both tiers deprecate atomically) |
+| SO target matches the appropriate worker deployment | COVERED - every SO's scaleTargetRef points at exactly its own (version x tier) Deployment; RecordedWDN keeps the trigger aimed at the right worker-deployment identity across WDN renames | Live V1 (`rr-test-v1-scale -> rr-test-v1`, `rr-od-test-v1-scale -> rr-od-test-v1`; 4 correctly-paired SOs during the V5 rollout); unit `TestBuildScaledObjectVariant` + the surviving-refs map assertion in `TestVariantSOsDeprecatedWithVersion` |
+| Workflow task without a Build ID -> ramping+current WDs scale to 1 for the unversioned queue | COVERED by two overlapping mechanisms: (a) Current/Ramping SOs carry `selectAllActive+selectUnversioned` so spooled no-build-ID tasks wake them from 0; (b) the `resolveMinReplicas` floor pins Ramping/Inactive/NotRegistered-target versions at >=1 unconditionally, making the "to 1" outcome deterministic during rollouts regardless of backlog visibility | Live V2 + V9b (unversioned workflow starts woke the Current version 0->1 in ~20s on BOTH the base and `-od` queues); unit: base flags per status (pre-existing) + `TestVariantSOUnversionedFlags` (variant SOs: flags on for Current/Ramping, strictly per-build when Draining). Caveat: the Ramping half of the scaler path is masked live by the floor (never observably at 0) - unit-verified only; the documented Current+Ramping double-count of the same spooled task remains the accepted cold-start trade-off |
+
 ## End state
 
 - markeznp25 KEPT on: TWC `sha-c7d1e97...` (PR #23), atlan-app chart `0.1.2-pr14006-gb7a008e` (OCIRepository), rerouter `sha-cdc7bf6b...` (PR #1 head d973885, dryRun:true, minLostWork:30m). This is deliberate - it is the validation tenant (Argo autosync off, targetRevision pinned).
