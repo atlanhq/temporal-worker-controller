@@ -110,6 +110,9 @@ The round-1 "version-GC retry loop" errors were misdiagnosed as benign: they wer
 - **Stuck predicate**: any od TWD whose children sit at >0 replicas when deleted (keda-off static, or SO min>=1).
 - **Unblock**: delete the TWD's ScaledObjects, then delete (not scale - KEDA fights) its child Deployments; the version record deletes ~4-5 min later (server-side poller TTL) and the finalizer clears. Verified on all four.
 - **Fix for the fork (follow-up, NOT #23 scope)**: the deletion/finalizer path should delete child Deployments + SOs first, wait for the poller window, then delete the version record. Until then this bites ANY TWD deletion with live pollers - od twins during consolidation are just the common case.
+- **FIX SHIPPED (#26) AND LIVE-VALIDATED 2026-07-22** on markeznp25 (image `sha-43afceb...`), both convergence paths hands-off:
+  - T1 - variants TWD with the exact deadlock predicate (base+od both `minReplicaCount: 1`, both polling): `kubectl delete` -> ONE reconcile deleted both SOs, both child Deployments, the version record, and removed the finalizer. **Delete-to-gone: 8 seconds** (vs 2+ days deadlocked pre-fix).
+  - Mixed legacy+variant TWD (legacy v1 pod without the variant label + v2 base/od pods, all live at deletion): teardown deleted everything, version deletion retried through the server-side poller TTL on the existing requeue loop, finalizer cleared. **Delete-to-gone: 5m19s, zero intervention** - the TTL-converge path.
 - Note: variants-mode teardown does not hit this shape in the same way (V6 drained before deletion), but a variants TWD deleted outright with running children would - same fix covers it.
 
 ## End state
