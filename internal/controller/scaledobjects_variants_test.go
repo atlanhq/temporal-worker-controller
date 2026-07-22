@@ -169,3 +169,78 @@ func TestStateMapperVariants(t *testing.T) {
 	// Base health gating is untouched: target.HealthySince comes from the base only.
 	assert.Nil(t, target.HealthySince)
 }
+
+// TestVariantSOsDeprecatedWithVersion: a Drained version must not produce SOs
+// for its variants either - the variant SO set derives from the base version
+// set, which already excludes Drained, so both tiers' SOs go stale and are
+// swept together (proven live in V6: 4 -> 2 on drain).
+func TestVariantSOsDeprecatedWithVersion(t *testing.T) {
+	twd := variantTWD()
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		CurrentVersion: &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID:    "v2",
+				Status:     temporaliov1alpha1.VersionStatusCurrent,
+				Deployment: &corev1.ObjectReference{Name: "app-worker-twd-v2"},
+				Variants: []temporaliov1alpha1.VariantStatus{
+					{Name: "od", Deployment: &corev1.ObjectReference{Name: "app-worker-twd-od-v2"}},
+				},
+			},
+		},
+		TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: "v2"},
+		},
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID:    "v1",
+				Status:     temporaliov1alpha1.VersionStatusDrained,
+				Deployment: &corev1.ObjectReference{Name: "app-worker-twd-v1"},
+				Variants: []temporaliov1alpha1.VariantStatus{
+					{Name: "od", Deployment: &corev1.ObjectReference{Name: "app-worker-twd-od-v1"}},
+				},
+			},
+		}},
+	}
+	base := activeVersionsForScaling(status)
+	all := append(base, variantVersionsForScaling(base, status, twd)...)
+	for _, v := range all {
+		assert.NotEqual(t, "v1", v.BuildID, "drained version must produce NO SOs, base or variant")
+	}
+	// And every surviving ref targets its own tier's Deployment.
+	names := map[string]string{}
+	for _, v := range all {
+		key := v.BuildID
+		if v.Variant != nil {
+			key += "/" + v.Variant.Name
+		}
+		names[key] = v.Deployment.Name
+	}
+	assert.Equal(t, map[string]string{
+		"v2":    "app-worker-twd-v2",
+		"v2/od": "app-worker-twd-od-v2",
+	}, names)
+}
+
+// TestVariantSOUnversionedFlags: the od variant's SO must carry selectAllActive +
+// selectUnversioned exactly like the base for Current/Ramping versions, so an
+// unversioned (no-build-ID) task spooled on the suffixed queue wakes the variant
+// from zero too. Draining stays strictly per-build-scoped.
+func TestVariantSOUnversionedFlags(t *testing.T) {
+	twd := variantTWD()
+	ref := &corev1.ObjectReference{Name: "app-worker-twd-od-bid1", Namespace: "app-ns"}
+	for _, tc := range []struct {
+		status temporaliov1alpha1.VersionStatus
+		want   bool
+	}{
+		{temporaliov1alpha1.VersionStatusCurrent, true},
+		{temporaliov1alpha1.VersionStatusRamping, true},
+		{temporaliov1alpha1.VersionStatusDraining, false},
+	} {
+		so := buildScaledObject(twd, versionRef{
+			BuildID: "bid1", Status: tc.status, Deployment: ref, Variant: &twd.Spec.Variants[0],
+		}, "temporal:7233")
+		md := soTrigger(t, so)
+		assert.Equal(t, tc.want, md["selectAllActive"] == "true", "selectAllActive for %s", tc.status)
+		assert.Equal(t, tc.want, md["selectUnversioned"] == "true", "selectUnversioned for %s", tc.status)
+	}
+}
