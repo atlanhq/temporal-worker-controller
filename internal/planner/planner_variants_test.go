@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
+	"github.com/temporalio/temporal-worker-controller/internal/temporal"
+	"github.com/temporalio/temporal-worker-controller/internal/testhelpers/testlogr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -258,4 +260,67 @@ func TestCheckAndUpdateVariantPodTemplateSpec(t *testing.T) {
 		autoSpec.WorkerOptions.UnsafeCustomBuildID = ""
 		assert.Nil(t, checkAndUpdateVariantPodTemplateSpec(current.DeepCopy(), autoSpec, conn, variant))
 	})
+}
+
+func TestGateWaitsForExpectedVariantQueues(t *testing.T) {
+	gate := temporaliov1alpha1.RolloutStrategy{
+		Strategy: temporaliov1alpha1.UpdateAllAtOnce,
+		Gate:     &temporaliov1alpha1.GateWorkflowConfig{WorkflowType: "GateWf"},
+	}
+	healthy := metav1.Now()
+	completedWf := func(q string) temporaliov1alpha1.WorkflowExecution {
+		return temporaliov1alpha1.WorkflowExecution{
+			WorkflowID: "gate-" + q, RunID: "r", TaskQueue: q,
+			Status: temporaliov1alpha1.WorkflowExecutionStatusCompleted,
+		}
+	}
+	mkStatus := func(queues []string, wfs []temporaliov1alpha1.WorkflowExecution) *temporaliov1alpha1.TemporalWorkerDeploymentStatus {
+		var tqs []temporaliov1alpha1.TaskQueue
+		for _, q := range queues {
+			tqs = append(tqs, temporaliov1alpha1.TaskQueue{Name: q})
+		}
+		return &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+			TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID: "v2", Status: temporaliov1alpha1.VersionStatusInactive,
+					HealthySince: &healthy, TaskQueues: tqs,
+				},
+				TestWorkflows: wfs,
+			},
+			CurrentVersion: &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+					BuildID: "v1", Status: temporaliov1alpha1.VersionStatusCurrent,
+				},
+			},
+		}
+	}
+	state := &temporal.TemporalWorkerState{Versions: map[string]*temporal.VersionInfo{}}
+	cfg := &Config{RolloutStrategy: gate, ExpectedGateQueues: []string{"q", "q-od"}}
+
+	t.Run("od queue not yet registered -> gate blocks even with base gate wf done", func(t *testing.T) {
+		st := mkStatus([]string{"q"}, []temporaliov1alpha1.WorkflowExecution{completedWf("q")})
+		assert.Nil(t, getVersionConfigDiff(testlogr.New(t), st, state, cfg, "ns/w"))
+	})
+	t.Run("both queues registered, od gate wf missing -> blocks", func(t *testing.T) {
+		st := mkStatus([]string{"q", "q-od"}, []temporaliov1alpha1.WorkflowExecution{completedWf("q")})
+		assert.Nil(t, getVersionConfigDiff(testlogr.New(t), st, state, cfg, "ns/w"))
+	})
+	t.Run("both queues + both gate wfs completed -> promotes", func(t *testing.T) {
+		st := mkStatus([]string{"q", "q-od"}, []temporaliov1alpha1.WorkflowExecution{completedWf("q"), completedWf("q-od")})
+		vcfg := getVersionConfigDiff(testlogr.New(t), st, state, cfg, "ns/w")
+		require.NotNil(t, vcfg)
+		assert.True(t, vcfg.SetCurrent)
+	})
+	t.Run("no expected queues configured -> legacy behavior", func(t *testing.T) {
+		legacy := &Config{RolloutStrategy: gate}
+		st := mkStatus([]string{"q"}, []temporaliov1alpha1.WorkflowExecution{completedWf("q")})
+		assert.NotNil(t, getVersionConfigDiff(testlogr.New(t), st, state, legacy, "ns/w"))
+	})
+}
+
+func TestExpectedGateQueues(t *testing.T) {
+	assert.Nil(t, ExpectedGateQueues(&temporaliov1alpha1.TemporalWorkerDeploymentSpec{}))
+	spec := specWithVariants("od")
+	spec.Variants = append(spec.Variants, temporaliov1alpha1.WorkerVariant{Name: "standby"}) // empty suffix: same queue
+	assert.Equal(t, []string{"q", "q-od"}, ExpectedGateQueues(spec))
 }

@@ -129,7 +129,8 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 
 	// Generate the plan using the planner package
 	plannerConfig := &planner.Config{
-		RolloutStrategy: rolloutStrategy,
+		RolloutStrategy:    rolloutStrategy,
+		ExpectedGateQueues: planner.ExpectedGateQueues(&w.Spec),
 	}
 
 	// Fetch all WorkerResourceTemplates that reference this TWD so that the planner

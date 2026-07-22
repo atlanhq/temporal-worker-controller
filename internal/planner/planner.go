@@ -124,6 +124,33 @@ type WorkflowConfig struct {
 type Config struct {
 	// RolloutStrategy to use
 	RolloutStrategy temporaliov1alpha1.RolloutStrategy
+
+	// ExpectedGateQueues lists the task queues that must be REGISTERED on the
+	// target version before a gated rollout may be evaluated: the base
+	// workerScaling.taskQueue plus each variant's suffixed queue (see
+	// ExpectedGateQueues). Closes the race where promotion could slip through
+	// after the base registers but before a variant's queue does - the gate
+	// then never fans out to that queue. Empty disables the check (no gate, or
+	// queues not derivable from the spec).
+	ExpectedGateQueues []string
+}
+
+// ExpectedGateQueues derives the queue set a gated rollout must observe on the
+// target version: workerScaling.taskQueue plus base+suffix for every variant
+// with a non-empty TaskQueueSuffix. Returns nil when the spec does not declare
+// the base queue (queues then aren't derivable and the check is skipped).
+func ExpectedGateQueues(spec *temporaliov1alpha1.TemporalWorkerDeploymentSpec) []string {
+	if spec.WorkerScaling == nil || spec.WorkerScaling.TaskQueue == "" {
+		return nil
+	}
+	base := spec.WorkerScaling.TaskQueue
+	out := []string{base}
+	for _, v := range spec.Variants {
+		if v.TaskQueueSuffix != "" {
+			out = append(out, base+v.TaskQueueSuffix)
+		}
+	}
+	return out
 }
 
 // GeneratePlan creates a plan for updating the worker deployment
@@ -1069,6 +1096,21 @@ func getVersionConfigDiff(
 	if strategy.Gate != nil {
 		if len(status.TargetVersion.TaskQueues) == 0 {
 			return nil
+		}
+		// Every spec-declared queue (base + variant suffixed queues) must be
+		// registered before the gate can be evaluated. Without this, promotion
+		// could pass after the base queue's gate workflow completes but before
+		// a variant's queue registers - its gate workflow would never run.
+		if len(config.ExpectedGateQueues) > 0 {
+			registered := make(map[string]struct{}, len(status.TargetVersion.TaskQueues))
+			for _, tq := range status.TargetVersion.TaskQueues {
+				registered[tq.Name] = struct{}{}
+			}
+			for _, q := range config.ExpectedGateQueues {
+				if _, ok := registered[q]; !ok {
+					return nil
+				}
+			}
 		}
 		if len(status.TargetVersion.TestWorkflows) < len(status.TargetVersion.TaskQueues) {
 			return nil
