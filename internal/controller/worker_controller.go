@@ -466,11 +466,66 @@ func (r *TemporalWorkerDeploymentReconciler) markWRTsTWDNotFound(ctx context.Con
 //  2. Set the current version to "unversioned" (empty BuildID) so new tasks route to unversioned workers
 //  3. Delete all registered versions (with SkipDrainage since the TWD is being removed entirely)
 //  4. Delete the deployment record itself once all versions are gone
+//
+// teardownChildren deletes the TWD's owned ScaledObjects and child Deployments.
+// Without this, deletion deadlocks: the children are owner-referenced to the TWD,
+// so garbage collection only removes them AFTER the TWD object goes away - which
+// the delete-protection finalizer blocks until the Temporal version records are
+// deleted - which the server refuses while the children's pods still poll
+// ("Version cannot be deleted since it has active pollers"). Observed live on
+// every TWD whose children sit at >0 replicas at deletion time: keda-off workers
+// (static replicas) and ScaledObjects with minReplicaCount>=1 (the SO survives
+// into termination and its HPA fights any manual scale-down, so SOs must be
+// deleted before Deployments). Idempotent: repeat calls see empty lists.
+func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
+	ctx context.Context,
+	l logr.Logger,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) error {
+	sos, err := r.listOwnedScaledObjects(ctx, workerDeploy)
+	if err != nil {
+		return fmt.Errorf("unable to list owned ScaledObjects for teardown: %w", err)
+	}
+	for name, so := range sos {
+		l.Info("deleting owned ScaledObject before Temporal cleanup", "name", name)
+		if err := r.Delete(ctx, so); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("unable to delete ScaledObject %s: %w", name, err)
+		}
+	}
+
+	var childDeploys appsv1.DeploymentList
+	if err := r.List(
+		ctx,
+		&childDeploys,
+		client.InNamespace(workerDeploy.Namespace),
+		client.MatchingFields{deployOwnerKey: workerDeploy.Name},
+	); err != nil {
+		return fmt.Errorf("unable to list child deployments for teardown: %w", err)
+	}
+	for i := range childDeploys.Items {
+		d := &childDeploys.Items[i]
+		l.Info("deleting child Deployment before Temporal cleanup", "name", d.Name)
+		if err := r.Delete(ctx, d); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("unable to delete child deployment %s: %w", d.Name, err)
+		}
+	}
+	return nil
+}
+
 func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	ctx context.Context,
 	l logr.Logger,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
+	// Tear down owned ScaledObjects and child Deployments FIRST so their pods stop
+	// polling; the version deletion below cannot succeed while pollers are active,
+	// and GC cannot remove the children until the finalizer this cleanup serves is
+	// gone. Runs before the Temporal dial so children are released even when the
+	// server is unreachable.
+	if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
+		return err
+	}
+
 	// Resolve Temporal connection.
 	// The TemporalConnection is guaranteed to exist because we hold a finalizer on it
 	// that prevents deletion while any TWD references it.
@@ -569,8 +624,9 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	// Step 3: Delete versions that are eligible. Versions that are still draining
 	// are force-deleted with SkipDrainage since the TWD is being removed entirely.
 	// If any version fails to delete (e.g. active pollers), return an error so the
-	// reconciler requeues. Pollers disappear once pods terminate and the next
-	// reconciliation will succeed.
+	// reconciler requeues. teardownChildren above already deleted the pods' owners;
+	// the server still reports pollers for a short TTL (~minutes) after the last
+	// poll, so the first attempts after teardown may legitimately retry.
 	for _, version := range resp.Info.VersionSummaries {
 		buildID := version.Version.BuildID
 		l.Info("Deleting worker deployment version", "buildID", buildID)

@@ -92,9 +92,29 @@ Three scenarios raised in review, mapped to existing evidence plus two variant-s
 | SO target matches the appropriate worker deployment | COVERED - every SO's scaleTargetRef points at exactly its own (version x tier) Deployment; RecordedWDN keeps the trigger aimed at the right worker-deployment identity across WDN renames | Live V1 (`rr-test-v1-scale -> rr-test-v1`, `rr-od-test-v1-scale -> rr-od-test-v1`; 4 correctly-paired SOs during the V5 rollout); unit `TestBuildScaledObjectVariant` + the surviving-refs map assertion in `TestVariantSOsDeprecatedWithVersion` |
 | Workflow task without a Build ID -> ramping+current WDs scale to 1 for the unversioned queue | COVERED by two overlapping mechanisms: (a) Current/Ramping SOs carry `selectAllActive+selectUnversioned` so spooled no-build-ID tasks wake them from 0; (b) the `resolveMinReplicas` floor pins Ramping/Inactive/NotRegistered-target versions at >=1 unconditionally, making the "to 1" outcome deterministic during rollouts regardless of backlog visibility | Live V2 + V9b (unversioned workflow starts woke the Current version 0->1 in ~20s on BOTH the base and `-od` queues); unit: base flags per status (pre-existing) + `TestVariantSOUnversionedFlags` (variant SOs: flags on for Current/Ramping, strictly per-build when Draining). Caveat: the Ramping half of the scaler path is masked live by the floor (never observably at 0) - unit-verified only; the documented Current+Ramping double-count of the same spooled task remains the accepted cold-start trade-off |
 
+
+## Round 3 (2026-07-22): odMirrorMode removed; fleet consolidation wave; deletion-deadlock finding
+
+The interim `odMirrorMode` knob was removed from the chart (atlan reland commit `9062d3a6`, ported to staging/preprod): variants is the only od-mirror shape, rendered unconditionally inside the `keda.enabled` gate. Default render is byte-identical to the previously validated `--set odMirrorMode=variants` output. The knob-removed chart (`0.1.2-pr14006-g9062d3a`) was deployed tenant-wide on markeznp25.
+
+| Check | Result |
+|---|---|
+| keda-on app (ai-memory, already variants) | no-op upgrade: variants intact, now-inert `odMirrorMode` HelmRelease value harmless |
+| keda-off app (anaplan) | od TWD pruned, NO variants - by design (variants live in the keda gate; keda-off apps were never rerouter-covered: no `workerScaling.taskQueue` -> not in the od-tier registry) |
+| fleet | od TWDs prune as the HelmRelease wave cycles; each keda-on prune also deletes its Temporal version + deployment records, actively freeing `matching.maxDeployments` headroom |
+
+### Finding: TWD deletion deadlocks while its own children still poll (pre-existing fork bug)
+
+The round-1 "version-GC retry loop" errors were misdiagnosed as benign: they were **stuck od-TWD deletions from the 2026-07-20 prune wave**. Mechanism: TWD deletion -> `temporal.io/delete-protection` finalizer tries to delete the Temporal version record **before tearing down the TWD's own child Deployments** -> children still poll -> server refuses ("Version cannot be deleted since it has active pollers") -> retry forever. Deadlocked 2+ days: anaplan, sagemaker, trino (keda-off: static replicas=1) + azure-data-factory (keda-on with SO min=1 - the SO survives into termination and fights any manual scale-down; its child also had a hash-truncated name `azure-data-chore-tool-68faabe01c` from a long custom buildID, which disguises it).
+
+- **Stuck predicate**: any od TWD whose children sit at >0 replicas when deleted (keda-off static, or SO min>=1).
+- **Unblock**: delete the TWD's ScaledObjects, then delete (not scale - KEDA fights) its child Deployments; the version record deletes ~4-5 min later (server-side poller TTL) and the finalizer clears. Verified on all four.
+- **Fix for the fork (follow-up, NOT #23 scope)**: the deletion/finalizer path should delete child Deployments + SOs first, wait for the poller window, then delete the version record. Until then this bites ANY TWD deletion with live pollers - od twins during consolidation are just the common case.
+- Note: variants-mode teardown does not hit this shape in the same way (V6 drained before deletion), but a variants TWD deleted outright with running children would - same fix covers it.
+
 ## End state
 
-- markeznp25 KEPT on: TWC `sha-c7d1e97...` (PR #23), atlan-app chart `0.1.2-pr14006-gb7a008e` (OCIRepository), rerouter `sha-cdc7bf6b...` (PR #1 head d973885, dryRun:true, minLostWork:30m). This is deliberate - it is the validation tenant (Argo autosync off, targetRevision pinned).
+- markeznp25 KEPT on: TWC `sha-2e49355...` (rebased PR #23 + gate hardening), atlan-app chart `0.1.2-pr14006-g9062d3a` (knob-removed, OCIRepository), rerouter `sha-cdc7bf6b...` (PR #1 head d973885, dryRun:true, minLostWork:30m), `matching.maxDeployments: 200` via the `-v2` runtime CM + CR override. This is deliberate - it is the validation tenant (Argo autosync off, targetRevision pinned).
 - ai-memory left on `odMirrorMode=variants` + `unsafeCustomBuildID=main-5336556b` (the consolidated real-app example; revert = remove both HelmRelease values keys).
 - Harness (`rerouter-e2e` ns incl. VPA), test workflows, taints: all removed. Fleet generations: unchanged except the canary and enrichment-studio's own perpetual churn (+1 on gen ~680, unrelated).
 - Restore points: TWC `1.6.0-atlan-2-8633f913...`, chart `0.1.2-beta-d263ae5`, rerouter `sha-4bce6904...`.
