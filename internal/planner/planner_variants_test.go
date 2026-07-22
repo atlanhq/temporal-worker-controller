@@ -125,6 +125,9 @@ func TestGetDeleteDeploymentsCascadesAndOrphans(t *testing.T) {
 				Deployment: k8s.NewObjectRef(base),
 			},
 			DrainedSince: &drainedAt,
+			// Required by the drained-delete gate since the sunset prune change:
+			// drained AND no active base replicas.
+			EligibleForDeletion: true,
 		}},
 	}
 
