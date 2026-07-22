@@ -28,8 +28,11 @@ type plan struct {
 	// Which actions to take
 	DeleteDeployments []*appsv1.Deployment
 	CreateDeployment  *appsv1.Deployment
-	ScaleDeployments  map[*corev1.ObjectReference]uint32
-	UpdateDeployments []*appsv1.Deployment
+	// CreateVariantDeployments holds the spec.variants child Deployments to
+	// create for the target version (built from planner.Plan.CreateVariants).
+	CreateVariantDeployments []*appsv1.Deployment
+	ScaleDeployments         map[*corev1.ObjectReference]uint32
+	UpdateDeployments        []*appsv1.Deployment
 	// Register new versions as current or with ramp
 	UpdateVersionConfig *planner.VersionConfig
 
@@ -126,7 +129,8 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 
 	// Generate the plan using the planner package
 	plannerConfig := &planner.Config{
-		RolloutStrategy: rolloutStrategy,
+		RolloutStrategy:    rolloutStrategy,
+		ExpectedGateQueues: planner.ExpectedGateQueues(&w.Spec),
 	}
 
 	// Fetch all WorkerResourceTemplates that reference this TWD so that the planner
@@ -190,6 +194,25 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 			return nil, err
 		}
 		plan.CreateDeployment = d
+	}
+
+	// Build the missing variant child Deployments for the target version.
+	if len(planResult.CreateVariants) > 0 {
+		variantsByName := make(map[string]*temporaliov1alpha1.WorkerVariant, len(w.Spec.Variants))
+		for i := range w.Spec.Variants {
+			variantsByName[w.Spec.Variants[i].Name] = &w.Spec.Variants[i]
+		}
+		for _, name := range planResult.CreateVariants {
+			variant, ok := variantsByName[name]
+			if !ok {
+				continue // spec changed between plan and build; next reconcile converges
+			}
+			d, err := k8s.NewVariantDeploymentWithControllerRef(w, targetBuildID, connection, variant, r.Scheme)
+			if err != nil {
+				return nil, err
+			}
+			plan.CreateVariantDeployments = append(plan.CreateVariantDeployments, d)
+		}
 	}
 
 	return plan, nil

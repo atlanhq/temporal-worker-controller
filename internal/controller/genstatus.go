@@ -65,6 +65,15 @@ func (r *TemporalWorkerDeploymentReconciler) generateStatus(
 			readyReplicas += d.Status.ReadyReplicas
 		}
 	}
+	// Variant child Deployments share the version-independent pod label the
+	// selector below matches, so they count toward the reported scale too.
+	for _, variants := range k8sState.VariantDeployments {
+		for _, d := range variants {
+			if d != nil {
+				readyReplicas += d.Status.ReadyReplicas
+			}
+		}
+	}
 	status.Replicas = readyReplicas
 	status.Selector = k8s.TWDNameSelector(workerDeploy.Name)
 

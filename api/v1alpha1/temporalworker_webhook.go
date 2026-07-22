@@ -81,10 +81,40 @@ func (r *TemporalWorkerDeployment) validateForUpdateOrCreate(ctx context.Context
 
 func validateForUpdateOrCreate(old, new *TemporalWorkerDeployment) (admission.Warnings, error) {
 	allErrs := validateRolloutStrategy(new.Spec.RolloutStrategy)
+	allErrs = append(allErrs, validateVariants(&new.Spec)...)
 	if len(allErrs) > 0 {
 		return nil, newInvalidErr(new, allErrs)
 	}
 	return nil, nil
+}
+
+// validateVariants checks constraints on spec.variants that the CRD schema
+// cannot enforce: unique non-reserved names, a non-empty taskQueueSuffix
+// requires workerScaling.taskQueue (the variant queue derives from it), and
+// envValueSuffixes entries must be non-empty.
+func validateVariants(s *TemporalWorkerDeploymentSpec) []*field.Error {
+	var allErrs []*field.Error
+	seen := map[string]struct{}{}
+	for i, v := range s.Variants {
+		p := field.NewPath("spec", "variants").Index(i)
+		if v.Name == "base" {
+			allErrs = append(allErrs, field.Invalid(p.Child("name"), v.Name, `"base" is reserved for the base deployment`))
+		}
+		if _, dup := seen[v.Name]; dup {
+			allErrs = append(allErrs, field.Duplicate(p.Child("name"), v.Name))
+		}
+		seen[v.Name] = struct{}{}
+		if v.TaskQueueSuffix != "" && (s.WorkerScaling == nil || s.WorkerScaling.TaskQueue == "") {
+			allErrs = append(allErrs, field.Invalid(p.Child("taskQueueSuffix"), v.TaskQueueSuffix,
+				"requires spec.workerScaling.taskQueue: the variant queue is derived as <taskQueue><suffix>"))
+		}
+		for j, name := range v.EnvValueSuffixes {
+			if name == "" {
+				allErrs = append(allErrs, field.Invalid(p.Child("envValueSuffixes").Index(j), name, "env var name must be non-empty"))
+			}
+		}
+	}
+	return allErrs
 }
 
 // validateRolloutStrategy checks constraints that the CRD schema cannot enforce:

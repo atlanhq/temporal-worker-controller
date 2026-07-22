@@ -4,6 +4,15 @@ on:
     branches:
     - v1.6.0-atlan
     - arun-925-v1.6.0-rebase
+  pull_request:
+    branches:
+    - v1.6.0-atlan
+    - arun-925-v1.6.0-rebase
+
+concurrency:
+  group: build-image-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-image:
     runs-on: ubuntu-latest
@@ -12,7 +21,33 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # For PRs build the exact head commit so the sha-<head> tag matches the
+          # image content; pushes use the default ref.
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      - name: Compute tags and push mode
+        id: meta
+        run: |
+          version="$(grep '^version:' helm/temporal-worker-controller/Chart.yaml | awk '{print $2}')"
+          image="ghcr.io/atlanhq/temporal-worker-controller"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # PR builds: an immutable sha tag (pin this when deploying for
+            # validation) plus a moving pr-<n> tag. The chart-version tags stay
+            # reserved for branch pushes.
+            head_sha="${{ github.event.pull_request.head.sha }}"
+            echo "tags=${image}:sha-${head_sha},${image}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            # Fork PRs have no ORG_PAT_GITHUB: build-only.
+            if [[ "${{ github.event.pull_request.head.repo.full_name }}" == "${{ github.repository }}" ]]; then
+              echo "push=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "push=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "tags=${image}:${version}-${{ github.sha }},${image}:${version}" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Log in to GHCR
+        if: steps.meta.outputs.push == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -20,20 +55,16 @@ jobs:
           password: ${{ secrets.ORG_PAT_GITHUB }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Extract chart version
-        id: chart
-        run: echo "version=$(grep '^version:' helm/temporal-worker-controller/Chart.yaml | awk '{print $2}')" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ steps.meta.outputs.push == 'true' }}
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/atlanhq/temporal-worker-controller:${{ steps.chart.outputs.version }}-${{ github.sha }}
-            ghcr.io/atlanhq/temporal-worker-controller:${{ steps.chart.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
 
   push-chart:
+    if: github.event_name == 'push'
     needs: build-image
     runs-on: ubuntu-latest
     permissions:

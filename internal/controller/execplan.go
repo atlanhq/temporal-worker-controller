@@ -44,6 +44,17 @@ func (r *TemporalWorkerDeploymentReconciler) executeK8sOperations(ctx context.Co
 		}
 	}
 
+	// Create variant deployments for the target version
+	for _, d := range p.CreateVariantDeployments {
+		l.Info("creating variant deployment", "deployment", d.Name, "variant", d.Labels[k8s.VariantLabel])
+		if err := r.Create(ctx, d); err != nil {
+			l.Error(err, "unable to create variant deployment", "deployment", d.Name)
+			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonDeploymentCreateFailed,
+				"Failed to create variant Deployment %q: %v", d.Name, err)
+			return err
+		}
+	}
+
 	// Delete deployments
 	for _, d := range p.DeleteDeployments {
 		l.Info("deleting deployment", "deployment", d)
