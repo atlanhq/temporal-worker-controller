@@ -55,6 +55,32 @@ Status: executing. Date: 2026-07-20. Controller under test: `ghcr.io/atlanhq/tem
 3. Promotion timing with variants: ~16s (synthetic) / ~20s (real app) taint-to-Current equivalents; no od-queue coupling observed - on-demand capacity provisioning never gated promotion because the od variant's floor pod schedules during ramp.
 4. KEDA idle scale-to-zero applies to BOTH tiers independently (v2 base+od both parked at 0 when idle) - the od tier costs nothing at rest, as designed.
 
+
+## Round 2 (2026-07-22, rebased controller): V9-V10
+
+Context: PR #23 rebased onto v1.6.0-atlan @ fb9d67a (#25 sunset prune); tenant found rolled to the plain base image `1.6.0-atlan-2-fb9d67a...` (no variants) by the team - re-swapped to the rebased PR image `sha-2e49355...` for this round. Controller delta vs round 1 additionally includes the ExpectedGateQueues hardening (gate evaluation blocks until every spec-declared queue - base + each variant suffix - is REGISTERED on the target version).
+
+| # | Test | Pass criteria |
+|---|---|---|
+| V9 | route-back after reroute | TwoActs(d1,d2) on the base queue; act 1 rerouted to `-od` mid-flight and completes on the od variant; act 2 then schedules and runs on the BASE queue (the patch is per-activity - subsequent work returns to spot) |
+| V10 | gated rollout covers the od queue | `rollout.gate: GateWf` + buildID bump: gate workflows fan out to BOTH queues, promotion blocks until BOTH complete (incl. the od one, run by the od variant worker), then v2 Current. Hardening: gate not evaluated before both queues are registered |
+
+### Results
+
+**BOTH PASS** (run 2026-07-22, controller `sha-2e49355...` = rebased PR #23 incl. the ExpectedGateQueues hardening; fleet stable through the swap - zero controller-induced generation churn).
+
+| # | Result | Evidence |
+|---|---|---|
+| V9 | PASS | `TwoActs` on the base queue: act 5 STARTED on the base pod -> reclaim -> rerouter `escalate{lost-work}` + patch to `atlan-rr9-e2e-prod-od` (`dry_run:false`); act 5's in-flight attempt completed on base (patchWhileStarted takes effect on the NEXT attempt - none happened); **act 11 then SCHEDULED on `atlan-rr9-e2e-prod` (BASE)** and completed there; workflow COMPLETED. The per-activity patch never leaks to subsequent activities - post-reroute work returns to the spot queue. (The od-failover leg of the same patch was proven in V8.) |
+| V10 | PASS | `rollout.gate: GateWf` + buildID bump test-v1 -> test-v2: **exactly 2 gate workflows** (`test-rerouter-e2e/rr9:test-v2-<queue>`, one per queue); the `-od` one ran on the od variant worker (sole poller of that queue). Promotion **waited for both**: at t+10s the od gate was Completed, the base gate pending, target still Inactive; v2 went Current only after both completed (bump -> promoted in 22s). Gated rollouts cover the od queue end to end |
+
+### Infrastructure findings from this round (all real, none variants-caused)
+
+1. **`matching.maxDeployments` (default 100) is exceeded fleet-wide on markeznp25**: 145 worker deployments registered; every NEW deployment-name registration fails with `reached maximum deployments in namespace (100)` (matching logs, ~140 errors/30s). Existing names keep working, which masks it - any newly onboarded versioned app on a tenant this size will silently fail to register. Raised to 200 for the tenant; the FLEET fix (chart-level dynamic config bump, sized to ~2x TWD count for twd-mode od twins) should ship with the rollout. Consolidating to variants HALVES the deployment count - one more argument for the migration.
+2. **Dynamic-config edits do not propagate**: the active file is a subPath mount (no in-place CM updates) AND the vcluster syncer served a stale host-side copy across CM delete/recreate and pod restarts. The working lever is the TemporalCluster CR's `services.overrides` volume (operator owns the deployment specs and reverts direct patches) pointed at a FRESH CM name - forces a clean sync + re-render. Applied as `temporal-cluster-runtime-dynamic-config-v2`.
+3. **Workflows started while matching rolls can spool invisibly**: a workflow started mid-roll sat with a SCHEDULED workflow task that neither the queue stats nor the KEDA scaler could see; restarting the workflow after the roll behaved normally. Worth knowing for any maintenance window.
+4. Round-1 finding confirmed by accident: the plain base-image controller (tenant was rolled to it by the team between rounds) ignores `spec.variants` harmlessly - base reconciles fine, the field no-ops (CRD forward-compat holds).
+
 ## End state
 
 - markeznp25 KEPT on: TWC `sha-c7d1e97...` (PR #23), atlan-app chart `0.1.2-pr14006-gb7a008e` (OCIRepository), rerouter `sha-cdc7bf6b...` (PR #1 head d973885, dryRun:true, minLostWork:30m). This is deliberate - it is the validation tenant (Argo autosync off, targetRevision pinned).
