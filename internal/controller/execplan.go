@@ -55,6 +55,34 @@ func (r *TemporalWorkerDeploymentReconciler) executeK8sOperations(ctx context.Co
 		}
 	}
 
+	// Delete each sunset version's ScaledObject before its Deployment. KEDA reconciles a
+	// ScaledObject against its scaleTargetRef, so one that outlives its Deployment reports
+	// "Target resource doesn't exist" on every reconcile until the next pass of
+	// reconcileScaledObjects removes it - reconcileScaledObjects runs before executePlan,
+	// so without this the orphan survives a full reconcile interval. Versions only reach
+	// DeleteDeployments once drained and scaled to zero, so removing the autoscaler ahead
+	// of the Deployment costs no scaling capacity. Best-effort: on failure the Deployment
+	// delete still proceeds and reconcileScaledObjects cleans up on the next reconcile.
+	for _, d := range p.DeleteDeployments {
+		buildID, ok := d.GetLabels()[k8s.BuildIDLabel]
+		if !ok {
+			continue
+		}
+		// Variant ScaledObjects are named off the variant-suffixed owner; see buildScaledObject.
+		owner := workerDeploy.Name
+		if variant := d.GetLabels()[k8s.VariantLabel]; variant != "" {
+			owner = workerDeploy.Name + "-" + variant
+		}
+		so := &unstructured.Unstructured{}
+		so.SetGroupVersionKind(schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: scaledObjectKind})
+		so.SetNamespace(d.Namespace)
+		so.SetName(ScaledObjectName(owner, buildID))
+		if err := r.Delete(ctx, so); client.IgnoreNotFound(err) != nil {
+			l.Error(err, "unable to delete ScaledObject before sunsetting deployment",
+				"scaledObject", so.GetName(), "deployment", d.Name)
+		}
+	}
+
 	// Delete deployments
 	for _, d := range p.DeleteDeployments {
 		l.Info("deleting deployment", "deployment", d)

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/controller/clientpool"
+	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/planner"
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	"go.temporal.io/api/serviceerror"
@@ -27,7 +28,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,8 +48,14 @@ func newTestScheme() *runtime.Scheme {
 	_ = temporaliov1alpha1.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
+	// ScaledObjects are handled as unstructured, so the GVK has to be registered
+	// explicitly for the fake client to serve them.
+	s.AddKnownTypeWithName(testScaledObjectGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(testScaledObjectGVK.GroupVersion().WithKind(scaledObjectKind+"List"), &unstructured.UnstructuredList{})
 	return s
 }
+
+var testScaledObjectGVK = schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: scaledObjectKind}
 
 // newTestReconciler creates a TemporalWorkerDeploymentReconciler with a fake client and recorder.
 func newTestReconciler(objs []client.Object) (*TemporalWorkerDeploymentReconciler, *record.FakeRecorder) {
@@ -748,6 +757,78 @@ func TestExecuteK8sOperations_EmitsEventOnFailure(t *testing.T) {
 			assertEventEmitted(t, drainEvents(recorder), tc.expectedReason)
 		})
 	}
+}
+
+// A ScaledObject that outlives its Deployment makes KEDA log "Target resource doesn't
+// exist" until the next reconcile, so the sunset order matters.
+func TestExecuteK8sOperations_DeletesScaledObjectBeforeDeployment(t *testing.T) {
+	const (
+		namespace = "default"
+		buildID   = "abc1234"
+	)
+	twd := makeTWD("test-worker", namespace, "my-conn")
+	deployName := "test-worker-" + buildID
+	soName := ScaledObjectName(twd.Name, buildID)
+
+	deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      deployName,
+		Namespace: namespace,
+		Labels:    map[string]string{k8s.BuildIDLabel: buildID},
+	}}
+
+	so := &unstructured.Unstructured{}
+	so.SetGroupVersionKind(testScaledObjectGVK)
+	so.SetNamespace(namespace)
+	so.SetName(soName)
+
+	var order []string
+	r, _ := newTestReconcilerWithInterceptors(
+		[]client.Object{twd, deploy, so},
+		interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				switch obj.(type) {
+				case *unstructured.Unstructured:
+					order = append(order, "scaledobject:"+obj.GetName())
+				case *appsv1.Deployment:
+					order = append(order, "deployment:"+obj.GetName())
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		},
+	)
+
+	require.NoError(t, r.executeK8sOperations(context.Background(), logr.Discard(), twd,
+		&plan{DeleteDeployments: []*appsv1.Deployment{deploy}}))
+
+	assert.Equal(t, []string{"scaledobject:" + soName, "deployment:" + deployName}, order)
+}
+
+// A version with no build ID label has no per-version ScaledObject to remove, and the
+// Deployment delete must still go through.
+func TestExecuteK8sOperations_DeleteWithoutBuildIDSkipsScaledObject(t *testing.T) {
+	const namespace = "default"
+	twd := makeTWD("test-worker", namespace, "my-conn")
+
+	deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      "legacy-deploy",
+		Namespace: namespace,
+	}}
+
+	var order []string
+	r, _ := newTestReconcilerWithInterceptors(
+		[]client.Object{twd, deploy},
+		interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				order = append(order, obj.GetName())
+				return c.Delete(ctx, obj, opts...)
+			},
+		},
+	)
+
+	require.NoError(t, r.executeK8sOperations(context.Background(), logr.Discard(), twd,
+		&plan{DeleteDeployments: []*appsv1.Deployment{deploy}}))
+
+	assert.Equal(t, []string{"legacy-deploy"}, order)
 }
 
 // ─── startTestWorkflows tests ────────────────────────────────────────────────
