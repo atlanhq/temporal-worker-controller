@@ -4458,6 +4458,13 @@ spec:
                       type: object
                     scaling:
                       properties:
+                        activitySlotsPerWorker:
+                          format: int32
+                          type: integer
+                        gateSlotsOnRunningWorkflow:
+                          type: boolean
+                        includeRunningWorkflowCount:
+                          type: boolean
                         maxReplicaCount:
                           format: int32
                           type: integer

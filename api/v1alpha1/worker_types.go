@@ -218,6 +218,29 @@ type VariantScaling struct {
 	// MaxReplicaCount overrides workerScaling.maxReplicaCount for this variant.
 	// +optional
 	MaxReplicaCount *int32 `json:"maxReplicaCount,omitempty"`
+
+	// GateSlotsOnRunningWorkflow overrides workerScaling.gateSlotsOnRunningWorkflow
+	// for this variant only. A variant polls "<queue><suffix>", a dedicated
+	// ACTIVITY queue where no workflow ever runs, so the KEDA scaler's default
+	// (true) discards its used-slots term - the only signal that an activity is
+	// executing - and the pod is reaped mid-activity. Set false here to scale the
+	// variant on real slot occupancy. The base worker needs no override: its
+	// parent workflows run on its own queue, so its running-workflow count is
+	// already non-zero while work executes.
+	// +optional
+	GateSlotsOnRunningWorkflow *bool `json:"gateSlotsOnRunningWorkflow,omitempty"`
+
+	// ActivitySlotsPerWorker overrides workerScaling.activitySlotsPerWorker for
+	// this variant only. Required alongside a false gate so the scaler derives
+	// real occupancy from task_slots_available and an IDLE variant still reports
+	// zero (and scales to zero) despite the SDK's phantom used-slot.
+	// +optional
+	ActivitySlotsPerWorker *int32 `json:"activitySlotsPerWorker,omitempty"`
+
+	// IncludeRunningWorkflowCount overrides workerScaling.includeRunningWorkflowCount
+	// for this variant only.
+	// +optional
+	IncludeRunningWorkflowCount *bool `json:"includeRunningWorkflowCount,omitempty"`
 }
 
 // WorkerScalingConfig holds the per-version KEDA scaling knobs that flow
