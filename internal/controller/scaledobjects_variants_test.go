@@ -244,3 +244,40 @@ func TestVariantSOUnversionedFlags(t *testing.T) {
 		assert.Equal(t, tc.want, md["selectUnversioned"] == "true", "selectUnversioned for %s", tc.status)
 	}
 }
+
+// Only the VARIANT gets dedicated-activity-queue scaling flags: it polls
+// "<queue>-od" where no workflow ever runs, so the KEDA scaler's default
+// gateSlotsOnRunningWorkflow=true discards its used-slots term - the only
+// signal an activity is executing - and the pod is reaped mid-activity
+// (atlanhq/keda#8; zoom-video-comm lineage failure 2026-08-01). The BASE
+// worker needs none of this: its parent workflows run on its own queue, so
+// its running-workflow count is already non-zero while work executes.
+func TestBuildScaledObject_VariantScalingFlagsAreVariantOnly(t *testing.T) {
+	gate := false
+	slots := int32(100)
+	twd := variantTWD()
+	twd.Spec.Variants[0].Scaling = &temporaliov1alpha1.VariantScaling{
+		GateSlotsOnRunningWorkflow: &gate,
+		ActivitySlotsPerWorker:     &slots,
+	}
+
+	variant := versionRef{
+		BuildID:    "bid1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "app-worker-twd-od-bid1", Namespace: "app-ns"},
+		Variant:    &twd.Spec.Variants[0],
+	}
+	base := versionRef{
+		BuildID:    "bid1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "app-worker-twd-bid1", Namespace: "app-ns"},
+	}
+
+	vm := soTrigger(t, buildScaledObject(twd, variant, "temporal:7233"))
+	assert.Equal(t, "false", vm["gateSlotsOnRunningWorkflow"], "variant must carry its own gate override")
+	assert.Equal(t, "100", vm["activitySlotsPerWorker"], "variant must carry its own slot ceiling")
+
+	bm := soTrigger(t, buildScaledObject(twd, base, "temporal:7233"))
+	assert.NotContains(t, bm, "gateSlotsOnRunningWorkflow", "base SO must NOT inherit the variant's gate")
+	assert.NotContains(t, bm, "activitySlotsPerWorker", "base SO must NOT inherit the variant's slot ceiling")
+}

@@ -660,6 +660,16 @@ func buildScaledObject(
 		triggerMetadata["selectUnversioned"] = "true"
 	}
 	setTriggerMetadata(triggerMetadata, twd)
+	if v.Variant != nil {
+		// Per-variant scaler overrides, applied AFTER the shared workerScaling
+		// fields so they win for this SO only - the base keeps whatever
+		// workerScaling says. A variant polls "<queue><suffix>", a dedicated
+		// ACTIVITY queue where no workflow ever runs, so it needs the same
+		// treatment a dedicated activity pool gets (atlanhq/keda#8): without a
+		// false gate the scaler discards its used-slots term (the only "an
+		// activity is executing" signal) and reaps the pod mid-activity.
+		setVariantTriggerMetadata(triggerMetadata, v.Variant.Scaling)
+	}
 	if v.Variant != nil && v.Variant.TaskQueueSuffix != "" {
 		// A workflowTaskQueueForCount inherited from workerScaling names the BASE
 		// workflow queue; the variant's version-scoped workflow count lives on the
@@ -719,6 +729,24 @@ func scaledObjectSpecHash(labels map[string]string, spec map[string]interface{})
 	}
 	sum := sha1.Sum(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// setVariantTriggerMetadata applies a variant's per-variant scaler overrides on
+// top of the shared workerScaling values, so they scope to that variant's
+// ScaledObject alone. Nil fields leave the inherited value untouched.
+func setVariantTriggerMetadata(m map[string]interface{}, vs *temporaliov1alpha1.VariantScaling) {
+	if vs == nil {
+		return
+	}
+	if vs.GateSlotsOnRunningWorkflow != nil {
+		m["gateSlotsOnRunningWorkflow"] = strconv.FormatBool(*vs.GateSlotsOnRunningWorkflow)
+	}
+	if vs.ActivitySlotsPerWorker != nil {
+		m["activitySlotsPerWorker"] = strconv.FormatInt(int64(*vs.ActivitySlotsPerWorker), 10)
+	}
+	if vs.IncludeRunningWorkflowCount != nil {
+		m["includeRunningWorkflowCount"] = strconv.FormatBool(*vs.IncludeRunningWorkflowCount)
+	}
 }
 
 // setTriggerMetadata writes the optional Temporal-scaler triggerMetadata
