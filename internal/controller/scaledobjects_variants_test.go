@@ -71,7 +71,11 @@ func TestBuildScaledObjectVariant(t *testing.T) {
 
 	md := soTrigger(t, so)
 	assert.Equal(t, "atlan-app-production-od", md["taskQueue"], "variant SO watches the suffixed queue")
-	assert.Equal(t, "atlan-app-production-od", md["workflowTaskQueueForCount"], "wtqfc follows the suffix")
+	// wtqfc names the queue whose RUNNING WORKFLOWS keep this variant warm.
+	// Parents run on the base queue - nothing starts workflows on the suffixed
+	// one - so suffixing it aimed the count at a structurally-empty queue.
+	assert.Equal(t, "atlan-app-production", md["workflowTaskQueueForCount"], "wtqfc stays on the BASE workflow queue")
+	assert.Equal(t, "false", md["gateSlotsOnRunningWorkflow"], "dedicated activity queue: never gate the used-slots signal")
 	assert.Equal(t, "app-ns/app-worker-twd", md["workerDeploymentName"], "same version identity as base")
 	assert.Equal(t, "bid1", md["workerDeploymentBuildId"])
 

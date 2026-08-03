@@ -792,3 +792,60 @@ func TestBuildScaledObject_SpecHashStableAndSensitive(t *testing.T) {
 	twd.Spec.WorkerScaling.MaxReplicaCount = int32Ptr(99)
 	assert.NotEqual(t, base, hashOf(buildScaledObject(twd, v, "temporal:7233")))
 }
+
+// A variant's task queue is a DEDICATED activity queue by construction:
+// nothing starts workflows on "<queue>-od", so the scaler's running-workflow
+// count on that queue is structurally 0 and its gateSlotsOnRunningWorkflow
+// default (true) discards the used-slots signal - letting KEDA delete a pod
+// while a rerouted activity is still executing on it (the zoom-video-comm
+// lineage failure). Variant SOs therefore get od-POOL semantics: gate off, and
+// the running-workflow count aimed at the BASE workflow queue.
+func TestBuildScaledObject_VariantGetsPoolSemantics(t *testing.T) {
+	irwc := true
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "mssql-worker-twd", Namespace: "mssql-app"},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{
+				TaskQueue:                   "atlan-mssql-production",
+				IncludeRunningWorkflowCount: &irwc,
+				WorkflowTaskQueueForCount:   "atlan-mssql-production",
+			},
+			Variants: []temporaliov1alpha1.WorkerVariant{
+				{Name: "od", TaskQueueSuffix: "-od"},
+			},
+		},
+	}
+	base := versionRef{
+		BuildID:    "main-f05b989",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "mssql-worker-twd-main-f05b989", Namespace: "mssql-app"},
+	}
+	variant := base
+	variant.Variant = &twd.Spec.Variants[0]
+	variant.Deployment = &corev1.ObjectReference{Name: "mssql-worker-twd-od-main-f05b989", Namespace: "mssql-app"}
+
+	meta := func(v versionRef) map[string]interface{} {
+		so := buildScaledObject(twd, v, "temporal:7236")
+		triggers, _, _ := unstructured.NestedSlice(so.Object, "spec", "triggers")
+		return triggers[0].(map[string]interface{})["metadata"].(map[string]interface{})
+	}
+
+	vm := meta(variant)
+	if got := vm["gateSlotsOnRunningWorkflow"]; got != "false" {
+		t.Errorf("variant SO gateSlotsOnRunningWorkflow = %v, want \"false\" (dedicated activity queue)", got)
+	}
+	if got := vm["workflowTaskQueueForCount"]; got != "atlan-mssql-production" {
+		t.Errorf("variant SO workflowTaskQueueForCount = %v, want the BASE workflow queue (parents never run on the suffixed queue)", got)
+	}
+	if got := vm["taskQueue"]; got != "atlan-mssql-production-od" {
+		t.Errorf("variant SO taskQueue = %v, want the suffixed activity queue", got)
+	}
+
+	bm := meta(base)
+	if got, ok := bm["gateSlotsOnRunningWorkflow"]; ok {
+		t.Errorf("base SO must keep workerScaling semantics (unset here), got %v", got)
+	}
+	if got := bm["workflowTaskQueueForCount"]; got != "atlan-mssql-production" {
+		t.Errorf("base SO workflowTaskQueueForCount = %v, want unchanged", got)
+	}
+}

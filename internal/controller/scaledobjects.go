@@ -660,13 +660,25 @@ func buildScaledObject(
 		triggerMetadata["selectUnversioned"] = "true"
 	}
 	setTriggerMetadata(triggerMetadata, twd)
-	if v.Variant != nil && v.Variant.TaskQueueSuffix != "" {
-		// A workflowTaskQueueForCount inherited from workerScaling names the BASE
-		// workflow queue; the variant's version-scoped workflow count lives on the
-		// suffixed queue (mirroring how the variant's own worker derives it).
-		if wtqfc, ok := triggerMetadata["workflowTaskQueueForCount"].(string); ok && wtqfc != "" {
-			triggerMetadata["workflowTaskQueueForCount"] = wtqfc + v.Variant.TaskQueueSuffix
-		}
+	if v.Variant != nil {
+		// A variant polls "<queue><suffix>", which is a DEDICATED ACTIVITY queue
+		// by construction: nothing starts workflows on it (the rerouter only
+		// moves activity task queues), so the scaler's running-workflow count
+		// there is structurally zero. Two consequences, both handled here the
+		// same way a dedicated activity POOL is configured:
+		//
+		//  1. gateSlotsOnRunningWorkflow is forced false. Left at the scaler's
+		//     default (true), a zero running-workflow count discards the
+		//     used-slots term, so an idle-looking-but-busy variant scales to
+		//     zero and KEDA deletes the pod while a rerouted activity is still
+		//     executing on it. Honoring an inherited true would reintroduce
+		//     exactly that, so the variant always overrides.
+		//  2. workflowTaskQueueForCount is left as inherited - it names the BASE
+		//     workflow queue, where this variant's parent workflows actually
+		//     run, so the count keeps the variant warm while a parent is live.
+		//     (It used to get the variant suffix appended, which aimed it at a
+		//     queue no workflow ever runs on.)
+		triggerMetadata["gateSlotsOnRunningWorkflow"] = "false"
 	}
 
 	spec := map[string]interface{}{
