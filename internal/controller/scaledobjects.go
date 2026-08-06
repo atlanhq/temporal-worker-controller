@@ -460,27 +460,63 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 	}
 
 	// Step 5 — delete stale (version no longer active).
+	return r.deleteStaleScaledObjects(ctx, l, existing, desired)
+}
+
+// deleteStaleScaledObjects removes the SOs we own that the desired state no
+// longer includes, handing each one's Deployment back to the planner on the way
+// out — except when that Deployment is still the scale target of a desired SO.
+// That happens on a rename (the SO naming changed, but the Deployment did not):
+// the replacement SO has already claimed the Deployment, so stripping the
+// keda-managed label here would let the planner write spec.replicas for a cycle
+// while KEDA still owns it, pulling down a Deployment the HPA had scaled up.
+func (r *TemporalWorkerDeploymentReconciler) deleteStaleScaledObjects(
+	ctx context.Context,
+	l logr.Logger,
+	existing, desired map[string]*unstructured.Unstructured,
+) error {
+	claimed := make(map[string]struct{}, len(desired))
+	for _, so := range desired {
+		if name, ns, ok := scaleTargetRef(so); ok {
+			claimed[ns+"/"+name] = struct{}{}
+		}
+	}
+
 	for name, so := range existing {
 		if _, want := desired[name]; want {
 			continue
 		}
-		buildID := so.GetLabels()[BuildIDLabel]
-		l.Info("deleting stale ScaledObject", "name", name, "buildId", buildID)
-
-		// Strip the managed-by label off the Deployment first so the planner
-		// is free to drive replicas to zero on the next cycle.
-		if deployName, deployNS, ok := scaleTargetRef(so); ok {
-			if err := r.ensureDeploymentManagedLabel(ctx, deployNS, deployName, false); err != nil {
-				l.Error(err, "failed to remove managed label", "deployment", deployName)
-			}
-		}
-
+		l.Info("deleting stale ScaledObject", "name", name, "buildId", so.GetLabels()[BuildIDLabel])
+		r.releaseStaleScaleTarget(ctx, l, so, claimed)
 		if err := r.Delete(ctx, so); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete scaledobject %s: %w", name, err)
 		}
 	}
 
 	return nil
+}
+
+// releaseStaleScaleTarget strips the keda-managed label off a stale SO's
+// Deployment so the planner is free to drive replicas to zero, unless a desired
+// SO still claims that Deployment (see deleteStaleScaledObjects).
+func (r *TemporalWorkerDeploymentReconciler) releaseStaleScaleTarget(
+	ctx context.Context,
+	l logr.Logger,
+	so *unstructured.Unstructured,
+	claimed map[string]struct{},
+) {
+	deployName, deployNS, ok := scaleTargetRef(so)
+	if !ok {
+		return
+	}
+	if _, keep := claimed[deployNS+"/"+deployName]; keep {
+		l.V(1).Info("keeping managed label; Deployment still claimed by a desired ScaledObject",
+			"deployment", deployName, "staleScaledObject", so.GetName())
+		return
+	}
+	if err := r.ensureDeploymentManagedLabel(ctx, deployNS, deployName, false); err != nil {
+		l.Error(err, "failed to remove managed label", "deployment", deployName)
+	}
 }
 
 // disablePerVersionScaling is the opt-out path: clean up any SOs we previously

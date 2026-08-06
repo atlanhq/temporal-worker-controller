@@ -215,6 +215,47 @@ func TestReconcileScaledObjects_SecondPassIsStable(t *testing.T) {
 	}
 }
 
+// The counterpart to the rename guard: when a stale SO's Deployment is NOT
+// claimed by any desired SO — the normal drain case — the label must still come
+// off, or the planner never regains control and the Deployment cannot be scaled
+// to zero.
+func TestReconcileScaledObjects_StaleSOReleasesUnclaimedDeployment(t *testing.T) {
+	twdName := "atlan-automation-engine-worker-default-normal-prio"
+
+	drained := &unstructured.Unstructured{}
+	drained.SetGroupVersionKind(testSOGVK)
+	drained.SetName("stale-drained-version-scale")
+	drained.SetNamespace("app-ns")
+	drained.SetLabels(map[string]string{
+		OwnerTWDLabel: twdName,
+		BuildIDLabel:  "old-build",
+	})
+	drained.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: temporaliov1alpha1.GroupVersion.String(),
+		Kind:       "TemporalWorkerDeployment",
+		Name:       twdName,
+		UID:        types.UID("twd-uid"),
+	}})
+	require.NoError(t, unstructured.SetNestedField(drained.Object,
+		"dep-old", "spec", "scaleTargetRef", "name"))
+
+	oldDep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      "dep-old",
+		Namespace: "app-ns",
+		Labels:    map[string]string{ManagedByLabel: "true"},
+	}}
+
+	r, twd := soReconcileFixture(t, drained, oldDep)
+	ctx := context.Background()
+
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
+
+	assert.NotContains(t, listSONames(t, r), "stale-drained-version-scale",
+		"stale SO for a no-longer-active version must be deleted")
+	assert.False(t, isManaged(t, r, "dep-old"),
+		"dep-old is claimed by no desired SO, so the planner must get it back")
+}
+
 // Upgrade simulation. Pre-fix, a long-named TWD's base and variants collapsed
 // onto one SO name whose scaleTargetRef pointed at the LAST variant. This seeds
 // that object and reconciles with the fixed naming, which is what a controller
@@ -259,20 +300,16 @@ func TestReconcileScaledObjects_UpgradeFromCollapsedSO(t *testing.T) {
 	assert.NotContains(t, names, legacyName, "legacy collapsed SO must be deleted")
 	assert.Len(t, names, 3, "one SO per Deployment after upgrade, got %v", names)
 
-	// Known gap, asserted so it is documented rather than assumed: step 5 deletes
-	// the legacy SO and strips keda-managed from the Deployment it targeted —
-	// dep-spot — even though step 4 has just pointed a new SO at that same
-	// Deployment. For one reconcile the Deployment has a ScaledObject but no
-	// label, so the planner believes it owns spec.replicas (default 1) and can
-	// yank a Deployment KEDA had scaled up. Deployments the legacy SO did not
-	// target are unaffected.
-	assert.True(t, isManaged(t, r, "dep-base"), "dep-base was not the legacy target")
-	assert.True(t, isManaged(t, r, "dep-od"), "dep-od was not the legacy target")
-	assert.False(t, isManaged(t, r, "dep-spot"),
-		"dep-spot loses keda-managed for one cycle; flip this once the stale-delete "+
-			"path skips Deployments that are still a desired SO's scale target")
+	// The rename must not hand replicas back to the planner mid-flight. dep-spot
+	// is the Deployment the legacy SO targeted AND the target of a new SO, so
+	// deleting the legacy SO must leave its keda-managed label alone: dropping it
+	// would let the planner write spec.replicas (default 1) for a cycle while
+	// KEDA still owns the Deployment.
+	for _, d := range []string{"dep-base", "dep-od", "dep-spot"} {
+		assert.True(t, isManaged(t, r, d),
+			"%s must stay keda-managed through the rename", d)
+	}
 
-	// The next reconcile restores it, so the gap is one cycle wide, not permanent.
 	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
 	for _, d := range []string{"dep-base", "dep-od", "dep-spot"} {
 		assert.True(t, isManaged(t, r, d),
