@@ -278,4 +278,10 @@ func TestReconcileScaledObjects_UpgradeFromCollapsedSO(t *testing.T) {
 		assert.True(t, isManaged(t, r, d),
 			"%s must be keda-managed after the follow-up reconcile", d)
 	}
+
+	// The rename is a one-time event, not a loop: once the legacy SO is gone the
+	// names are stable, so KEDA sees a single delete+create per affected version
+	// rather than churn on every ~10s requeue.
+	assert.ElementsMatch(t, names, listSONames(t, r),
+		"no further SO churn after the upgrade pass")
 }
