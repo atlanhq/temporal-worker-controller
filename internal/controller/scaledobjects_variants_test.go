@@ -66,7 +66,7 @@ func TestBuildScaledObjectVariant(t *testing.T) {
 
 	so := buildScaledObject(twd, v, "temporal:7233")
 
-	assert.Equal(t, ScaledObjectName("app-worker-twd-od", "bid1"), so.GetName())
+	assert.Equal(t, ScaledObjectName("app-worker-twd", "od", "bid1"), so.GetName())
 	assert.Equal(t, "od", so.GetLabels()[VariantSOLabel])
 
 	md := soTrigger(t, so)

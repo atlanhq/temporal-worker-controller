@@ -58,7 +58,7 @@ func TestScaledObjectName(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ScaledObjectName(tc.twdName, tc.buildID)
+			got := ScaledObjectName(tc.twdName, "", tc.buildID)
 			assert.LessOrEqual(t, len(got), 63, "name must fit DNS label limit")
 			if tc.expectExact != "" {
 				assert.Equal(t, tc.expectExact, got)
@@ -68,10 +68,50 @@ func TestScaledObjectName(t *testing.T) {
 					"name should be longer than prefix")
 			}
 			// Deterministic: same inputs → same name.
-			again := ScaledObjectName(tc.twdName, tc.buildID)
+			again := ScaledObjectName(tc.twdName, "", tc.buildID)
 			assert.Equal(t, got, again, "name must be deterministic")
 		})
 	}
+}
+
+// A base and its variants share one buildID by design, so the buildID alone
+// cannot distinguish their ScaledObject names. Once the TWD name alone fills
+// the prefix budget the variant name is truncated away, and every variant of a
+// version resolves to the same name as the base.
+func TestScaledObjectNameVariantsDistinctWhenTruncated(t *testing.T) {
+	const buildID = "master-a1b2c3d4e5f6-xk4p"
+
+	for _, twdName := range []string{
+		"app-worker-twd",
+		"atlan-automation-engine-worker-default-normal-prio",
+		"atlan-automation-engine-worker-default-normal-priority-queue",
+	} {
+		t.Run(twdName, func(t *testing.T) {
+			base := ScaledObjectName(twdName, "", buildID)
+			od := ScaledObjectName(twdName, "od", buildID)
+			spot := ScaledObjectName(twdName, "spot", buildID)
+
+			assert.NotEqual(t, base, od, "base and od variant must not share an SO name")
+			assert.NotEqual(t, od, spot, "two variants must not share an SO name")
+			assert.NotEqual(t, base, spot, "base and spot variant must not share an SO name")
+
+			for _, got := range []string{base, od, spot} {
+				assert.LessOrEqual(t, len(got), scaledObjectMaxNameLen)
+			}
+			assert.Contains(t, od, "-od-", "variant name stays visible in the SO name")
+			assert.Contains(t, spot, "-spot-", "variant name stays visible in the SO name")
+		})
+	}
+}
+
+func TestDuplicateStrings(t *testing.T) {
+	assert.Empty(t, duplicateStrings(nil))
+	assert.Empty(t, duplicateStrings([]string{"a", "b", "c"}))
+	assert.Equal(t, []string{"a"}, duplicateStrings([]string{"a", "b", "a"}))
+	assert.Equal(t, []string{"a"}, duplicateStrings([]string{"a", "a", "a"}),
+		"a value repeated three times is reported once")
+	assert.Equal(t, []string{"b", "a"}, duplicateStrings([]string{"a", "b", "b", "a"}),
+		"duplicates come back in first-seen order")
 }
 
 func TestScaledObjectNameAlwaysEndsWithSuffix(t *testing.T) {
@@ -83,7 +123,7 @@ func TestScaledObjectNameAlwaysEndsWithSuffix(t *testing.T) {
 		{"very-long-twd-name", "very-long-build-id-overflowing-the-budget"},
 	}
 	for _, tc := range cases {
-		got := ScaledObjectName(tc.twd, tc.build)
+		got := ScaledObjectName(tc.twd, "", tc.build)
 		assert.True(t, len(got) > len(scaledObjectSuffix),
 			"name %q should include the -scale suffix", got)
 		assert.Equal(t, scaledObjectSuffix, got[len(got)-len(scaledObjectSuffix):],

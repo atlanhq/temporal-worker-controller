@@ -28,6 +28,7 @@ const (
 	ReasonVersionPromotionFailed     = "VersionPromotionFailed"
 	ReasonMetadataUpdateFailed       = "MetadataUpdateFailed"
 	ReasonManagerIdentityClaimFailed = "ManagerIdentityClaimFailed"
+	ReasonScaledObjectNameCollision  = "ScaledObjectNameCollision"
 )
 
 const (
