@@ -116,28 +116,86 @@ const (
 
 // --- Naming -------------------------------------------------------------------
 
-// ScaledObjectName returns the per-version ScaledObject name for a given
-// TWD + buildID. Format: <twdName>-<buildID>-scale. If the result exceeds
-// K8s's 63-char DNS-label limit, the buildID is replaced with a short hash
-// so the result fits.
-func ScaledObjectName(twdName, buildID string) string {
-	full := fmt.Sprintf("%s-%s%s", twdName, buildID, scaledObjectSuffix)
+// ScaledObjectName returns the per-version ScaledObject name for a TWD version,
+// or for one of that version's spec.variants when variant is non-empty. Format:
+// <twdName>[-<variant>]-<buildID>-scale. If the result exceeds K8s's 63-char
+// DNS-label limit, the buildID is replaced with a short hash so the result fits.
+//
+// The hash covers twdName, variant and buildID together. Hashing the buildID
+// alone is not enough: a variant registers under the SAME buildID as its base
+// by design, so base and every variant of a version would hash identically.
+// The variant is also excluded from the truncated segment so it stays readable
+// on a long twdName instead of being cut off the end — an operator reading
+// `kubectl get scaledobject` during an incident needs to see which tier is which.
+func ScaledObjectName(twdName, variant, buildID string) string {
+	var variantPart string
+	if variant != "" {
+		variantPart = "-" + variant
+	}
+	full := fmt.Sprintf("%s%s-%s%s", twdName, variantPart, buildID, scaledObjectSuffix)
 	if len(full) <= scaledObjectMaxNameLen {
 		return full
 	}
-	// Truncated fallback: prefix(twdName) + "-" + sha1(buildID)[:8] + suffix.
-	// Keep enough of the prefix to be recognizable; the rest is deterministic
-	// from buildID so the SO is stable across reconciles.
-	sum := sha1.Sum([]byte(buildID))
+	// Truncated fallback:
+	//   prefix(twdName) + [-variant] + "-" + sha1(twdName/variant/buildID)[:8] + suffix
+	// "/" cannot appear in a TWD name, a variant name or a build ID, so the hash
+	// input is unambiguous across the three fields. The digest is deterministic,
+	// so the SO name is stable across reconciles.
+	sum := sha1.Sum([]byte(twdName + "/" + variant + "/" + buildID))
 	hash := hex.EncodeToString(sum[:])[:8]
-	// Budget: 63 - len("-") - 8 - len(suffix) = 63 - 1 - 8 - 6 = 48 for prefix
+	// Budget: 63 - len(variantPart) - len("-") - 8 - len(suffix). variantPart is
+	// bounded by the CRD's MaxLength=20 on spec.variants[].name, which keeps at
+	// least 27 characters of twdName.
 	const hashLen = 8
-	maxPrefix := scaledObjectMaxNameLen - 1 - hashLen - len(scaledObjectSuffix)
+	maxPrefix := scaledObjectMaxNameLen - len(variantPart) - 1 - hashLen - len(scaledObjectSuffix)
+	if maxPrefix < 0 {
+		maxPrefix = 0
+	}
 	prefix := twdName
 	if len(prefix) > maxPrefix {
 		prefix = prefix[:maxPrefix]
 	}
-	return prefix + "-" + hash + scaledObjectSuffix
+	// A cut landing on a separator would leave "...--<variant>" or "...--<hash>".
+	prefix = strings.TrimRight(prefix, "-.")
+	return prefix + variantPart + "-" + hash + scaledObjectSuffix
+}
+
+// warnOnSONameCollision reports two versions of one TWD resolving to the same
+// ScaledObject name. Such a pair collapses in the reconciler's desired-state map
+// with no API error to surface: the loser is dropped, never gets the
+// keda-managed label, and its Deployment silently runs on the planner's static
+// replicas instead of scaling on backlog. ScaledObjectName is injective over
+// (twdName, variant, buildID), so a collision is a controller bug rather than a
+// user-input problem — reconciliation continues for the versions that are fine,
+// but the event and log make the gap visible.
+func (r *TemporalWorkerDeploymentReconciler) warnOnSONameCollision(
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	names []string,
+) {
+	dupes := duplicateStrings(names)
+	if len(dupes) == 0 {
+		return
+	}
+	joined := strings.Join(dupes, ", ")
+	l.Error(fmt.Errorf("colliding names: %s", joined),
+		"two versions resolved to the same ScaledObject name; the losing Deployments will not autoscale")
+	r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonScaledObjectNameCollision,
+		"ScaledObject name collision (%s): a version or variant will not be autoscaled", joined)
+}
+
+// duplicateStrings returns the values appearing more than once, each reported
+// once, in first-seen order.
+func duplicateStrings(values []string) []string {
+	counts := make(map[string]int, len(values))
+	var dupes []string
+	for _, v := range values {
+		counts[v]++
+		if counts[v] == 2 {
+			dupes = append(dupes, v)
+		}
+	}
+	return dupes
 }
 
 // --- Version enumeration ------------------------------------------------------
@@ -350,6 +408,7 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 	versions = append(versions, variantVersionsForScaling(versions, &twd.Status, twd)...)
 	desired := make(map[string]*unstructured.Unstructured, len(versions))
 	desiredVersionsByName := make(map[string]versionRef, len(versions))
+	names := make([]string, 0, len(versions))
 	for _, v := range versions {
 		// Resolve the worker deployment name this version's pods actually
 		// registered under. A version preserved across a
@@ -366,9 +425,12 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			}
 		}
 		so := buildScaledObject(twd, v, temporalEndpoint)
+		names = append(names, so.GetName())
 		desired[so.GetName()] = so
 		desiredVersionsByName[so.GetName()] = v
 	}
+
+	r.warnOnSONameCollision(l, twd, names)
 
 	// Step 2 — list existing SOs we own.
 	existing, err := r.listOwnedScaledObjects(ctx, twd)
@@ -578,10 +640,10 @@ func buildScaledObject(
 	if v.Variant != nil {
 		// Variant SOs get their own name (variant folded into the twd prefix so
 		// the hash fallback keeps names distinct) and a discriminator label.
-		so.SetName(ScaledObjectName(twd.Name+"-"+v.Variant.Name, v.BuildID))
+		so.SetName(ScaledObjectName(twd.Name, v.Variant.Name, v.BuildID))
 		soLabels[VariantSOLabel] = v.Variant.Name
 	} else {
-		so.SetName(ScaledObjectName(twd.Name, v.BuildID))
+		so.SetName(ScaledObjectName(twd.Name, "", v.BuildID))
 	}
 	so.SetNamespace(twd.Namespace)
 	so.SetLabels(soLabels)
