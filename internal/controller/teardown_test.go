@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -23,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // TestTeardownChildren: deletion must remove the TWD's owned ScaledObjects and
@@ -111,4 +113,81 @@ func TestTeardownChildren(t *testing.T) {
 
 	// Idempotent on retry (empty lists).
 	require.NoError(t, r.teardownChildren(context.Background(), logr.Discard(), twd))
+}
+
+// A cluster with no KEDA installed has no ScaledObject kind, so listing owned
+// ScaledObjects fails with a no-kind-match error. That must not fail the
+// teardown: the delete-protection finalizer would never be removed and the TWD
+// would be permanently undeletable. Child Deployments must still be cleaned up.
+// This is also why the envtest integration suite's deletion cases fail — envtest
+// installs the project's CRDs but not KEDA's.
+func TestTeardownChildren_NoKEDACRD(t *testing.T) {
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "app-worker-twd",
+			Namespace: "app-ns",
+			UID:       types.UID("twd-uid"),
+		},
+	}
+	ctrl := true
+	ownedDeploy := func(name string) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "app-ns",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: temporaliov1alpha1.GroupVersion.String(),
+					Kind:       "TemporalWorkerDeployment",
+					Name:       twd.Name,
+					UID:        twd.UID,
+					Controller: &ctrl,
+				}},
+			},
+		}
+	}
+
+	soListGVK := schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObjectList"}
+	scheme := runtime.NewScheme()
+	require.NoError(t, temporaliov1alpha1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	scheme.AddKnownTypeWithName(soListGVK, &unstructured.UnstructuredList{})
+
+	// The fake client answers an unregistered kind with an empty list, so the
+	// KEDA-less cluster has to be modelled by injecting the error a real client's
+	// RESTMapper returns when the CRD is absent — the same error observed in CI:
+	// `no matches for kind "ScaledObject" in version "keda.sh/v1alpha1"`.
+	noKEDA := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if list.GetObjectKind().GroupVersionKind().Kind == "ScaledObjectList" {
+				return &meta.NoKindMatchError{
+					GroupKind:        schema.GroupKind{Group: "keda.sh", Kind: "ScaledObject"},
+					SearchedVersions: []string{"v1alpha1"},
+				}
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(twd, ownedDeploy("app-worker-twd-v1")).
+		WithIndex(&appsv1.Deployment{}, deployOwnerKey, func(rawObj client.Object) []string {
+			owner := metav1.GetControllerOf(rawObj.(*appsv1.Deployment))
+			if owner == nil {
+				return nil
+			}
+			return []string{owner.Name}
+		}).
+		WithInterceptorFuncs(noKEDA).
+		Build()
+	r := &TemporalWorkerDeploymentReconciler{Client: fakeClient, Scheme: scheme}
+
+	require.NoError(t, r.teardownChildren(context.Background(), logr.Discard(), twd),
+		"a missing ScaledObject kind must not fail teardown")
+
+	var d appsv1.Deployment
+	err := r.Get(context.Background(), types.NamespacedName{Namespace: "app-ns", Name: "app-worker-twd-v1"}, &d)
+	assert.True(t, apierrors.IsNotFound(err),
+		"child Deployments must still be torn down when KEDA is absent")
 }
