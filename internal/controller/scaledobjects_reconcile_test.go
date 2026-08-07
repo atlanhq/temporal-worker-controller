@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -41,6 +42,13 @@ var (
 // which Deployments it labels. The apiserver's field-manager merge semantics are
 // not modelled here and are not what these tests cover. Merge patches (the
 // keda-managed label path) pass through untouched.
+//
+// It also models KEDA's vscaledobject.kb.io admission webhook, which rejects a
+// ScaledObject whose scaleTargetRef points at a workload another ScaledObject
+// already manages. Without that rule the fake client accepts two SOs on one
+// Deployment and a rename deadlock cannot be reproduced at all — which is
+// exactly why the first version of these tests passed while the real cluster
+// deadlocked.
 func applyAsUpsert() interceptor.Funcs {
 	return interceptor.Funcs{
 		Patch: func(
@@ -57,6 +65,9 @@ func applyAsUpsert() interceptor.Funcs {
 			existing.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
 			err := c.Get(ctx, client.ObjectKeyFromObject(obj), existing)
 			if apierrors.IsNotFound(err) {
+				if err := rejectIfTargetAlreadyManaged(ctx, c, obj); err != nil {
+					return err
+				}
 				return c.Create(ctx, obj)
 			}
 			if err != nil {
@@ -66,6 +77,36 @@ func applyAsUpsert() interceptor.Funcs {
 			return c.Update(ctx, obj)
 		},
 	}
+}
+
+// rejectIfTargetAlreadyManaged reproduces KEDA's admission error when a second
+// ScaledObject claims a workload that a different ScaledObject already manages.
+func rejectIfTargetAlreadyManaged(ctx context.Context, c client.WithWatch, obj client.Object) error {
+	so, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil
+	}
+	target, _, ok := scaleTargetRef(so)
+	if !ok {
+		return nil
+	}
+	var list unstructured.UnstructuredList
+	list.SetGroupVersionKind(testSOListGVK)
+	if err := c.List(ctx, &list, client.InNamespace(so.GetNamespace())); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.GetName() == so.GetName() {
+			continue
+		}
+		if t, _, ok := scaleTargetRef(other); ok && t == target {
+			return apierrors.NewBadRequest(fmt.Sprintf(
+				"admission webhook %q denied the request: the workload %q of type %q is already managed by the ScaledObject %q",
+				"vscaledobject.kb.io", target, "apps/v1.Deployment", other.GetName()))
+		}
+	}
+	return nil
 }
 
 // longVariantTWD returns a TWD whose name alone fills the ScaledObject prefix
@@ -215,6 +256,116 @@ func TestReconcileScaledObjects_SecondPassIsStable(t *testing.T) {
 	}
 }
 
+// A rename must be a delete-then-create. KEDA refuses a second ScaledObject on a
+// Deployment another SO already manages, so if the stale SO under the old name is
+// still present when the replacement is applied, the apply is rejected and the
+// version never gets its scaler. Truncated SO names are short when the TWD name
+// is short (truncation is driven by buildID length), so this is reachable by any
+// TWD with a long image tag — not just long-named ones.
+func TestReconcileScaledObjects_RenameDeletesStaleBeforeApply(t *testing.T) {
+	twdName := "atlan-automation-engine-worker-default-normal-prio"
+
+	// A stale SO under a previous naming scheme, pointed at a Deployment that a
+	// desired SO also claims. This is what a naming change leaves behind.
+	legacy := &unstructured.Unstructured{}
+	legacy.SetGroupVersionKind(testSOGVK)
+	legacy.SetName("legacy-naming-scheme-a1b2c3d4-scale")
+	legacy.SetNamespace("app-ns")
+	legacy.SetLabels(map[string]string{
+		OwnerTWDLabel: twdName,
+		BuildIDLabel:  testLongBuildID,
+	})
+	legacy.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: temporaliov1alpha1.GroupVersion.String(),
+		Kind:       "TemporalWorkerDeployment",
+		Name:       twdName,
+		UID:        types.UID("twd-uid"),
+	}})
+	require.NoError(t, unstructured.SetNestedField(legacy.Object,
+		"dep-base", "spec", "scaleTargetRef", "name"))
+
+	r, twd := soReconcileFixture(t, legacy)
+	ctx := context.Background()
+
+	// A rename converges over two cycles: the predecessor is deleted in the first
+	// and the replacement applied in the second, because KEDA's finalizer keeps
+	// the old object claiming the Deployment in between. Neither cycle errors.
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"),
+		"a rename must not fail the reconcile")
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
+
+	names := listSONames(t, r)
+	assert.NotContains(t, names, "legacy-naming-scheme-a1b2c3d4-scale",
+		"the stale SO must be deleted so the replacement can claim the Deployment")
+
+	targets := make(map[string]string, len(names))
+	for _, n := range names {
+		targets[soTargetOf(t, r, n)] = n
+	}
+	assert.Contains(t, targets, "dep-base",
+		"dep-base must end up with a ScaledObject under the new name")
+	assert.True(t, isManaged(t, r, "dep-base"),
+		"dep-base must keep keda-managed across the rename")
+}
+
+// KEDA puts a finalizer on every ScaledObject, so a Delete only sets
+// deletionTimestamp and the object lingers until KEDA clears it. While it lingers
+// the admission webhook still counts it as managing the Deployment. Applying the
+// replacement in that window is guaranteed to be denied, so the apply is deferred
+// to a later cycle instead of being reported as a reconcile failure. Observed on
+// markeznp34: two "reconcile failed" errors before the third cycle succeeded.
+func TestReconcileScaledObjects_RenameDefersApplyUntilPredecessorFinalized(t *testing.T) {
+	twdName := "atlan-automation-engine-worker-default-normal-prio"
+
+	legacy := &unstructured.Unstructured{}
+	legacy.SetGroupVersionKind(testSOGVK)
+	legacy.SetName("legacy-naming-scheme-a1b2c3d4-scale")
+	legacy.SetNamespace("app-ns")
+	legacy.SetFinalizers([]string{"finalizer.keda.sh"})
+	legacy.SetLabels(map[string]string{
+		OwnerTWDLabel: twdName,
+		BuildIDLabel:  testLongBuildID,
+	})
+	legacy.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: temporaliov1alpha1.GroupVersion.String(),
+		Kind:       "TemporalWorkerDeployment",
+		Name:       twdName,
+		UID:        types.UID("twd-uid"),
+	}})
+	require.NoError(t, unstructured.SetNestedField(legacy.Object,
+		"dep-base", "spec", "scaleTargetRef", "name"))
+
+	r, twd := soReconcileFixture(t, legacy)
+	ctx := context.Background()
+
+	// Cycle 1: the predecessor is deleted but held by its finalizer, so the
+	// replacement is deferred. This must NOT surface as an error.
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"),
+		"a deferred apply is an expected transition, not a reconcile failure")
+	assert.True(t, isManaged(t, r, "dep-base"),
+		"dep-base keeps keda-managed while the rename is in flight")
+
+	// KEDA clears its finalizer, letting the delete complete.
+	held := &unstructured.Unstructured{}
+	held.SetGroupVersionKind(testSOGVK)
+	require.NoError(t, r.Get(ctx, types.NamespacedName{
+		Namespace: "app-ns", Name: "legacy-naming-scheme-a1b2c3d4-scale"}, held))
+	held.SetFinalizers(nil)
+	require.NoError(t, r.Update(ctx, held))
+
+	// Cycle 2: the replacement is created now that the Deployment is free.
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
+
+	names := listSONames(t, r)
+	assert.NotContains(t, names, "legacy-naming-scheme-a1b2c3d4-scale")
+	targets := make(map[string]string, len(names))
+	for _, n := range names {
+		targets[soTargetOf(t, r, n)] = n
+	}
+	assert.Contains(t, targets, "dep-base", "dep-base must get its replacement SO")
+	assert.True(t, isManaged(t, r, "dep-base"))
+}
+
 // The counterpart to the rename guard: when a stale SO's Deployment is NOT
 // claimed by any desired SO — the normal drain case — the label must still come
 // off, or the planner never regains control and the Deployment cannot be scaled
@@ -294,6 +445,10 @@ func TestReconcileScaledObjects_UpgradeFromCollapsedSO(t *testing.T) {
 	dep.Labels = map[string]string{ManagedByLabel: "true"}
 	require.NoError(t, r.Update(ctx, &dep))
 
+	// Two cycles: the collapsed SO is deleted in the first, and the replacement
+	// claiming the same Deployment is applied in the second (see
+	// RenameDefersApplyUntilPredecessorFinalized).
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
 	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
 
 	names := listSONames(t, r)

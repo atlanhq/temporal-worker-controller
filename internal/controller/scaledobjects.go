@@ -51,6 +51,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -446,7 +447,23 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 		l.Error(err, "failed to delete legacy TWD-targeting ScaledObject")
 	}
 
-	// Step 4 — create / update.
+	claimed := claimedScaleTargets(desired)
+
+	// Step 4 — release renamed SOs BEFORE applying. KEDA's admission webhook
+	// rejects a ScaledObject whose scaleTargetRef points at a Deployment another
+	// ScaledObject already manages, so a rename has to be delete-then-create. If
+	// the old name survived into the apply below, the apply would be denied and
+	// the version would never get its scaler.
+	deferred, err := r.deleteRenamedScaledObjects(ctx, l, existing, desired, claimed)
+	if err != nil {
+		return err
+	}
+
+	// Step 5 — create / update. Apply failures are collected rather than
+	// returned immediately: one failing version must not skip the stale cleanup
+	// below, or a rejected apply would leave the object it conflicts with in
+	// place forever and never converge.
+	var applyErrs []error
 	for name, want := range desired {
 		v := desiredVersionsByName[name]
 		// Ensure the child Deployment is labelled so planner yields.
@@ -454,34 +471,97 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			l.Error(err, "failed to label Deployment as managed", "deployment", v.Deployment.Name)
 			// continue — best effort
 		}
+		if _, wait := deferred[name]; wait {
+			// Its predecessor was deleted this cycle but KEDA's finalizer keeps the
+			// object alive for a moment, and the admission webhook still counts it
+			// as managing the Deployment. Applying now would be denied for certain,
+			// so wait for the next requeue rather than log a failure for an expected
+			// step of the transition.
+			l.Info("deferring ScaledObject apply until its renamed predecessor is finalized", "name", name)
+			continue
+		}
 		if err := r.applyDesiredScaledObject(ctx, l, name, want, existing[name], v); err != nil {
-			return err
+			applyErrs = append(applyErrs, err)
 		}
 	}
 
-	// Step 5 — delete stale (version no longer active).
-	return r.deleteStaleScaledObjects(ctx, l, existing, desired)
+	// Step 6 — delete stale (version no longer active).
+	if err := r.deleteStaleScaledObjects(ctx, l, existing, desired, claimed); err != nil {
+		applyErrs = append(applyErrs, err)
+	}
+
+	return errors.Join(applyErrs...)
+}
+
+// claimedScaleTargets maps the namespace/name of every Deployment a desired
+// ScaledObject points its scaleTargetRef at to that ScaledObject's name.
+func claimedScaleTargets(desired map[string]*unstructured.Unstructured) map[string]string {
+	claimed := make(map[string]string, len(desired))
+	for soName, so := range desired {
+		if name, ns, ok := scaleTargetRef(so); ok {
+			claimed[ns+"/"+name] = soName
+		}
+	}
+	return claimed
+}
+
+// deleteRenamedScaledObjects deletes the stale SOs whose scale target a desired
+// SO also claims, and drops them from existing so the later stale sweep skips
+// them. That pairing — same Deployment, different SO name — is what a change to
+// the naming function leaves behind, and KEDA will not let the replacement be
+// created while the old object still manages the Deployment.
+//
+// The keda-managed label is deliberately left in place: the replacement SO
+// claims the same Deployment, so handing replicas back to the planner here would
+// let it write spec.replicas while KEDA still owns them.
+//
+// Returns the names of the desired SOs whose apply must wait for a later cycle.
+// KEDA's finalizer keeps a deleted ScaledObject alive briefly, and while it is
+// there the admission webhook still counts it as managing the Deployment, so the
+// replacement cannot be created yet.
+func (r *TemporalWorkerDeploymentReconciler) deleteRenamedScaledObjects(
+	ctx context.Context,
+	l logr.Logger,
+	existing, desired map[string]*unstructured.Unstructured,
+	claimed map[string]string,
+) (map[string]struct{}, error) {
+	deferred := map[string]struct{}{}
+	for name, so := range existing {
+		if _, want := desired[name]; want {
+			continue
+		}
+		target, ns, ok := scaleTargetRef(so)
+		if !ok {
+			continue
+		}
+		replacement, isClaimed := claimed[ns+"/"+target]
+		if !isClaimed {
+			continue
+		}
+		l.Info("deleting renamed ScaledObject so its replacement can claim the Deployment",
+			"name", name, "replacement", replacement, "deployment", target,
+			"buildId", so.GetLabels()[BuildIDLabel])
+		if err := r.Delete(ctx, so); err != nil && !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("delete renamed scaledobject %s: %w", name, err)
+		}
+		delete(existing, name)
+		deferred[replacement] = struct{}{}
+	}
+	return deferred, nil
 }
 
 // deleteStaleScaledObjects removes the SOs we own that the desired state no
 // longer includes, handing each one's Deployment back to the planner on the way
-// out — except when that Deployment is still the scale target of a desired SO.
-// That happens on a rename (the SO naming changed, but the Deployment did not):
-// the replacement SO has already claimed the Deployment, so stripping the
-// keda-managed label here would let the planner write spec.replicas for a cycle
-// while KEDA still owns it, pulling down a Deployment the HPA had scaled up.
+// out. Renamed SOs are already gone by this point (deleteRenamedScaledObjects),
+// so in the normal path every SO here has an unclaimed target. The claimed check
+// in releaseStaleScaleTarget still applies, for the case where a rename delete
+// failed and the object reaches this sweep anyway.
 func (r *TemporalWorkerDeploymentReconciler) deleteStaleScaledObjects(
 	ctx context.Context,
 	l logr.Logger,
 	existing, desired map[string]*unstructured.Unstructured,
+	claimed map[string]string,
 ) error {
-	claimed := make(map[string]struct{}, len(desired))
-	for _, so := range desired {
-		if name, ns, ok := scaleTargetRef(so); ok {
-			claimed[ns+"/"+name] = struct{}{}
-		}
-	}
-
 	for name, so := range existing {
 		if _, want := desired[name]; want {
 			continue
@@ -503,7 +583,7 @@ func (r *TemporalWorkerDeploymentReconciler) releaseStaleScaleTarget(
 	ctx context.Context,
 	l logr.Logger,
 	so *unstructured.Unstructured,
-	claimed map[string]struct{},
+	claimed map[string]string,
 ) {
 	deployName, deployNS, ok := scaleTargetRef(so)
 	if !ok {
