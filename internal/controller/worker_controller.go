@@ -484,7 +484,16 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 ) error {
 	sos, err := r.listOwnedScaledObjects(ctx, workerDeploy)
 	if err != nil {
-		return fmt.Errorf("unable to list owned ScaledObjects for teardown: %w", err)
+		// A cluster with no KEDA installed has no ScaledObject kind registered, so
+		// there is nothing to tear down. Treating that as fatal would fail cleanup
+		// on every reconcile, leave the delete-protection finalizer in place and
+		// make the TemporalWorkerDeployment permanently undeletable. The rest of
+		// the teardown (child Deployments, Temporal-side records) still applies.
+		if !meta.IsNoMatchError(err) {
+			return fmt.Errorf("unable to list owned ScaledObjects for teardown: %w", err)
+		}
+		l.Info("ScaledObject kind not registered; skipping ScaledObject teardown")
+		sos = nil
 	}
 	for name, so := range sos {
 		l.Info("deleting owned ScaledObject before Temporal cleanup", "name", name)
