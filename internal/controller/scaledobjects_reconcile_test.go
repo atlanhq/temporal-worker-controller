@@ -287,8 +287,12 @@ func TestReconcileScaledObjects_RenameDeletesStaleBeforeApply(t *testing.T) {
 	r, twd := soReconcileFixture(t, legacy)
 	ctx := context.Background()
 
+	// A rename converges over two cycles: the predecessor is deleted in the first
+	// and the replacement applied in the second, because KEDA's finalizer keeps
+	// the old object claiming the Deployment in between. Neither cycle errors.
 	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"),
 		"a rename must not fail the reconcile")
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
 
 	names := listSONames(t, r)
 	assert.NotContains(t, names, "legacy-naming-scheme-a1b2c3d4-scale",
@@ -302,6 +306,64 @@ func TestReconcileScaledObjects_RenameDeletesStaleBeforeApply(t *testing.T) {
 		"dep-base must end up with a ScaledObject under the new name")
 	assert.True(t, isManaged(t, r, "dep-base"),
 		"dep-base must keep keda-managed across the rename")
+}
+
+// KEDA puts a finalizer on every ScaledObject, so a Delete only sets
+// deletionTimestamp and the object lingers until KEDA clears it. While it lingers
+// the admission webhook still counts it as managing the Deployment. Applying the
+// replacement in that window is guaranteed to be denied, so the apply is deferred
+// to a later cycle instead of being reported as a reconcile failure. Observed on
+// markeznp34: two "reconcile failed" errors before the third cycle succeeded.
+func TestReconcileScaledObjects_RenameDefersApplyUntilPredecessorFinalized(t *testing.T) {
+	twdName := "atlan-automation-engine-worker-default-normal-prio"
+
+	legacy := &unstructured.Unstructured{}
+	legacy.SetGroupVersionKind(testSOGVK)
+	legacy.SetName("legacy-naming-scheme-a1b2c3d4-scale")
+	legacy.SetNamespace("app-ns")
+	legacy.SetFinalizers([]string{"finalizer.keda.sh"})
+	legacy.SetLabels(map[string]string{
+		OwnerTWDLabel: twdName,
+		BuildIDLabel:  testLongBuildID,
+	})
+	legacy.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: temporaliov1alpha1.GroupVersion.String(),
+		Kind:       "TemporalWorkerDeployment",
+		Name:       twdName,
+		UID:        types.UID("twd-uid"),
+	}})
+	require.NoError(t, unstructured.SetNestedField(legacy.Object,
+		"dep-base", "spec", "scaleTargetRef", "name"))
+
+	r, twd := soReconcileFixture(t, legacy)
+	ctx := context.Background()
+
+	// Cycle 1: the predecessor is deleted but held by its finalizer, so the
+	// replacement is deferred. This must NOT surface as an error.
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"),
+		"a deferred apply is an expected transition, not a reconcile failure")
+	assert.True(t, isManaged(t, r, "dep-base"),
+		"dep-base keeps keda-managed while the rename is in flight")
+
+	// KEDA clears its finalizer, letting the delete complete.
+	held := &unstructured.Unstructured{}
+	held.SetGroupVersionKind(testSOGVK)
+	require.NoError(t, r.Get(ctx, types.NamespacedName{
+		Namespace: "app-ns", Name: "legacy-naming-scheme-a1b2c3d4-scale"}, held))
+	held.SetFinalizers(nil)
+	require.NoError(t, r.Update(ctx, held))
+
+	// Cycle 2: the replacement is created now that the Deployment is free.
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
+
+	names := listSONames(t, r)
+	assert.NotContains(t, names, "legacy-naming-scheme-a1b2c3d4-scale")
+	targets := make(map[string]string, len(names))
+	for _, n := range names {
+		targets[soTargetOf(t, r, n)] = n
+	}
+	assert.Contains(t, targets, "dep-base", "dep-base must get its replacement SO")
+	assert.True(t, isManaged(t, r, "dep-base"))
 }
 
 // The counterpart to the rename guard: when a stale SO's Deployment is NOT
@@ -383,6 +445,10 @@ func TestReconcileScaledObjects_UpgradeFromCollapsedSO(t *testing.T) {
 	dep.Labels = map[string]string{ManagedByLabel: "true"}
 	require.NoError(t, r.Update(ctx, &dep))
 
+	// Two cycles: the collapsed SO is deleted in the first, and the replacement
+	// claiming the same Deployment is applied in the second (see
+	// RenameDefersApplyUntilPredecessorFinalized).
+	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
 	require.NoError(t, r.reconcileScaledObjects(ctx, logr.Discard(), twd, "temporal:7233"))
 
 	names := listSONames(t, r)

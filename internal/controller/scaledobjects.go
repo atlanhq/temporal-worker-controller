@@ -454,7 +454,8 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 	// ScaledObject already manages, so a rename has to be delete-then-create. If
 	// the old name survived into the apply below, the apply would be denied and
 	// the version would never get its scaler.
-	if err := r.deleteRenamedScaledObjects(ctx, l, existing, desired, claimed); err != nil {
+	deferred, err := r.deleteRenamedScaledObjects(ctx, l, existing, desired, claimed)
+	if err != nil {
 		return err
 	}
 
@@ -470,6 +471,15 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			l.Error(err, "failed to label Deployment as managed", "deployment", v.Deployment.Name)
 			// continue — best effort
 		}
+		if _, wait := deferred[name]; wait {
+			// Its predecessor was deleted this cycle but KEDA's finalizer keeps the
+			// object alive for a moment, and the admission webhook still counts it
+			// as managing the Deployment. Applying now would be denied for certain,
+			// so wait for the next requeue rather than log a failure for an expected
+			// step of the transition.
+			l.Info("deferring ScaledObject apply until its renamed predecessor is finalized", "name", name)
+			continue
+		}
 		if err := r.applyDesiredScaledObject(ctx, l, name, want, existing[name], v); err != nil {
 			applyErrs = append(applyErrs, err)
 		}
@@ -483,13 +493,13 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 	return errors.Join(applyErrs...)
 }
 
-// claimedScaleTargets returns the namespace/name of every Deployment a desired
-// ScaledObject points its scaleTargetRef at.
-func claimedScaleTargets(desired map[string]*unstructured.Unstructured) map[string]struct{} {
-	claimed := make(map[string]struct{}, len(desired))
-	for _, so := range desired {
+// claimedScaleTargets maps the namespace/name of every Deployment a desired
+// ScaledObject points its scaleTargetRef at to that ScaledObject's name.
+func claimedScaleTargets(desired map[string]*unstructured.Unstructured) map[string]string {
+	claimed := make(map[string]string, len(desired))
+	for soName, so := range desired {
 		if name, ns, ok := scaleTargetRef(so); ok {
-			claimed[ns+"/"+name] = struct{}{}
+			claimed[ns+"/"+name] = soName
 		}
 	}
 	return claimed
@@ -504,12 +514,18 @@ func claimedScaleTargets(desired map[string]*unstructured.Unstructured) map[stri
 // The keda-managed label is deliberately left in place: the replacement SO
 // claims the same Deployment, so handing replicas back to the planner here would
 // let it write spec.replicas while KEDA still owns them.
+//
+// Returns the names of the desired SOs whose apply must wait for a later cycle.
+// KEDA's finalizer keeps a deleted ScaledObject alive briefly, and while it is
+// there the admission webhook still counts it as managing the Deployment, so the
+// replacement cannot be created yet.
 func (r *TemporalWorkerDeploymentReconciler) deleteRenamedScaledObjects(
 	ctx context.Context,
 	l logr.Logger,
 	existing, desired map[string]*unstructured.Unstructured,
-	claimed map[string]struct{},
-) error {
+	claimed map[string]string,
+) (map[string]struct{}, error) {
+	deferred := map[string]struct{}{}
 	for name, so := range existing {
 		if _, want := desired[name]; want {
 			continue
@@ -518,17 +534,20 @@ func (r *TemporalWorkerDeploymentReconciler) deleteRenamedScaledObjects(
 		if !ok {
 			continue
 		}
-		if _, isClaimed := claimed[ns+"/"+target]; !isClaimed {
+		replacement, isClaimed := claimed[ns+"/"+target]
+		if !isClaimed {
 			continue
 		}
 		l.Info("deleting renamed ScaledObject so its replacement can claim the Deployment",
-			"name", name, "deployment", target, "buildId", so.GetLabels()[BuildIDLabel])
+			"name", name, "replacement", replacement, "deployment", target,
+			"buildId", so.GetLabels()[BuildIDLabel])
 		if err := r.Delete(ctx, so); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete renamed scaledobject %s: %w", name, err)
+			return nil, fmt.Errorf("delete renamed scaledobject %s: %w", name, err)
 		}
 		delete(existing, name)
+		deferred[replacement] = struct{}{}
 	}
-	return nil
+	return deferred, nil
 }
 
 // deleteStaleScaledObjects removes the SOs we own that the desired state no
@@ -541,7 +560,7 @@ func (r *TemporalWorkerDeploymentReconciler) deleteStaleScaledObjects(
 	ctx context.Context,
 	l logr.Logger,
 	existing, desired map[string]*unstructured.Unstructured,
-	claimed map[string]struct{},
+	claimed map[string]string,
 ) error {
 	for name, so := range existing {
 		if _, want := desired[name]; want {
@@ -564,7 +583,7 @@ func (r *TemporalWorkerDeploymentReconciler) releaseStaleScaleTarget(
 	ctx context.Context,
 	l logr.Logger,
 	so *unstructured.Unstructured,
-	claimed map[string]struct{},
+	claimed map[string]string,
 ) {
 	deployName, deployNS, ok := scaleTargetRef(so)
 	if !ok {
