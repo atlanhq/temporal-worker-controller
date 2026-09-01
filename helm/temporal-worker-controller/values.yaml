@@ -135,9 +135,19 @@ certmanager:
   # Leave empty when enabled: true — cert-manager injects the CA bundle automatically.
   caBundle: ""
 
-# Not yet supported
 prometheus:
+  # Creates a ServiceMonitor for the metrics Service. Needs metrics.enabled with
+  # metrics.disableAuth false - that is the only mode where a metrics Service exists -
+  # and the monitoring.coreos.com CRDs present in the cluster.
   enabled: false
+  interval: 1m
+  # go_* is roughly two thirds of the ~310 series a manager exposes. Dropping it keeps
+  # every controller_runtime_*, workqueue_*, leader_election_*, rest_client_* and
+  # process_* series, so process_resident_memory_bytes still covers manager memory.
+  metricRelabelings:
+    - action: drop
+      sourceLabels: [__name__]
+      regex: go_.*
 
 nodeSelector: {}
 

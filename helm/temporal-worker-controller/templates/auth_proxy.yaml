@@ -43,8 +43,12 @@ roleRef:
   kind: ClusterRole
   name: {{ .Release.Name }}-{{ .Release.Namespace }}-proxy-role
 subjects:
+  # Must match the ServiceAccount the manager pod actually runs as (see
+  # serviceaccount.yaml and manager.yaml). Naming a different one leaves
+  # kube-rbac-proxy unable to create TokenReviews, so it cannot authenticate any
+  # caller and answers 401 to every scrape.
   - kind: ServiceAccount
-    name: controller-manager
+    name: {{ .Values.serviceAccount.name | default (printf "%s-service-account" .Release.Name) }}
     namespace: {{ .Release.Namespace }}
 ---
 apiVersion: v1
