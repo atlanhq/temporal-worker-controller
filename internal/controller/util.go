@@ -29,6 +29,8 @@ const (
 	ReasonMetadataUpdateFailed       = "MetadataUpdateFailed"
 	ReasonManagerIdentityClaimFailed = "ManagerIdentityClaimFailed"
 	ReasonScaledObjectNameCollision  = "ScaledObjectNameCollision"
+	ReasonPinnedExecutionsStranded   = "PinnedExecutionsStranded"
+	ReasonPinnedExecutionCheckFailed = "PinnedExecutionCheckFailed"
 )
 
 const (
