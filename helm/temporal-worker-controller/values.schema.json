@@ -186,7 +186,7 @@
         },
         "metricRelabelings": {
           "type": "array",
-          "description": "metricRelabelConfigs applied to the scraped series",
+          "description": "metricRelabelings applied to the scraped series",
           "items": { "type": "object" }
         }
       }
