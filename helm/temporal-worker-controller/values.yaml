@@ -139,6 +139,11 @@ prometheus:
   # Creates a ServiceMonitor for the metrics Service. Needs metrics.enabled with
   # metrics.disableAuth false - that is the only mode where a metrics Service exists -
   # and the monitoring.coreos.com CRDs present in the cluster.
+  #
+  # Setting this alongside metrics.disableAuth true renders nothing and reports
+  # nothing: there is no Service to select, so the render stays silent rather than
+  # emitting a ServiceMonitor with no target. Both settings read as "monitor this",
+  # so check metrics.disableAuth before concluding a tenant is being scraped.
   enabled: false
   interval: 1m
   # go_* is roughly two thirds of the ~310 series a manager exposes. Dropping it keeps
