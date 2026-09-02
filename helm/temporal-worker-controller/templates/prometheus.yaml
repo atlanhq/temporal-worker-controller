@@ -1,24 +1,43 @@
-{{- if .Values.prometheus.enabled }}
-{{ fail "prometheus isn't supported yet" }}
+{{- if and .Values.prometheus.enabled .Values.metrics.enabled (not .Values.metrics.disableAuth) (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
 # Prometheus Monitor Service (Metrics)
+#
+# Gated on the same condition as the metrics Service in auth_proxy.yaml, which is the
+# only Service exposing the metrics port. With metrics.disableAuth the manager binds
+# 0.0.0.0 but no Service is created, so there would be nothing to select.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   labels:
     app.kubernetes.io/component: metrics
-    {{ include "temporal-worker-controller.labels" $ | indent 4 }}
+    {{- include "temporal-worker-controller.labels" $ | nindent 4 }}
   name: {{ .Release.Name }}-metrics-monitor
   namespace: {{ .Release.Namespace }}
 spec:
-  endpoints:
-    - path: /metrics
-      port: https
-      scheme: https
-      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-      tlsConfig:
-        insecureSkipVerify: true
+  # When this chart is a dependency, .Release.Name is the umbrella release, so the
+  # Service name differs on every install and the default job label would too. Derive
+  # it from app.kubernetes.io/name instead, which is the same everywhere, so one alert
+  # rule covers every install.
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
   selector:
     matchLabels:
       {{- include "temporal-worker-controller.selectorLabels" $ | nindent 6 }}
----
+  endpoints:
+    # The webhook Service carries the same selector labels but leaves its port
+    # unnamed, so naming the port keeps the metrics Service as the only target.
+    - path: /metrics
+      port: https
+      scheme: https
+      interval: {{ .Values.prometheus.interval | default "1m" }}
+      # kube-rbac-proxy authenticates this token via TokenReview, then authorizes the
+      # caller for get on the /metrics nonResourceURL via SubjectAccessReview.
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true
+      {{- with .Values.prometheus.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 {{- end }}
