@@ -86,7 +86,8 @@ const (
 	OwnerTWDLabel = "twd.temporal.io/owner"
 
 	// VariantSOLabel records the spec.variants name on a variant's per-version
-	// ScaledObject (absent on base SOs).
+	// ScaledObject. A base SO carries k8s.BaseVariantName: owner+buildID alone
+	// matches the base AND every variant of that version.
 	VariantSOLabel = "twd.temporal.io/variant"
 
 	// specHashAnnotation stores a hash of the controller-managed content
@@ -128,12 +129,17 @@ const (
 // The variant is also excluded from the truncated segment so it stays readable
 // on a long twdName instead of being cut off the end — an operator reading
 // `kubectl get scaledobject` during an incident needs to see which tier is which.
+//
+// NOT injective — reconcileScaledObjects must resolve duplicates. The readable
+// form joins variant and buildID with "-" and both may contain "-", so
+// (variant "od", buildID "b") and (variant "", buildID "od-b") compose one
+// name; normalisation can also fold two buildIDs together.
 func ScaledObjectName(twdName, variant, buildID string) string {
 	var variantPart string
 	if variant != "" {
 		variantPart = "-" + variant
 	}
-	full := fmt.Sprintf("%s%s-%s%s", twdName, variantPart, buildID, scaledObjectSuffix)
+	full := normalizeScaledObjectName(fmt.Sprintf("%s%s-%s%s", twdName, variantPart, buildID, scaledObjectSuffix))
 	if len(full) <= scaledObjectMaxNameLen {
 		return full
 	}
@@ -158,31 +164,51 @@ func ScaledObjectName(twdName, variant, buildID string) string {
 	}
 	// A cut landing on a separator would leave "...--<variant>" or "...--<hash>".
 	prefix = strings.TrimRight(prefix, "-.")
-	return prefix + variantPart + "-" + hash + scaledObjectSuffix
+	return normalizeScaledObjectName(prefix + variantPart + "-" + hash + scaledObjectSuffix)
 }
 
-// warnOnSONameCollision reports two versions of one TWD resolving to the same
-// ScaledObject name. Such a pair collapses in the reconciler's desired-state map
-// with no API error to surface: the loser is dropped, never gets the
-// keda-managed label, and its Deployment silently runs on the planner's static
-// replicas instead of scaling on backlog. ScaledObjectName is injective over
-// (twdName, variant, buildID), so a collision is a controller bug rather than a
-// user-input problem — reconciliation continues for the versions that are fine,
-// but the event and log make the gap visible.
+// normalizeScaledObjectName folds a composed name into an RFC 1123 DNS label.
+// cleanBuildID validates a buildID as a LABEL VALUE, which admits upper case,
+// "_" and "." — illegal in an object name, so the apiserver rejected the apply
+// and the version got no scaler at all. Only ever shortens.
+func normalizeScaledObjectName(s string) string {
+	return strings.Trim(k8s.CleanStringForDNS(s), "-")
+}
+
+// disambiguateScaledObjectName names an SO from a hash of the whole
+// (twdName, variant, buildID) triple, for versions whose readable names
+// collide. Readability is worth less than a scaler: the loser of a duplicate
+// never gets the keda-managed label, so the planner pins it at static replicas.
+func disambiguateScaledObjectName(twdName, variant, buildID string) string {
+	sum := sha1.Sum([]byte(twdName + "/" + variant + "/" + buildID))
+	hash := hex.EncodeToString(sum[:])[:8]
+	maxPrefix := scaledObjectMaxNameLen - 1 - 8 - len(scaledObjectSuffix)
+	prefix := twdName
+	if len(prefix) > maxPrefix {
+		prefix = prefix[:maxPrefix]
+	}
+	prefix = strings.TrimRight(prefix, "-.")
+	return normalizeScaledObjectName(prefix + "-" + hash + scaledObjectSuffix)
+}
+
+// warnOnSONameCollision reports the readable ScaledObject names that two
+// versions of one TWD both composed. reconcileScaledObjects hands every
+// contender a hashed name, so no version loses its scaler, but the pair is
+// still worth surfacing: it costs a rename, leaves those names unreadable, and
+// means an image tag has run into a variant name.
 func (r *TemporalWorkerDeploymentReconciler) warnOnSONameCollision(
 	l logr.Logger,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
-	names []string,
+	dupes []string,
 ) {
-	dupes := duplicateStrings(names)
 	if len(dupes) == 0 {
 		return
 	}
 	joined := strings.Join(dupes, ", ")
-	l.Error(fmt.Errorf("colliding names: %s", joined),
-		"two versions resolved to the same ScaledObject name; the losing Deployments will not autoscale")
+	l.Info("ScaledObject name collision; contenders renamed to their hashed form",
+		"collidingNames", joined)
 	r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonScaledObjectNameCollision,
-		"ScaledObject name collision (%s): a version or variant will not be autoscaled", joined)
+		"ScaledObject name collision (%s): the versions involved were given hashed names", joined)
 }
 
 // duplicateStrings returns the values appearing more than once, each reported
@@ -222,6 +248,14 @@ type versionRef struct {
 	// SO watches <taskQueue><variant.TaskQueueSuffix> under the SAME
 	// {workerDeploymentName, buildID}. Nil for the base.
 	Variant *temporaliov1alpha1.WorkerVariant
+}
+
+// variantName is the spec.variants name this ref stands for, "" for the base.
+func (v versionRef) variantName() string {
+	if v.Variant == nil {
+		return ""
+	}
+	return v.Variant.Name
 }
 
 // activeVersionsForScaling returns versions that should have a live SO.
@@ -407,9 +441,22 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 	// Step 1 — enumerate desired SOs from active versions (base + variants).
 	versions := activeVersionsForScaling(&twd.Status)
 	versions = append(versions, variantVersionsForScaling(versions, &twd.Status, twd)...)
+	// Compose every readable name up front. A name two versions both want is
+	// replaced for BOTH of them, not just the loser, so which one keeps the
+	// readable name never depends on enumeration order.
+	readable := make([]string, len(versions))
+	for i, v := range versions {
+		readable[i] = ScaledObjectName(twd.Name, v.variantName(), v.BuildID)
+	}
+	dupes := duplicateStrings(readable)
+	contested := make(map[string]struct{}, len(dupes))
+	for _, n := range dupes {
+		contested[n] = struct{}{}
+	}
+	r.warnOnSONameCollision(l, twd, dupes)
+
 	desired := make(map[string]*unstructured.Unstructured, len(versions))
 	desiredVersionsByName := make(map[string]versionRef, len(versions))
-	names := make([]string, 0, len(versions))
 	for _, v := range versions {
 		// Resolve the worker deployment name this version's pods actually
 		// registered under. A version preserved across a
@@ -426,12 +473,20 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			}
 		}
 		so := buildScaledObject(twd, v, temporalEndpoint)
-		names = append(names, so.GetName())
+		if _, clash := contested[so.GetName()]; clash {
+			so.SetName(disambiguateScaledObjectName(twd.Name, v.variantName(), v.BuildID))
+		}
+		if _, taken := desired[so.GetName()]; taken {
+			// A hashed name that is still taken means the sha1 prefixes matched
+			// too. Skip rather than overwrite a version that is already correct.
+			l.Error(fmt.Errorf("scaledobject name %s already claimed", so.GetName()),
+				"skipping ScaledObject; this version will not autoscale",
+				"buildId", v.BuildID, "variant", v.variantName())
+			continue
+		}
 		desired[so.GetName()] = so
 		desiredVersionsByName[so.GetName()] = v
 	}
-
-	r.warnOnSONameCollision(l, twd, names)
 
 	// Step 2 — list existing SOs we own.
 	existing, err := r.listOwnedScaledObjects(ctx, twd)
@@ -750,8 +805,9 @@ func buildScaledObject(
 		Kind:    scaledObjectKind,
 	})
 	soLabels := map[string]string{
-		OwnerTWDLabel: twd.Name,
-		BuildIDLabel:  v.BuildID,
+		OwnerTWDLabel:  twd.Name,
+		BuildIDLabel:   v.BuildID,
+		VariantSOLabel: k8s.BaseVariantName,
 	}
 	if v.Variant != nil {
 		// Variant SOs get their own name (variant folded into the twd prefix so
