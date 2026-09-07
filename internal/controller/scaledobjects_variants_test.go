@@ -86,13 +86,15 @@ func TestBuildScaledObjectVariant(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, int64(0), minR)
 
-	// Base SO for the same version stays unsuffixed and unlabeled.
+	// Base SO for the same version stays unsuffixed, and carries the reserved
+	// base discriminator so owner+buildID+variant selects exactly one SO.
 	base := buildScaledObject(twd, versionRef{BuildID: "bid1", Status: temporaliov1alpha1.VersionStatusCurrent, Deployment: ref}, "temporal:7233")
 	baseMd := soTrigger(t, base)
 	assert.Equal(t, "atlan-app-production", baseMd["taskQueue"])
 	assert.Equal(t, "atlan-app-production", baseMd["workflowTaskQueueForCount"])
-	_, hasLabel := base.GetLabels()[VariantSOLabel]
-	assert.False(t, hasLabel)
+	assert.Equal(t, k8s.BaseVariantName, base.GetLabels()[VariantSOLabel])
+	assert.NotEqual(t, base.GetLabels()[VariantSOLabel], so.GetLabels()[VariantSOLabel],
+		"base and variant SOs of one version must be distinguishable by label")
 }
 
 func TestResolveMinReplicasVariantFloor(t *testing.T) {

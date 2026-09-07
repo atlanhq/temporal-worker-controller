@@ -86,7 +86,8 @@ const (
 	OwnerTWDLabel = "twd.temporal.io/owner"
 
 	// VariantSOLabel records the spec.variants name on a variant's per-version
-	// ScaledObject (absent on base SOs).
+	// ScaledObject. A base SO carries k8s.BaseVariantName: owner+buildID alone
+	// matches the base AND every variant of that version.
 	VariantSOLabel = "twd.temporal.io/variant"
 
 	// specHashAnnotation stores a hash of the controller-managed content
@@ -128,12 +129,17 @@ const (
 // The variant is also excluded from the truncated segment so it stays readable
 // on a long twdName instead of being cut off the end — an operator reading
 // `kubectl get scaledobject` during an incident needs to see which tier is which.
+//
+// NOT injective — reconcileScaledObjects must resolve duplicates. The readable
+// form joins variant and buildID with "-" and both may contain "-", so
+// (variant "od", buildID "b") and (variant "", buildID "od-b") compose one
+// name; normalisation can also fold two buildIDs together.
 func ScaledObjectName(twdName, variant, buildID string) string {
 	var variantPart string
 	if variant != "" {
 		variantPart = "-" + variant
 	}
-	full := fmt.Sprintf("%s%s-%s%s", twdName, variantPart, buildID, scaledObjectSuffix)
+	full := normalizeScaledObjectName(fmt.Sprintf("%s%s-%s%s", twdName, variantPart, buildID, scaledObjectSuffix))
 	if len(full) <= scaledObjectMaxNameLen {
 		return full
 	}
@@ -158,31 +164,169 @@ func ScaledObjectName(twdName, variant, buildID string) string {
 	}
 	// A cut landing on a separator would leave "...--<variant>" or "...--<hash>".
 	prefix = strings.TrimRight(prefix, "-.")
-	return prefix + variantPart + "-" + hash + scaledObjectSuffix
+	return normalizeScaledObjectName(prefix + variantPart + "-" + hash + scaledObjectSuffix)
 }
 
-// warnOnSONameCollision reports two versions of one TWD resolving to the same
-// ScaledObject name. Such a pair collapses in the reconciler's desired-state map
-// with no API error to surface: the loser is dropped, never gets the
-// keda-managed label, and its Deployment silently runs on the planner's static
-// replicas instead of scaling on backlog. ScaledObjectName is injective over
-// (twdName, variant, buildID), so a collision is a controller bug rather than a
-// user-input problem — reconciliation continues for the versions that are fine,
-// but the event and log make the gap visible.
+// normalizeScaledObjectName folds a composed name into an RFC 1123 DNS label.
+// cleanBuildID validates a buildID as a LABEL VALUE, which admits upper case,
+// "_" and "." — illegal in an object name, so the apiserver rejected the apply
+// and the version got no scaler at all. Only ever shortens.
+func normalizeScaledObjectName(s string) string {
+	return strings.Trim(k8s.CleanStringForDNS(s), "-")
+}
+
+// disambiguateScaledObjectName names an SO from a salted hash of the whole
+// (twdName, variant, buildID) triple, for versions whose readable names
+// collide. Readability is worth less than a scaler: a version left without a
+// name never gets the keda-managed label, so the planner pins its Deployment at
+// static replicas.
+//
+// The salt is what makes this a real fallback. Unsalted, a base version's
+// hashed name is byte-identical to its own truncated readable name (both budget
+// 48 chars of prefix over the same digest input), so "fall back to the hash"
+// would be a no-op for exactly the versions whose names are long enough to
+// truncate. Varying the salt also yields a fresh candidate when one is already
+// taken.
+func disambiguateScaledObjectName(twdName, variant, buildID string, salt int) string {
+	var variantPart string
+	if variant != "" {
+		variantPart = "-" + variant
+	}
+	sum := sha1.Sum([]byte(fmt.Sprintf("%s/%s/%s/so%d", twdName, variant, buildID, salt)))
+	hash := hex.EncodeToString(sum[:])[:8]
+	maxPrefix := scaledObjectMaxNameLen - len(variantPart) - 1 - 8 - len(scaledObjectSuffix)
+	if maxPrefix < 0 {
+		maxPrefix = 0
+	}
+	prefix := twdName
+	if len(prefix) > maxPrefix {
+		prefix = prefix[:maxPrefix]
+	}
+	prefix = strings.TrimRight(prefix, "-.")
+	return normalizeScaledObjectName(prefix + variantPart + "-" + hash + scaledObjectSuffix)
+}
+
+// maxNameSaltAttempts bounds the search for a free fallback name. Each salt is
+// an independent 32-bit digest, so needing a second attempt already implies a
+// hash collision; the bound only exists so the loop cannot spin.
+const maxNameSaltAttempts = 64
+
+// assignScaledObjectNames allocates one ScaledObject name per version, since
+// ScaledObjectName is not injective. Rules, in order:
+//
+//   - An uncontested readable name is used as-is.
+//   - When two versions compose one readable name, the INCUMBENT keeps it — the
+//     version whose Deployment the live SO of that name already scales. A
+//     converged, serving tier is never renamed just because some other version
+//     collided with it; only the newcomer moves.
+//   - Everyone else takes a salted hash, retried until free, so no version is
+//     ever left unnamed. A version without a name keeps no scaler and its
+//     Deployment stays frozen, which is the whole bug being fixed.
+//
+// The outcome depends on cluster state and the set of versions, never on the
+// order they were enumerated in.
+//
+// Returns a name per version (parallel to versions) and the readable names that
+// were actually displaced this pass — empty once converged, so a stable
+// collision does not re-raise an event on every requeue.
+func assignScaledObjectNames(
+	twdName string,
+	versions []versionRef,
+	existing map[string]*unstructured.Unstructured,
+) (names []string, displaced []string) {
+	readable := make([]string, len(versions))
+	for i, v := range versions {
+		readable[i] = ScaledObjectName(twdName, v.variantName(), v.BuildID)
+	}
+	contested := make(map[string]struct{})
+	for _, n := range duplicateStrings(readable) {
+		contested[n] = struct{}{}
+	}
+
+	names = make([]string, len(versions))
+	taken := make(map[string]struct{}, len(versions))
+	reported := make(map[string]struct{})
+	for i := range versions {
+		if _, clash := contested[readable[i]]; !clash {
+			names[i] = readable[i]
+			taken[readable[i]] = struct{}{}
+		}
+	}
+	// Incumbents claim their contested names before any fallback is handed out.
+	for i, v := range versions {
+		if names[i] != "" {
+			continue
+		}
+		if _, held := taken[readable[i]]; held {
+			continue
+		}
+		if so, live := existing[readable[i]]; live && scaledObjectTargets(so, v.Deployment) {
+			names[i] = readable[i]
+			taken[readable[i]] = struct{}{}
+		}
+	}
+	for i, v := range versions {
+		if names[i] != "" {
+			continue
+		}
+		names[i] = freeScaledObjectName(twdName, v, taken)
+		taken[names[i]] = struct{}{}
+		// Only report a displacement that changes something: once the fallback
+		// name is live and already aimed at this Deployment, the collision has
+		// converged and there is nothing new to tell anyone.
+		if so, live := existing[names[i]]; !live || !scaledObjectTargets(so, v.Deployment) {
+			// Two versions sharing one readable name can both be displaced, so
+			// report each contested name once.
+			if _, seen := reported[readable[i]]; !seen {
+				reported[readable[i]] = struct{}{}
+				displaced = append(displaced, readable[i])
+			}
+		}
+	}
+	return names, displaced
+}
+
+// freeScaledObjectName returns the first salted name not already allocated.
+func freeScaledObjectName(twdName string, v versionRef, taken map[string]struct{}) string {
+	var name string
+	for salt := 0; salt < maxNameSaltAttempts; salt++ {
+		name = disambiguateScaledObjectName(twdName, v.variantName(), v.BuildID, salt)
+		if _, used := taken[name]; !used {
+			return name
+		}
+	}
+	return name
+}
+
+// scaledObjectTargets reports whether so's scaleTargetRef points at ref.
+func scaledObjectTargets(so *unstructured.Unstructured, ref *corev1.ObjectReference) bool {
+	if so == nil || ref == nil {
+		return false
+	}
+	name, ns, ok := scaleTargetRef(so)
+	return ok && name == ref.Name && ns == ref.Namespace
+}
+
+// warnOnSONameCollision reports the readable ScaledObject names that two
+// versions of one TWD both composed and that were displaced this pass.
+// assignScaledObjectNames keeps the incumbent on its name and moves the
+// newcomer to a hashed one, so no version loses its scaler, but the pair is
+// still worth surfacing: it costs the newcomer a rename, leaves its name
+// unreadable, and means an image tag has run into a variant name or another
+// tag that differs from it only by case or a separator.
 func (r *TemporalWorkerDeploymentReconciler) warnOnSONameCollision(
 	l logr.Logger,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
-	names []string,
+	dupes []string,
 ) {
-	dupes := duplicateStrings(names)
 	if len(dupes) == 0 {
 		return
 	}
 	joined := strings.Join(dupes, ", ")
-	l.Error(fmt.Errorf("colliding names: %s", joined),
-		"two versions resolved to the same ScaledObject name; the losing Deployments will not autoscale")
+	l.Info("ScaledObject name collision; contenders renamed to their hashed form",
+		"collidingNames", joined)
 	r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonScaledObjectNameCollision,
-		"ScaledObject name collision (%s): a version or variant will not be autoscaled", joined)
+		"ScaledObject name collision (%s): the versions involved were given hashed names", joined)
 }
 
 // duplicateStrings returns the values appearing more than once, each reported
@@ -222,6 +366,14 @@ type versionRef struct {
 	// SO watches <taskQueue><variant.TaskQueueSuffix> under the SAME
 	// {workerDeploymentName, buildID}. Nil for the base.
 	Variant *temporaliov1alpha1.WorkerVariant
+}
+
+// variantName is the spec.variants name this ref stands for, "" for the base.
+func (v versionRef) variantName() string {
+	if v.Variant == nil {
+		return ""
+	}
+	return v.Variant.Name
 }
 
 // activeVersionsForScaling returns versions that should have a live SO.
@@ -404,13 +556,23 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 		return r.disablePerVersionScaling(ctx, l, twd)
 	}
 
-	// Step 1 — enumerate desired SOs from active versions (base + variants).
+	// Step 1 — list existing SOs we own. This comes before naming because name
+	// allocation consults it: the incumbent of a contested name keeps it.
+	existing, err := r.listOwnedScaledObjects(ctx, twd)
+	if err != nil {
+		return fmt.Errorf("list scaled objects: %w", err)
+	}
+
+	// Step 2 — enumerate desired SOs from active versions (base + variants) and
+	// allocate a distinct name to every one of them.
 	versions := activeVersionsForScaling(&twd.Status)
 	versions = append(versions, variantVersionsForScaling(versions, &twd.Status, twd)...)
+	names, displaced := assignScaledObjectNames(twd.Name, versions, existing)
+	r.warnOnSONameCollision(l, twd, displaced)
+
 	desired := make(map[string]*unstructured.Unstructured, len(versions))
 	desiredVersionsByName := make(map[string]versionRef, len(versions))
-	names := make([]string, 0, len(versions))
-	for _, v := range versions {
+	for i, v := range versions {
 		// Resolve the worker deployment name this version's pods actually
 		// registered under. A version preserved across a
 		// spec.workerOptions.workerDeploymentName change (see the planner's
@@ -426,17 +588,9 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			}
 		}
 		so := buildScaledObject(twd, v, temporalEndpoint)
-		names = append(names, so.GetName())
-		desired[so.GetName()] = so
-		desiredVersionsByName[so.GetName()] = v
-	}
-
-	r.warnOnSONameCollision(l, twd, names)
-
-	// Step 2 — list existing SOs we own.
-	existing, err := r.listOwnedScaledObjects(ctx, twd)
-	if err != nil {
-		return fmt.Errorf("list scaled objects: %w", err)
+		so.SetName(names[i])
+		desired[names[i]] = so
+		desiredVersionsByName[names[i]] = v
 	}
 
 	// Step 3 — migration: delete any LEGACY SO that targets the TWD itself
@@ -750,8 +904,9 @@ func buildScaledObject(
 		Kind:    scaledObjectKind,
 	})
 	soLabels := map[string]string{
-		OwnerTWDLabel: twd.Name,
-		BuildIDLabel:  v.BuildID,
+		OwnerTWDLabel:  twd.Name,
+		BuildIDLabel:   v.BuildID,
+		VariantSOLabel: k8s.BaseVariantName,
 	}
 	if v.Variant != nil {
 		// Variant SOs get their own name (variant folded into the twd prefix so
