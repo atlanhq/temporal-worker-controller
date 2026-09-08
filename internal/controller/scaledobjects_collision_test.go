@@ -41,7 +41,10 @@ func TestScaledObjectNameIsAlwaysAValidObjectName(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ScaledObjectName(tc.twd, tc.variant, tc.buildID)
-			assert.Empty(t, validation.IsDNS1123Label(got), "%q is not a valid object name", got)
+			// An object name is validated as a DNS-1123 SUBDOMAIN, so dots are
+			// legal; what must hold is that every dot-separated label is
+			// non-empty and alphanumeric-bounded.
+			assert.Empty(t, validation.IsDNS1123Subdomain(got), "%q is not a valid object name", got)
 			assert.LessOrEqual(t, len(got), scaledObjectMaxNameLen)
 			assert.Equal(t, got, ScaledObjectName(tc.twd, tc.variant, tc.buildID), "must be deterministic")
 		})
@@ -242,15 +245,29 @@ func TestScaledObjectLabels_BaseIsSelectable(t *testing.T) {
 // where before they composed two (one of them invalid). This needs no variant
 // at all, so it is more reachable than the variant/buildID boundary case.
 func TestScaledObjectNameNormalisationFoldsTags(t *testing.T) {
-	for _, pair := range [][2]string{
-		{"v1_0-319dd01", "v1.0-319dd01"},
-		{"Main-319dd01", "main-319dd01"},
-		{"feature_x-319dd01", "feature.x-319dd01"},
+	for _, tc := range []struct {
+		a, b string
+		fold bool
+		why  string
+	}{
+		// Case is folded, so these two tags still collide.
+		{"Main-319dd01", "main-319dd01", true, "lowercasing folds case"},
+		// Dots are preserved, so a dotted tag no longer collides with the
+		// underscored one it used to fold into. That is the whole point of
+		// preserving them: "_" is illegal in a name and must be replaced, "."
+		// is legal and must not be.
+		{"v1_0-319dd01", "v1.0-319dd01", false, "'.' is kept, '_' becomes '-'"},
+		{"feature_x-319dd01", "feature.x-319dd01", false, "'.' is kept, '_' becomes '-'"},
 	} {
-		t.Run(pair[0]+" vs "+pair[1], func(t *testing.T) {
+		t.Run(tc.a+" vs "+tc.b, func(t *testing.T) {
+			pair := [2]string{tc.a, tc.b}
 			a := ScaledObjectName("app-worker-twd", "", pair[0])
 			b := ScaledObjectName("app-worker-twd", "", pair[1])
-			require.Equal(t, a, b, "premise: normalisation folds these two tags")
+			if !tc.fold {
+				assert.NotEqual(t, a, b, "must stay distinct: %s", tc.why)
+				return
+			}
+			require.Equal(t, a, b, "premise: normalisation folds these two tags (%s)", tc.why)
 
 			// The fallback must still separate them, or one version loses its
 			// scaler. It hashes the raw triple, so the fold does not reach it.

@@ -53,6 +53,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -116,6 +117,10 @@ const (
 	scaledObjectFieldManager = "temporal-worker-controller"
 )
 
+// nonDNSNameChars matches runs of characters that cannot appear in a Kubernetes
+// object name. "." is excluded on purpose — it is a legal subdomain separator.
+var nonDNSNameChars = regexp.MustCompile(`[^a-z0-9.-]+`)
+
 // --- Naming -------------------------------------------------------------------
 
 // ScaledObjectName returns the per-version ScaledObject name for a TWD version,
@@ -167,12 +172,39 @@ func ScaledObjectName(twdName, variant, buildID string) string {
 	return normalizeScaledObjectName(prefix + variantPart + "-" + hash + scaledObjectSuffix)
 }
 
-// normalizeScaledObjectName folds a composed name into an RFC 1123 DNS label.
+// normalizeScaledObjectName folds a composed name into a valid RFC 1123 DNS
+// subdomain, which is what the apiserver validates an object name against.
+//
 // cleanBuildID validates a buildID as a LABEL VALUE, which admits upper case,
-// "_" and "." — illegal in an object name, so the apiserver rejected the apply
-// and the version got no scaler at all. Only ever shortens.
+// "_" and "." — and a buildID goes straight into this name. Upper case and "_"
+// are illegal in an object name, so the apiserver rejected the apply outright
+// and the version got no scaler at all.
+//
+// Dots are DIFFERENT: they are legal as subdomain separators, and apps released
+// through the semver flow carry buildIDs like "1.1.1", so most ScaledObjects in
+// the fleet have a dotted name that works today. Folding dots to "-" would
+// rename every one of them — a delete-and-recreate per object for a purely
+// cosmetic gain — so dots are preserved and only the genuinely illegal
+// characters are replaced. What a dot still needs is a well-formed label on
+// each side of it: every dot-separated label must be non-empty and must not
+// begin or end with "-", or the name is rejected even though the dot is fine.
+//
+// Only ever shortens, so a caller that has already fitted the name to
+// scaledObjectMaxNameLen stays within budget.
 func normalizeScaledObjectName(s string) string {
-	return strings.Trim(k8s.CleanStringForDNS(s), "-")
+	s = strings.ToLower(s)
+	s = nonDNSNameChars.ReplaceAllString(s, "-")
+	labels := strings.Split(s, ".")
+	kept := labels[:0]
+	for _, label := range labels {
+		// A cut or a replaced run can leave a label empty or dash-bounded; both
+		// are invalid, and an empty label would also collapse "a..b" into a name
+		// the apiserver refuses.
+		if label = strings.Trim(label, "-"); label != "" {
+			kept = append(kept, label)
+		}
+	}
+	return strings.Join(kept, ".")
 }
 
 // disambiguateScaledObjectName names an SO from a salted hash of the whole
