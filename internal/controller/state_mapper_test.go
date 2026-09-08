@@ -5,6 +5,7 @@
 package controller
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -268,4 +269,52 @@ func TestMapWorkerDeploymentVersion(t *testing.T) {
 	assert.Equal(t, temporaliov1alpha1.VersionStatusNotRegistered, currentVersion.Status)
 	assert.Nil(t, currentVersion.HealthySince)
 	assert.Nil(t, currentVersion.Deployment)
+}
+
+// The reconciler skips its status write only when the mapped status DeepEquals the
+// persisted one. Deployments is a map, so without an explicit order a TWD with several
+// deprecated versions would map to a differently ordered slice on every reconcile,
+// rewrite its status each time, and re-trigger itself through the watch.
+func TestMapToStatusDeprecatedVersionsOrderIsStable(t *testing.T) {
+	const drainedVersions = 12
+	drainedSince := time.Now().Add(-time.Hour)
+
+	want := make([]string, drainedVersions)
+	for i := range want {
+		want[i] = fmt.Sprintf("build-%02d", i)
+	}
+
+	deployments := map[string]*appsv1.Deployment{
+		"current": {ObjectMeta: metav1.ObjectMeta{Name: "worker-current", Namespace: "default"}},
+	}
+	versions := map[string]*temporal.VersionInfo{
+		"current": {DeploymentName: "worker", BuildID: "current", Status: temporaliov1alpha1.VersionStatusCurrent},
+	}
+	// Insert in descending order so insertion order cannot pass by accident.
+	for i := len(want) - 1; i >= 0; i-- {
+		buildID := want[i]
+		deployments[buildID] = &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "worker-" + buildID, Namespace: "default"}}
+		versions[buildID] = &temporal.VersionInfo{
+			DeploymentName: "worker",
+			BuildID:        buildID,
+			Status:         temporaliov1alpha1.VersionStatusDrained,
+			DrainedSince:   &drainedSince,
+		}
+	}
+
+	mapper := newStateMapper(
+		&k8s.DeploymentState{Deployments: deployments},
+		&temporal.TemporalWorkerState{CurrentBuildID: "current", Versions: versions},
+		"worker",
+	)
+
+	for i := 0; i < 20; i++ {
+		got := make([]string, 0, drainedVersions)
+		for _, v := range mapper.mapToStatus("current").DeprecatedVersions {
+			got = append(got, v.BuildID)
+		}
+		if !assert.Equal(t, want, got, "reconcile %d", i) {
+			break
+		}
+	}
 }
