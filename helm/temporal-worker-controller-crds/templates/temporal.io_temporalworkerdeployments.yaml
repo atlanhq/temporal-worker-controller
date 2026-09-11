@@ -142,6 +142,9 @@ spec:
                   scaledownDelay:
                     default: 1h
                     type: string
+                  teardownDrainageTimeout:
+                    default: 72h
+                    type: string
                 type: object
               template:
                 properties:

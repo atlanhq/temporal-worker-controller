@@ -52,6 +52,10 @@ func (s *TemporalWorkerDeploymentSpec) Default(ctx context.Context) error {
 		s.SunsetStrategy.DeleteDelay = &v1.Duration{Duration: defaults.DeleteDelay}
 	}
 
+	if s.SunsetStrategy.TeardownDrainageTimeout == nil {
+		s.SunsetStrategy.TeardownDrainageTimeout = &v1.Duration{Duration: defaults.TeardownDrainageTimeout}
+	}
+
 	return nil
 }
 

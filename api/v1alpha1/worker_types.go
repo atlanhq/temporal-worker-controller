@@ -709,6 +709,26 @@ type SunsetStrategy struct {
 	// +optional
 	// +kubebuilder:default="24h"
 	DeleteDelay *metav1.Duration `json:"deleteDelay"`
+
+	// TeardownDrainageTimeout caps how long deletion of this TemporalWorkerDeployment waits
+	// for open pinned executions to finish. While it waits, the workers those executions
+	// are pinned to stay up (as do their autoscalers, so a pool at zero can still be woken).
+	// On expiry the remaining executions are terminated and the teardown proceeds: an
+	// execution pinned to a deleted version has no worker to dispatch its tasks and no
+	// schedule-to-start timeout to expire them, so terminating is what keeps it from
+	// hanging forever. Measured from metadata.deletionTimestamp.
+	//
+	// Zero terminates immediately without waiting. Leaving it unset predates this
+	// behaviour and neither waits nor terminates.
+	//
+	// Defaults to 72h, the intended workflow execution ceiling, so removing a worker
+	// pool does not cut short work that was still legally running on it. Two costs
+	// scale with this value: the object holds its name for the duration, so a
+	// same-name reinstall is blocked while it waits, and its workers keep running.
+	// Lower it per app where reinstall speed matters more than in-flight work.
+	// +optional
+	// +kubebuilder:default="72h"
+	TeardownDrainageTimeout *metav1.Duration `json:"teardownDrainageTimeout"`
 }
 
 type AllAtOnceRolloutStrategy struct{}
