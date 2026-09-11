@@ -13,11 +13,14 @@ const (
 	MaxVersionsIneligibleForDeletion = int32(ServerMaxVersions * 0.75)
 
 	// TeardownDrainageTimeout bounds how long TWD deletion waits for open pinned
-	// executions before terminating them. Sized to outlast a collateral uninstall:
-	// on 2026-08-31 Flux reinstalled 20 minutes after remediating its own timeout, and
-	// terminating inside that window would end work the returning workers could have
-	// finished. The cost of the longer wait is only that the object holds its name.
-	TeardownDrainageTimeout = 30 * time.Minute
+	// executions before terminating them. Set to the intended workflow execution
+	// ceiling, so a workflow that is still running is given its whole legal lifetime
+	// rather than being cut short by an unrelated chart change. Note the ceiling is
+	// not guaranteed: workflow_max_timeout_hours is unset by default in the app SDK,
+	// which leaves the namespace default, so for those apps this budget is the only
+	// thing bounding the wait - which is why it expires into a terminate rather than
+	// into an unbounded hold.
+	TeardownDrainageTimeout = 72 * time.Hour
 
 	// ToBeDeprecatedDefaultControllerIdentity will stop being used in the next release.
 	ToBeDeprecatedDefaultControllerIdentity = "temporal-worker-controller"

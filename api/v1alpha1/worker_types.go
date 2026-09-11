@@ -721,11 +721,13 @@ type SunsetStrategy struct {
 	// Zero terminates immediately without waiting. Leaving it unset predates this
 	// behaviour and neither waits nor terminates.
 	//
-	// The object holds its name while it waits, so a value below the delivery layer's
-	// reinstall time terminates work that the returning workers could have finished.
-	// Defaults to 30 minutes.
+	// Defaults to 72h, the intended workflow execution ceiling, so removing a worker
+	// pool does not cut short work that was still legally running on it. Two costs
+	// scale with this value: the object holds its name for the duration, so a
+	// same-name reinstall is blocked while it waits, and its workers keep running.
+	// Lower it per app where reinstall speed matters more than in-flight work.
 	// +optional
-	// +kubebuilder:default="30m"
+	// +kubebuilder:default="72h"
 	TeardownDrainageTimeout *metav1.Duration `json:"teardownDrainageTimeout"`
 }
 
