@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -16,6 +17,7 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -174,6 +176,12 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		if controllerutil.ContainsFinalizer(&workerDeploy, finalizerName) {
 			l.Info("TemporalWorkerDeployment is being deleted, running cleanup")
 			if err := r.handleDeletion(ctx, l, &workerDeploy); err != nil {
+				// A held teardown is the design working, not a failure: the workers stay up
+				// until what is pinned to them finishes or the budget expires.
+				if errors.Is(err, errTeardownWaiting) {
+					l.Info("teardown held", "reason", err.Error())
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
 				l.Error(err, "failed to clean up Temporal server-side deployment data, will retry")
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
@@ -464,8 +472,10 @@ func (r *TemporalWorkerDeploymentReconciler) markWRTsTWDNotFound(ctx context.Con
 // The cleanup sequence:
 //  1. Clear the ramping version (must happen first to avoid a split-traffic window)
 //  2. Set the current version to "unversioned" (empty BuildID) so new tasks route to unversioned workers
-//  3. Delete all registered versions (with SkipDrainage since the TWD is being removed entirely)
-//  4. Delete the deployment record itself once all versions are gone
+//  3. Wait, up to spec.sunset.teardownDrainageTimeout, for open pinned executions to
+//     finish, then tear down the ScaledObjects and child Deployments
+//  4. Delete all registered versions (with SkipDrainage, now that the wait has cleared them)
+//  5. Delete the deployment record itself once all versions are gone
 //
 // teardownChildren deletes the TWD's owned ScaledObjects and child Deployments.
 // Without this, deletion deadlocks: the children are owner-referenced to the TWD,
@@ -526,13 +536,15 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	l logr.Logger,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
-	// Tear down owned ScaledObjects and child Deployments FIRST so their pods stop
-	// polling; the version deletion below cannot succeed while pollers are active,
-	// and GC cannot remove the children until the finalizer this cleanup serves is
-	// gone. Runs before the Temporal dial so children are released even when the
-	// server is unreachable.
-	if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
-		return err
+	// Workers are torn down once nothing is pinned to them any more, or once the drainage
+	// budget runs out. Past the budget the teardown is unconditional and runs before the
+	// Temporal dial, so an unreachable server cannot hold the children hostage - the
+	// original ordering, kept as the fallback rather than the default.
+	forceTeardown := teardownBudgetExpired(workerDeploy)
+	if forceTeardown {
+		if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
+			return err
+		}
 	}
 
 	// Resolve Temporal connection.
@@ -615,6 +627,7 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 
 	// Step 2: Set current version to unversioned (empty BuildID) so tasks route to unversioned workers.
 	// This is the critical step that unblocks task dispatch.
+	redirectedNow := false
 	if routingConfig.CurrentVersion != nil {
 		l.Info("Setting current version to unversioned", "previousBuildID", routingConfig.CurrentVersion.BuildID)
 		if _, err := deploymentHandler.SetCurrentVersion(ctx, sdkclient.WorkerDeploymentSetCurrentVersionOptions{
@@ -626,18 +639,52 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			return fmt.Errorf("unable to set current version to unversioned: %w", err)
 		}
 		l.Info("Successfully set current version to unversioned")
+		redirectedNow = true
 	} else {
 		l.Info("No current version set, skipping unversioned redirect")
 	}
 
-	// Step 3: Delete versions that are eligible. Versions that are still draining
-	// are force-deleted with SkipDrainage since the TWD is being removed entirely.
-	// If any version fails to delete (e.g. active pollers), return an error so the
-	// reconciler requeues. teardownChildren above already deleted the pods' owners;
-	// the server still reports pollers for a short TTL (~minutes) after the last
-	// poll, so the first attempts after teardown may legitimately retry.
+	// A version stops accruing pinned executions only once the redirect lands, and
+	// visibility indexes them asynchronously, so a count taken in the same pass that
+	// moved routing cannot include the last few. Defer it to the next pass.
+	if redirectedNow && !forceTeardown {
+		return fmt.Errorf("%w: waiting for visibility to settle after the unversioned redirect", errTeardownWaiting)
+	}
+
+	// Step 3: wait for anything still pinned to these versions to finish, keeping the
+	// workers (and the ScaledObjects that wake them from zero) alive while it does.
+	// Deleting a version out from under an open pinned execution strands it for good:
+	// its tasks route by exact version match, and a task on a base task queue has
+	// neither a worker to dispatch it nor a schedule-to-start timeout to expire it.
+	if !forceTeardown {
+		pinned, err := r.countPinnedExecutions(ctx, l, temporalClient, workerDeploy, workerDeploymentName, resp.Info.VersionSummaries)
+		if err != nil {
+			// Unknown counts as still-pinned. The budget bounds the wait either way, so a
+			// visibility store that is down delays teardown instead of stranding silently.
+			return fmt.Errorf("%w: %v", errTeardownWaiting, err)
+		}
+		if pinned > 0 {
+			r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
+			return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
+		}
+
+		// Nothing pinned: the workers can go, and the version records with them.
+		if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
+			return err
+		}
+	}
+
+	// Step 4: Delete the version records. SkipDrainage stays on: the gate above reads the
+	// same signal drainage is derived from but fresher, since drainage flips to DRAINING
+	// the moment routing moves and only clears on a refresh cycle. By here the count is
+	// clean or the budget has expired, and the expired path records each version first.
+	// A failed delete (e.g. active pollers, cached for minutes after the last poll)
+	// returns an error so the reconciler requeues.
 	for _, version := range resp.Info.VersionSummaries {
 		buildID := version.Version.BuildID
+		if forceTeardown {
+			r.recordPinnedExecutions(ctx, l, temporalClient, workerDeploy, workerDeploymentName, buildID)
+		}
 		l.Info("Deleting worker deployment version", "buildID", buildID)
 		if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
 			BuildID:      buildID,
@@ -648,7 +695,7 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 		}
 	}
 
-	// Step 4: Delete the deployment itself. This only succeeds if all versions are gone.
+	// Step 5: Delete the deployment itself. This only succeeds if all versions are gone.
 	l.Info("Attempting to delete worker deployment from Temporal server", "name", workerDeploymentName)
 	if _, err := temporalClient.WorkerDeploymentClient().Delete(ctx, sdkclient.WorkerDeploymentDeleteOptions{
 		Name:     workerDeploymentName,
@@ -658,6 +705,176 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	}
 
 	return nil
+}
+
+// errTeardownWaiting marks a teardown that is deliberately incomplete: the TWD still
+// has work pinned to it, or routing moved too recently to count. Reconcile requeues on
+// it without logging a failure, since nothing has gone wrong.
+var errTeardownWaiting = errors.New("teardown waiting")
+
+// teardownBudgetExpired reports whether the wait for pinned executions has run out.
+// The deadline is derived from deletionTimestamp rather than tracked in status, so it
+// survives a controller restart and cannot drift. A zero timeout disables the wait.
+func teardownBudgetExpired(workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+	timeout := workerDeploy.Spec.SunsetStrategy.TeardownDrainageTimeout
+	if timeout == nil || timeout.Duration <= 0 {
+		return true
+	}
+	deletedAt := workerDeploy.DeletionTimestamp
+	if deletedAt == nil || deletedAt.IsZero() {
+		return true
+	}
+	return time.Since(deletedAt.Time) >= timeout.Duration
+}
+
+// countPinnedExecutions totals the open executions pinned to any of the given versions.
+// An error means the total is unknown, never that it is zero.
+func (r *TemporalWorkerDeploymentReconciler) countPinnedExecutions(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	deploymentName string,
+	versions []sdkclient.WorkerDeploymentVersionSummary,
+) (int64, error) {
+	var total int64
+	for _, version := range versions {
+		buildID := version.Version.BuildID
+		query := pinnedExecutionQuery(deploymentName, buildID)
+		resp, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+			Namespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+			Query:     query,
+		})
+		if err != nil {
+			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonPinnedExecutionCheckFailed,
+				"Could not check version %s for open pinned executions: %v", buildID, err)
+			return 0, fmt.Errorf("unable to count pinned executions on version %s: %w", buildID, err)
+		}
+		if n := resp.GetCount(); n > 0 {
+			l.Info("version still has open pinned executions, holding teardown",
+				"buildID", buildID, "pinnedExecutions", n, "query", query)
+			total += n
+		}
+	}
+	return total, nil
+}
+
+// recordTeardownHeld makes the wait legible from outside. A TWD that sits in
+// Terminating with no explanation reads as a wedged finalizer, which is what the
+// operator would otherwise start debugging. Emitted once per transition, not once per
+// requeue, so a long wait does not flood the event stream.
+func (r *TemporalWorkerDeploymentReconciler) recordTeardownHeld(
+	ctx context.Context,
+	l logr.Logger,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	pinned int64,
+) {
+	msg := fmt.Sprintf("Waiting for %d open pinned execution(s) to finish before tearing down workers", pinned)
+	changed := meta.SetStatusCondition(&workerDeploy.Status.Conditions, metav1.Condition{
+		Type:               temporaliov1alpha1.ConditionReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: workerDeploy.Generation,
+		Reason:             ReasonTeardownDrainingPinnedExecutions,
+		Message:            msg,
+	})
+	if !changed {
+		return
+	}
+	r.Recorder.Eventf(workerDeploy, corev1.EventTypeNormal, ReasonTeardownDrainingPinnedExecutions, "%s", msg)
+	if err := r.Status().Update(ctx, workerDeploy); err != nil {
+		// The condition is a convenience; the log line above is the record that matters.
+		l.V(1).Info("unable to record teardown-held condition", "error", err)
+	}
+}
+
+// pinnedExecutionQuery matches open executions pinned to one deployment version.
+func pinnedExecutionQuery(deploymentName, buildID string) string {
+	return fmt.Sprintf(
+		`ExecutionStatus="Running" AND TemporalWorkerDeploymentVersion="%s:%s"`,
+		deploymentName, buildID,
+	)
+}
+
+// pinnedExecutionQuerier is the subset of the Temporal client used to find open
+// workflows pinned to a version. Narrowed so the check is testable without a server.
+type pinnedExecutionQuerier interface {
+	CountWorkflow(context.Context, *workflowservice.CountWorkflowExecutionsRequest) (*workflowservice.CountWorkflowExecutionsResponse, error)
+	ListWorkflow(context.Context, *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error)
+}
+
+// strandedSampleLimit caps the workflow IDs recorded per version. The full set is
+// recoverable by re-running the logged query; the sample exists so an operator has
+// something to act on without that round trip.
+const strandedSampleLimit = 20
+
+// recordPinnedExecutions records any open executions pinned to buildID before it is
+// force-deleted. Their workflow tasks route by exact version match and a task on a
+// base task queue has no schedule-to-start timeout, so once the version is gone
+// nothing dispatches them again and nothing expires them. The delete still proceeds
+// (blocking teardown would hold the TWD in Terminating for as long as the longest
+// pinned workflow runs), but it no longer proceeds silently.
+//
+// The log line is the durable record: this runs inside the finalizer, so the TWD is
+// deleted moments later and any status condition written here would go with it.
+func (r *TemporalWorkerDeploymentReconciler) recordPinnedExecutions(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	deploymentName, buildID string,
+) {
+	ns := workerDeploy.Spec.WorkerOptions.TemporalNamespace
+	query := pinnedExecutionQuery(deploymentName, buildID)
+
+	countResp, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+		Namespace: ns,
+		Query:     query,
+	})
+	if err != nil {
+		l.Error(err, "unable to check for pinned executions before force-deleting version, proceeding",
+			"buildID", buildID, "query", query)
+		r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonPinnedExecutionCheckFailed,
+			"Could not check version %s for open pinned executions before force-deleting it: %v",
+			buildID, err)
+		return
+	}
+	if countResp.GetCount() == 0 {
+		return
+	}
+
+	ids := listPinnedExecutionIDs(ctx, l, c, ns, query)
+	l.Info("force-deleting worker deployment version with open pinned executions",
+		"buildID", buildID,
+		"pinnedExecutions", countResp.GetCount(),
+		"workflowIDs", ids,
+		"query", query)
+	r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonPinnedExecutionsStranded,
+		"Force-deleting version %s with %d open pinned execution(s). They will not make progress until re-pinned to a live version. Sampled %d: %s",
+		buildID, countResp.GetCount(), len(ids), strings.Join(ids, ", "))
+}
+
+// listPinnedExecutionIDs samples the workflow IDs matching query. A failure here
+// costs the sample, not the count, so it is logged and swallowed.
+func listPinnedExecutionIDs(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	ns, query string,
+) []string {
+	resp, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: ns,
+		PageSize:  strandedSampleLimit,
+		Query:     query,
+	})
+	if err != nil {
+		l.Error(err, "unable to sample pinned execution IDs, count is still recorded", "query", query)
+		return nil
+	}
+	ids := make([]string, 0, len(resp.GetExecutions()))
+	for _, e := range resp.GetExecutions() {
+		ids = append(ids, e.GetExecution().GetWorkflowId())
+	}
+	return ids
 }
 
 // setCondition sets a condition on the TemporalWorkerDeployment status.

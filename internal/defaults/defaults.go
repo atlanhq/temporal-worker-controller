@@ -12,6 +12,11 @@ const (
 	ServerMaxVersions                = 100
 	MaxVersionsIneligibleForDeletion = int32(ServerMaxVersions * 0.75)
 
+	// TeardownDrainageTimeout bounds how long TWD deletion waits for open pinned
+	// executions. Long enough to cover short activities, short enough that a TWD
+	// deleted by a failed Helm upgrade releases its name before the retry reinstalls.
+	TeardownDrainageTimeout = 15 * time.Minute
+
 	// ToBeDeprecatedDefaultControllerIdentity will stop being used in the next release.
 	ToBeDeprecatedDefaultControllerIdentity = "temporal-worker-controller"
 )
