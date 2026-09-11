@@ -13,9 +13,11 @@ const (
 	MaxVersionsIneligibleForDeletion = int32(ServerMaxVersions * 0.75)
 
 	// TeardownDrainageTimeout bounds how long TWD deletion waits for open pinned
-	// executions. Long enough to cover short activities, short enough that a TWD
-	// deleted by a failed Helm upgrade releases its name before the retry reinstalls.
-	TeardownDrainageTimeout = 15 * time.Minute
+	// executions before terminating them. Sized to outlast a collateral uninstall:
+	// on 2026-08-31 Flux reinstalled 20 minutes after remediating its own timeout, and
+	// terminating inside that window would end work the returning workers could have
+	// finished. The cost of the longer wait is only that the object holds its name.
+	TeardownDrainageTimeout = 30 * time.Minute
 
 	// ToBeDeprecatedDefaultControllerIdentity will stop being used in the next release.
 	ToBeDeprecatedDefaultControllerIdentity = "temporal-worker-controller"

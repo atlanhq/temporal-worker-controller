@@ -33,6 +33,7 @@ const (
 	ReasonPinnedExecutionCheckFailed = "PinnedExecutionCheckFailed"
 
 	ReasonTeardownDrainingPinnedExecutions = "TeardownDrainingPinnedExecutions"
+	ReasonPinnedExecutionsTerminated       = "PinnedExecutionsTerminated"
 )
 
 const (

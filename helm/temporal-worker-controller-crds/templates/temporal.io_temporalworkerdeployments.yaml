@@ -143,7 +143,7 @@ spec:
                     default: 1h
                     type: string
                   teardownDrainageTimeout:
-                    default: 15m
+                    default: 30m
                     type: string
                 type: object
               template:

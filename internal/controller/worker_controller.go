@@ -540,7 +540,8 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	// budget runs out. Past the budget the teardown is unconditional and runs before the
 	// Temporal dial, so an unreachable server cannot hold the children hostage - the
 	// original ordering, kept as the fallback rather than the default.
-	forceTeardown := teardownBudgetExpired(workerDeploy)
+	disposition := teardownDispositionFor(workerDeploy)
+	forceTeardown := disposition != teardownWait
 	if forceTeardown {
 		if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
 			return err
@@ -682,8 +683,19 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	// returns an error so the reconciler requeues.
 	for _, version := range resp.Info.VersionSummaries {
 		buildID := version.Version.BuildID
-		if forceTeardown {
+		// Abandoning is the only path that leaves a strand, so it is the only one that
+		// records one. The terminate path logs each execution as it ends it.
+		if disposition == teardownAbandon {
 			r.recordPinnedExecutions(ctx, l, temporalClient, workerDeploy, workerDeploymentName, buildID)
+		}
+		// End what is still pinned before the version record goes, so nothing is left
+		// holding a task that can never be dispatched. Returning the error requeues:
+		// deleting the version after a failed terminate would recreate the hang this
+		// exists to prevent.
+		if disposition == teardownTerminate {
+			if err := r.terminatePinnedExecutions(ctx, l, temporalClient, workerDeploy, workerDeploymentName, buildID); err != nil {
+				return err
+			}
 		}
 		l.Info("Deleting worker deployment version", "buildID", buildID)
 		if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
@@ -712,19 +724,108 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 // it without logging a failure, since nothing has gone wrong.
 var errTeardownWaiting = errors.New("teardown waiting")
 
-// teardownBudgetExpired reports whether the wait for pinned executions has run out.
-// The deadline is derived from deletionTimestamp rather than tracked in status, so it
-// survives a controller restart and cannot drift. A zero timeout disables the wait.
-func teardownBudgetExpired(workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+// teardownDisposition is what this pass is allowed to do about executions still
+// pinned to the versions being deleted.
+type teardownDisposition int
+
+const (
+	// teardownWait keeps the workers (and their ScaledObjects) alive so pinned
+	// executions can finish.
+	teardownWait teardownDisposition = iota
+	// teardownTerminate ends whatever is still open, because the workers are going
+	// anyway and an execution pinned to a deleted version hangs forever otherwise.
+	teardownTerminate
+	// teardownAbandon deletes without waiting and without terminating: the behaviour
+	// from before this wait existed. Reached only when no budget is configured, so a
+	// controller running ahead of its CRD changes nothing.
+	teardownAbandon
+)
+
+// teardownDispositionFor decides which of the three applies. The deadline is derived
+// from deletionTimestamp rather than tracked in status, so it survives a controller
+// restart and cannot drift.
+//
+// An unset timeout means the CRD predates this feature: abandon, exactly as before. A
+// zero timeout is an explicit "don't wait": terminate immediately and tear down.
+func teardownDispositionFor(workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment) teardownDisposition {
 	timeout := workerDeploy.Spec.SunsetStrategy.TeardownDrainageTimeout
-	if timeout == nil || timeout.Duration <= 0 {
-		return true
+	if timeout == nil {
+		return teardownAbandon
+	}
+	if timeout.Duration <= 0 {
+		return teardownTerminate
 	}
 	deletedAt := workerDeploy.DeletionTimestamp
 	if deletedAt == nil || deletedAt.IsZero() {
-		return true
+		return teardownAbandon
 	}
-	return time.Since(deletedAt.Time) >= timeout.Duration
+	if time.Since(deletedAt.Time) >= timeout.Duration {
+		return teardownTerminate
+	}
+	return teardownWait
+}
+
+// terminatePinnedExecutions ends every open execution pinned to buildID. Called only
+// when the workers are being removed regardless: a pinned execution whose version is
+// gone has no worker to dispatch its tasks and no schedule-to-start timeout to expire
+// them, so terminating is what turns a permanent silent hang into a closed workflow
+// that shows up as terminated, can be alerted on, and can be retried.
+//
+// Terminate rather than cancel: cancellation has to be processed by a worker, and by
+// here the workers are already down. The cost is that no compensation logic runs, so
+// whatever the execution had half-written in the data plane stays half-written - the
+// same as today, where it stays half-written forever with the workflow still open.
+func (r *TemporalWorkerDeploymentReconciler) terminatePinnedExecutions(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionTerminator,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	deploymentName, buildID string,
+) error {
+	ns := workerDeploy.Spec.WorkerOptions.TemporalNamespace
+	query := pinnedExecutionQuery(deploymentName, buildID)
+	reason := fmt.Sprintf(
+		"TemporalWorkerDeployment %s/%s deleted; workers for version %s:%s removed after the teardown drainage budget expired",
+		workerDeploy.Namespace, workerDeploy.Name, deploymentName, buildID)
+
+	var terminated int
+	var nextPage []byte
+	for {
+		resp, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+			Namespace:     ns,
+			Query:         query,
+			NextPageToken: nextPage,
+		})
+		if err != nil {
+			return fmt.Errorf("unable to list pinned executions on version %s: %w", buildID, err)
+		}
+		for _, e := range resp.GetExecutions() {
+			id := e.GetExecution().GetWorkflowId()
+			runID := e.GetExecution().GetRunId()
+			if err := c.TerminateWorkflow(ctx, id, runID, reason); err != nil {
+				// Already closed between the list and the terminate: nothing to end.
+				var notFound *serviceerror.NotFound
+				if errors.As(err, &notFound) {
+					continue
+				}
+				return fmt.Errorf("unable to terminate pinned execution %s: %w", id, err)
+			}
+			l.Info("terminated execution pinned to a version being deleted",
+				"workflowID", id, "runID", runID, "buildID", buildID)
+			terminated++
+		}
+		nextPage = resp.GetNextPageToken()
+		if len(nextPage) == 0 {
+			break
+		}
+	}
+
+	if terminated > 0 {
+		r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonPinnedExecutionsTerminated,
+			"Terminated %d open pinned execution(s) on version %s; its workers are being removed. Query: %s",
+			terminated, buildID, query)
+	}
+	return nil
 }
 
 // countPinnedExecutions totals the open executions pinned to any of the given versions.
@@ -800,6 +901,12 @@ func pinnedExecutionQuery(deploymentName, buildID string) string {
 type pinnedExecutionQuerier interface {
 	CountWorkflow(context.Context, *workflowservice.CountWorkflowExecutionsRequest) (*workflowservice.CountWorkflowExecutionsResponse, error)
 	ListWorkflow(context.Context, *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error)
+}
+
+// pinnedExecutionTerminator adds the one write the teardown makes to workflow state.
+type pinnedExecutionTerminator interface {
+	pinnedExecutionQuerier
+	TerminateWorkflow(ctx context.Context, workflowID, runID, reason string, details ...interface{}) error
 }
 
 // strandedSampleLimit caps the workflow IDs recorded per version. The full set is
