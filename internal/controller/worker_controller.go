@@ -19,6 +19,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
+	sdkworker "go.temporal.io/sdk/worker"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	appsv1 "k8s.io/api/apps/v1"
@@ -531,6 +532,11 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 	return nil
 }
 
+// sharedReleaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers
+// before trusting a count of zero pinned executions: long enough for an execution started just
+// before the deletion to complete its first workflow task, including a scale-up from zero.
+const sharedReleaseSettle = time.Minute
+
 // sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
 func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
 	ctx context.Context,
@@ -554,41 +560,62 @@ func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
 	return false, nil
 }
 
-// releaseSharedDeployment waits for executions pinned to this TWD's own builds, then deletes only its own workers.
+// ownVersions returns the Worker Deployment versions this TWD's own workers poll, grouped by
+// Worker Deployment name. They come from its child Deployments rather than the server, so a
+// transient describe failure cannot release workers that pinned work still needs.
+func (r *TemporalWorkerDeploymentReconciler) ownVersions(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (map[string][]sdkclient.WorkerDeploymentVersionSummary, error) {
+	var children appsv1.DeploymentList
+	if err := r.List(ctx, &children, client.InNamespace(workerDeploy.Namespace),
+		client.MatchingFields{deployOwnerKey: workerDeploy.Name}); err != nil {
+		return nil, fmt.Errorf("unable to list child deployments: %w", err)
+	}
+	versions := map[string][]sdkclient.WorkerDeploymentVersionSummary{}
+	seen := map[sdkworker.WorkerDeploymentVersion]bool{}
+	for i := range children.Items {
+		v := sdkworker.WorkerDeploymentVersion{
+			DeploymentName: k8s.WorkerDeploymentNameFromDeployment(&children.Items[i]),
+			BuildID:        children.Items[i].Labels[k8s.BuildIDLabel],
+		}
+		if v.DeploymentName == "" {
+			v.DeploymentName = k8s.ComputeWorkerDeploymentName(workerDeploy)
+		}
+		if v.BuildID == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		versions[v.DeploymentName] = append(versions[v.DeploymentName], sdkclient.WorkerDeploymentVersionSummary{Version: v})
+	}
+	return versions, nil
+}
+
+// releaseSharedDeployment waits for executions pinned to the versions this TWD's own workers
+// poll, then deletes only those workers. An execution is only counted once its first workflow
+// task pins it and visibility indexes it, so a count of zero is trusted only after the deletion
+// has had sharedReleaseSettle to show up.
 func (r *TemporalWorkerDeploymentReconciler) releaseSharedDeployment(
 	ctx context.Context,
 	l logr.Logger,
 	c pinnedExecutionQuerier,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
-	deploymentName string,
-	versions []sdkclient.WorkerDeploymentVersionSummary,
-	forceTeardown bool,
+	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
 ) error {
-	l.Info("Worker Deployment is shared with other TWDs, releasing only this TWD's workers", "workerDeploymentName", deploymentName)
-	if !forceTeardown {
-		var children appsv1.DeploymentList
-		if err := r.List(ctx, &children, client.InNamespace(workerDeploy.Namespace),
-			client.MatchingFields{deployOwnerKey: workerDeploy.Name}); err != nil {
-			return fmt.Errorf("unable to list child deployments: %w", err)
-		}
-		own := map[string]bool{}
-		for i := range children.Items {
-			own[children.Items[i].Labels[k8s.BuildIDLabel]] = true
-		}
-		var owned []sdkclient.WorkerDeploymentVersionSummary
-		for _, v := range versions {
-			if own[v.Version.BuildID] {
-				owned = append(owned, v)
-			}
-		}
-		pinned, err := r.countPinnedExecutions(ctx, l, c, workerDeploy, deploymentName, owned)
+	var pinned int64
+	for name, vs := range versions {
+		n, err := r.countPinnedExecutions(ctx, l, c, workerDeploy, name, vs)
 		if err != nil {
 			return fmt.Errorf("%w: %v", errTeardownWaiting, err)
 		}
-		if pinned > 0 {
-			r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
-			return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
-		}
+		pinned += n
+	}
+	if pinned > 0 {
+		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
+		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
+	}
+	if time.Since(workerDeploy.DeletionTimestamp.Time) < sharedReleaseSettle {
+		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
 	}
 	return r.teardownChildren(ctx, l, workerDeploy)
 }
@@ -607,6 +634,29 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	if forceTeardown {
 		if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
 			return err
+		}
+	}
+
+	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave
+	// them to the siblings and release only this TWD's workers.
+	shared, err := r.sharesWorkerDeployment(ctx, workerDeploy)
+	if err != nil {
+		return err
+	}
+	var ownVersions map[string][]sdkclient.WorkerDeploymentVersionSummary
+	if shared {
+		l.Info("Worker Deployment is shared with other TWDs, releasing only this TWD's workers",
+			"workerDeploymentName", k8s.ComputeWorkerDeploymentName(workerDeploy))
+		if forceTeardown {
+			return nil
+		}
+		if ownVersions, err = r.ownVersions(ctx, workerDeploy); err != nil {
+			return err
+		}
+		// With no workers left there is nothing for pinned work to run on, so there is nothing to
+		// wait for and no reason to depend on the Temporal server.
+		if len(ownVersions) == 0 {
+			return r.teardownChildren(ctx, l, workerDeploy)
 		}
 	}
 
@@ -649,6 +699,10 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 		temporalClient = c
 	}
 
+	if shared {
+		return r.releaseSharedDeployment(ctx, l, temporalClient, workerDeploy, ownVersions)
+	}
+
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(workerDeploy)
 	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(workerDeploymentName)
 
@@ -661,15 +715,6 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			return nil
 		}
 		return fmt.Errorf("unable to describe worker deployment: %w", err)
-	}
-
-	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave them to the siblings.
-	shared, err := r.sharesWorkerDeployment(ctx, workerDeploy)
-	if err != nil {
-		return err
-	}
-	if shared {
-		return r.releaseSharedDeployment(ctx, l, temporalClient, workerDeploy, workerDeploymentName, resp.Info.VersionSummaries, forceTeardown)
 	}
 
 	routingConfig := resp.Info.RoutingConfig
