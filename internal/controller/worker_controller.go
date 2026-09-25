@@ -531,11 +531,45 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 	return nil
 }
 
+// sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
+func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (bool, error) {
+	var twds temporaliov1alpha1.TemporalWorkerDeploymentList
+	if err := r.List(ctx, &twds, client.InNamespace(workerDeploy.Namespace)); err != nil {
+		return false, fmt.Errorf("unable to list TemporalWorkerDeployments: %w", err)
+	}
+	name := k8s.ComputeWorkerDeploymentName(workerDeploy)
+	for i := range twds.Items {
+		other := &twds.Items[i]
+		if other.UID == workerDeploy.UID || !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if other.Spec.WorkerOptions.TemporalNamespace == workerDeploy.Spec.WorkerOptions.TemporalNamespace &&
+			k8s.ComputeWorkerDeploymentName(other) == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	ctx context.Context,
 	l logr.Logger,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
+	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave them to the siblings.
+	shared, err := r.sharesWorkerDeployment(ctx, workerDeploy)
+	if err != nil {
+		return err
+	}
+	if shared {
+		l.Info("Worker Deployment is shared with other TWDs, releasing only this TWD's workers",
+			"workerDeploymentName", k8s.ComputeWorkerDeploymentName(workerDeploy))
+		return r.teardownChildren(ctx, l, workerDeploy)
+	}
+
 	// Workers are torn down once nothing is pinned to them any more, or once the drainage
 	// budget runs out. Past the budget the teardown is unconditional and runs before the
 	// Temporal dial, so an unreachable server cannot hold the children hostage - the
