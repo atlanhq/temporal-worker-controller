@@ -478,6 +478,9 @@ func (r *TemporalWorkerDeploymentReconciler) markWRTsTWDNotFound(ctx context.Con
 //  4. Delete all registered versions (with SkipDrainage, now that the wait has cleared them)
 //  5. Delete the deployment record itself once all versions are gone
 //
+// When a live sibling TWD shares the Worker Deployment name, steps 1, 2, 4 and 5 are left to
+// the siblings and only this TWD's own workers are released (see releaseSharedDeployment).
+//
 // teardownChildren deletes the TWD's owned ScaledObjects and child Deployments.
 // Without this, deletion deadlocks: the children are owner-referenced to the TWD,
 // so garbage collection only removes them AFTER the TWD object goes away - which
@@ -572,6 +575,7 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 		client.MatchingFields{deployOwnerKey: workerDeploy.Name}); err != nil {
 		return nil, fmt.Errorf("unable to list child deployments: %w", err)
 	}
+	fallbackName := k8s.ComputeWorkerDeploymentName(workerDeploy)
 	versions := map[string][]sdkclient.WorkerDeploymentVersionSummary{}
 	seen := map[sdkworker.WorkerDeploymentVersion]bool{}
 	for i := range children.Items {
@@ -580,7 +584,7 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 			BuildID:        children.Items[i].Labels[k8s.BuildIDLabel],
 		}
 		if v.DeploymentName == "" {
-			v.DeploymentName = k8s.ComputeWorkerDeploymentName(workerDeploy)
+			v.DeploymentName = fallbackName
 		}
 		if v.BuildID == "" || seen[v] {
 			continue
