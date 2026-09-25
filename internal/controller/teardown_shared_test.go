@@ -13,12 +13,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
+	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -46,6 +48,7 @@ func sharedTestClient(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objs...).
+		WithStatusSubresource(&temporaliov1alpha1.TemporalWorkerDeployment{}).
 		WithIndex(&appsv1.Deployment{}, deployOwnerKey, func(rawObj client.Object) []string {
 			if owner := metav1.GetControllerOf(rawObj.(*appsv1.Deployment)); owner != nil {
 				return []string{owner.Name}
@@ -77,34 +80,67 @@ func TestSharesWorkerDeployment(t *testing.T) {
 	}
 }
 
-// A TWD leaving a shared Worker Deployment must release its own workers without
-// touching Temporal: the reconciler has no Temporal client here, so any server
-// call would panic.
-func TestHandleDeletion_SharedDeploymentReleasesOnlyOwnWorkers(t *testing.T) {
-	deleting := sharedTWD("app-size-s-twd", "app", true)
-	sibling := sharedTWD("app-worker-twd", "app", false)
+func ownedWorkers(twd *temporaliov1alpha1.TemporalWorkerDeployment, name, buildID string) *appsv1.Deployment {
 	ctrl := true
-	owned := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
-		Name: "app-size-s-twd-v1", Namespace: "app-ns",
+	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: name, Namespace: "app-ns", Labels: map[string]string{k8s.BuildIDLabel: buildID},
 		OwnerReferences: []metav1.OwnerReference{{
 			APIVersion: temporaliov1alpha1.GroupVersion.String(), Kind: "TemporalWorkerDeployment",
-			Name: deleting.Name, UID: deleting.UID, Controller: &ctrl,
+			Name: twd.Name, UID: twd.UID, Controller: &ctrl,
 		}},
 	}}
-	siblings := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
-		Name: "app-worker-twd-v1", Namespace: "app-ns",
-		OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: temporaliov1alpha1.GroupVersion.String(), Kind: "TemporalWorkerDeployment",
-			Name: sibling.Name, UID: sibling.UID, Controller: &ctrl,
-		}},
-	}}
-	r := &TemporalWorkerDeploymentReconciler{Client: sharedTestClient(t, deleting, sibling, owned, siblings)}
+}
 
-	require.NoError(t, r.handleDeletion(context.Background(), logr.Discard(), deleting))
-
+func exists(t *testing.T, c client.Client, name string) bool {
+	t.Helper()
 	var d appsv1.Deployment
-	err := r.Get(context.Background(), types.NamespacedName{Namespace: "app-ns", Name: owned.Name}, &d)
-	assert.True(t, apierrors.IsNotFound(err), "the deleted TWD's own workers must go")
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "app-ns", Name: siblings.Name}, &d),
-		"the sibling's workers must stay")
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "app-ns", Name: name}, &d)
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
+
+// A TWD leaving a shared Worker Deployment holds while its own build still has pinned
+// work, and counts nothing but its own build: the siblings' builds stay live.
+func TestReleaseSharedDeployment_HoldsOnOwnBuildOnly(t *testing.T) {
+	leaving := sharedTWD("app-size-s-twd", "app", true)
+	sibling := sharedTWD("app-worker-twd", "app", false)
+	c := sharedTestClient(t, leaving, sibling,
+		ownedWorkers(leaving, "app-size-s-twd-old", "old"), ownedWorkers(sibling, "app-worker-twd-new", "new"))
+	r := &TemporalWorkerDeploymentReconciler{Client: c, Recorder: record.NewFakeRecorder(10)}
+	q := &fakePinnedQuerier{count: 1}
+
+	err := r.releaseSharedDeployment(context.Background(), logr.Discard(), q, leaving, "app", versions("old", "new"), false)
+
+	require.ErrorIs(t, err, errTeardownWaiting)
+	require.Len(t, q.countQueries, 1, "only this TWD's own build may be counted")
+	assert.Contains(t, q.countQueries[0], `"app:old"`)
+	assert.True(t, exists(t, c, "app-size-s-twd-old"), "workers stay up while their pinned work runs")
+}
+
+func TestReleaseSharedDeployment_ReleasesOnlyOwnWorkers(t *testing.T) {
+	leaving := sharedTWD("app-size-s-twd", "app", true)
+	sibling := sharedTWD("app-worker-twd", "app", false)
+	c := sharedTestClient(t, leaving, sibling,
+		ownedWorkers(leaving, "app-size-s-twd-old", "old"), ownedWorkers(sibling, "app-worker-twd-new", "new"))
+	r := &TemporalWorkerDeploymentReconciler{Client: c}
+
+	require.NoError(t, r.releaseSharedDeployment(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, "app", versions("old", "new"), false))
+
+	assert.False(t, exists(t, c, "app-size-s-twd-old"), "the leaving TWD's workers must go")
+	assert.True(t, exists(t, c, "app-worker-twd-new"), "the sibling's workers must stay")
+}
+
+func TestReleaseSharedDeployment_ForcedSkipsCount(t *testing.T) {
+	leaving := sharedTWD("app-size-s-twd", "app", true)
+	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-old", "old"))
+	r := &TemporalWorkerDeploymentReconciler{Client: c}
+	q := &fakePinnedQuerier{count: 5}
+
+	require.NoError(t, r.releaseSharedDeployment(context.Background(), logr.Discard(), q, leaving, "app", versions("old"), true))
+
+	assert.Empty(t, q.countQueries)
+	assert.False(t, exists(t, c, "app-size-s-twd-old"))
 }
