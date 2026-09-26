@@ -478,8 +478,9 @@ func (r *TemporalWorkerDeploymentReconciler) markWRTsTWDNotFound(ctx context.Con
 //  4. Delete all registered versions (with SkipDrainage, now that the wait has cleared them)
 //  5. Delete the deployment record itself once all versions are gone
 //
-// When a live sibling TWD shares the Worker Deployment name, steps 1, 2, 4 and 5 are left to
-// the siblings and only this TWD's own workers are released (see releaseSharedDeployment).
+// When a live sibling TWD shares the Worker Deployment name, or the server reports no Worker
+// Deployment, steps 1, 2, 4 and 5 are skipped and only this TWD's own workers are released
+// (see releaseOwnWorkers).
 //
 // teardownChildren deletes the TWD's owned ScaledObjects and child Deployments.
 // Without this, deletion deadlocks: the children are owner-referenced to the TWD,
@@ -535,10 +536,15 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 	return nil
 }
 
-// sharedReleaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers
-// before trusting a count of zero pinned executions: long enough for an execution started just
-// before the deletion to complete its first workflow task, including a scale-up from zero.
-const sharedReleaseSettle = time.Minute
+// releaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers before
+// trusting a count of zero pinned executions: long enough for an execution started just before
+// the deletion to complete its first workflow task, including a scale-up from zero.
+const releaseSettle = time.Minute
+
+// notFoundSettle is how long a TWD whose Worker Deployment the server reports as not found keeps
+// its workers before trusting that report, which the server can give transiently. It only has to
+// outlast that, since each held pass describes the Worker Deployment again.
+const notFoundSettle = 30 * time.Second
 
 // sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
 func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
@@ -595,16 +601,17 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 	return versions, nil
 }
 
-// releaseSharedDeployment waits for executions pinned to the versions this TWD's own workers
+// releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
 // poll, then deletes only those workers. An execution is only counted once its first workflow
-// task pins it and visibility indexes it, so a count of zero is trusted only after the deletion
-// has had sharedReleaseSettle to show up.
-func (r *TemporalWorkerDeploymentReconciler) releaseSharedDeployment(
+// task pins it and visibility indexes it, so while the Worker Deployment is still in use a count
+// of zero is trusted only after the deletion is settle old.
+func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	ctx context.Context,
 	l logr.Logger,
 	c pinnedExecutionQuerier,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+	settle time.Duration,
 ) error {
 	var pinned int64
 	for name, vs := range versions {
@@ -618,7 +625,7 @@ func (r *TemporalWorkerDeploymentReconciler) releaseSharedDeployment(
 		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
 		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
 	}
-	if time.Since(workerDeploy.DeletionTimestamp.Time) < sharedReleaseSettle {
+	if time.Since(workerDeploy.DeletionTimestamp.Time) < settle {
 		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
 	}
 	return r.teardownChildren(ctx, l, workerDeploy)
@@ -704,7 +711,7 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	}
 
 	if shared {
-		return r.releaseSharedDeployment(ctx, l, temporalClient, workerDeploy, ownVersions)
+		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, releaseSettle)
 	}
 
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(workerDeploy)
@@ -715,8 +722,22 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if errors.As(err, &notFound) {
-			l.Info("Worker Deployment not found on Temporal server, nothing to clean up")
-			return nil
+			l.Info("Worker Deployment not found on Temporal server, releasing only this TWD's workers")
+			if forceTeardown {
+				return nil
+			}
+			// A NotFound can be transient, and until steps 1-2 run the routing may still send new
+			// executions to this TWD's build. So it keeps the workers while anything is pinned to them
+			// and until notFoundSettle has passed; a held pass describes again, and a transient NotFound
+			// then clears and the full cleanup runs.
+			versions, err := r.ownVersions(ctx, workerDeploy)
+			if err != nil {
+				return err
+			}
+			if len(versions) == 0 {
+				return r.teardownChildren(ctx, l, workerDeploy)
+			}
+			return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, versions, notFoundSettle)
 		}
 		return fmt.Errorf("unable to describe worker deployment: %w", err)
 	}

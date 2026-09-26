@@ -14,7 +14,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
+	"github.com/temporalio/temporal-worker-controller/internal/controller/clientpool"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
+	"go.temporal.io/api/workflowservice/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -122,12 +124,12 @@ func release(t *testing.T, r *TemporalWorkerDeploymentReconciler, q pinnedExecut
 	t.Helper()
 	versions, err := r.ownVersions(context.Background(), twd)
 	require.NoError(t, err)
-	return r.releaseSharedDeployment(context.Background(), logr.Discard(), q, twd, versions)
+	return r.releaseOwnWorkers(context.Background(), logr.Discard(), q, twd, versions, releaseSettle)
 }
 
 // Siblings on one release share the build, so the leaving TWD's version is also theirs. Any open
 // execution pinned to it may still schedule work on this TWD's queue, so the TWD holds for it.
-func TestReleaseSharedDeployment_HoldsOnOwnBuild(t *testing.T) {
+func TestReleaseOwnWorkers_HoldsOnOwnBuild(t *testing.T) {
 	leaving := sharedTWD("app-size-s-twd", "app", true)
 	sibling := sharedTWD("app-worker-twd", "app", false)
 	c := sharedTestClient(t, leaving, sibling,
@@ -142,7 +144,7 @@ func TestReleaseSharedDeployment_HoldsOnOwnBuild(t *testing.T) {
 	assert.True(t, exists(t, c, "app-size-s-twd-v1"), "workers stay up while their pinned work runs")
 }
 
-func TestReleaseSharedDeployment_ReleasesOnlyOwnWorkers(t *testing.T) {
+func TestReleaseOwnWorkers_ReleasesOnlyOwnWorkers(t *testing.T) {
 	leaving := sharedTWD("app-size-s-twd", "app", true)
 	sibling := sharedTWD("app-worker-twd", "app", false)
 	c := sharedTestClient(t, leaving, sibling,
@@ -157,7 +159,7 @@ func TestReleaseSharedDeployment_ReleasesOnlyOwnWorkers(t *testing.T) {
 // Pinned work is counted under the name the workers registered with, so workers left over
 // from a workerDeploymentName change are not released while their pinned work still runs.
 // A base Deployment and its variant on the same build are one version and one query.
-func TestReleaseSharedDeployment_CountsEachPolledVersionOnce(t *testing.T) {
+func TestReleaseOwnWorkers_CountsEachPolledVersionOnce(t *testing.T) {
 	leaving := sharedTWD("app-size-s-twd", "app", true)
 	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false),
 		ownedWorkers(leaving, "app-size-s-twd-new", "new", ""),
@@ -171,7 +173,7 @@ func TestReleaseSharedDeployment_CountsEachPolledVersionOnce(t *testing.T) {
 }
 
 // Right after the deletion, an execution may not be pinned or indexed yet, so zero is not trusted.
-func TestReleaseSharedDeployment_ZeroRightAfterDeletionHolds(t *testing.T) {
+func TestReleaseOwnWorkers_ZeroRightAfterDeletionHolds(t *testing.T) {
 	leaving := sharedTWD("app-size-s-twd", "app", true)
 	just := metav1.NewTime(time.Now().Add(-5 * time.Second))
 	leaving.DeletionTimestamp = &just
@@ -183,7 +185,7 @@ func TestReleaseSharedDeployment_ZeroRightAfterDeletionHolds(t *testing.T) {
 	assert.True(t, exists(t, c, "app-size-s-twd-v1"))
 }
 
-func TestReleaseSharedDeployment_CountFailureHolds(t *testing.T) {
+func TestReleaseOwnWorkers_CountFailureHolds(t *testing.T) {
 	leaving := sharedTWD("app-size-s-twd", "app", true)
 	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-old", "old", "app"))
 
@@ -219,4 +221,58 @@ func TestHandleDeletion_SharedPastBudgetNeedsNoTemporal(t *testing.T) {
 
 	assert.False(t, exists(t, c, "app-size-s-twd-old"))
 	assert.True(t, exists(t, c, "app-worker-twd-new"))
+}
+
+// countingTemporalClient answers the pinned-execution count on top of a stub whose Worker
+// Deployment describe fails with NotFound.
+type countingTemporalClient struct {
+	*stubTemporalClient
+	pinned fakePinnedQuerier
+}
+
+func (c *countingTemporalClient) CountWorkflow(ctx context.Context, req *workflowservice.CountWorkflowExecutionsRequest) (*workflowservice.CountWorkflowExecutionsResponse, error) {
+	return c.pinned.CountWorkflow(ctx, req)
+}
+
+// A NotFound from the server can be transient, so a TWD on its own Worker Deployment keeps its
+// workers while executions are pinned to them, and right after its deletion even when none are.
+func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pinned     int64
+		deletedAgo time.Duration
+		wantHeld   bool
+	}{
+		{"pinned execution open", 1, 10 * time.Minute, true},
+		{"nothing pinned, just deleted", 0, time.Second, true},
+		{"nothing pinned, past the settle", 0, time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			twd := sharedTWD("app-worker-twd", "", true)
+			deleted := metav1.NewTime(time.Now().Add(-tc.deletedAgo))
+			twd.DeletionTimestamp = &deleted
+			twd.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
+			twd.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
+			conn := &temporaliov1alpha1.TemporalConnection{
+				ObjectMeta: metav1.ObjectMeta{Name: "conn", Namespace: "app-ns"},
+				Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: "temporal:7233"},
+			}
+			c := sharedTestClient(t, twd, conn, ownedWorkers(twd, "app-worker-twd-v1", "v1", ""))
+			r := sharedReconciler(c)
+			r.TemporalClientPool = clientpool.New(nil, c)
+			stub := &countingTemporalClient{stubTemporalClient: newStubTemporalClient(nil), pinned: fakePinnedQuerier{count: tc.pinned}}
+			r.TemporalClientPool.SetClientForTesting(noCredsPoolKey("temporal:7233", "default"), stub)
+
+			err := r.handleDeletion(context.Background(), logr.Discard(), twd)
+
+			if tc.wantHeld {
+				require.ErrorIs(t, err, errTeardownWaiting)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantHeld, exists(t, c, "app-worker-twd-v1"))
+			require.Len(t, stub.pinned.countQueries, 1)
+			assert.Equal(t, pinnedExecutionQuery(k8s.ComputeWorkerDeploymentName(twd), "v1"), stub.pinned.countQueries[0])
+		})
+	}
 }
