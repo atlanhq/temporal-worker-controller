@@ -19,6 +19,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
+	sdkworker "go.temporal.io/sdk/worker"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	appsv1 "k8s.io/api/apps/v1"
@@ -477,6 +478,10 @@ func (r *TemporalWorkerDeploymentReconciler) markWRTsTWDNotFound(ctx context.Con
 //  4. Delete all registered versions (with SkipDrainage, now that the wait has cleared them)
 //  5. Delete the deployment record itself once all versions are gone
 //
+// When a live sibling TWD shares the Worker Deployment name, or the server reports no Worker
+// Deployment, steps 1, 2, 4 and 5 are skipped and only this TWD's own workers are released
+// (see releaseOwnWorkers).
+//
 // teardownChildren deletes the TWD's owned ScaledObjects and child Deployments.
 // Without this, deletion deadlocks: the children are owner-referenced to the TWD,
 // so garbage collection only removes them AFTER the TWD object goes away - which
@@ -548,6 +553,29 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 		}
 	}
 
+	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave
+	// them to the siblings and release only this TWD's workers.
+	shared, err := r.sharesWorkerDeployment(ctx, workerDeploy)
+	if err != nil {
+		return err
+	}
+	var ownVersions map[string][]sdkclient.WorkerDeploymentVersionSummary
+	if shared {
+		l.Info("Worker Deployment is shared with other TWDs, releasing only this TWD's workers",
+			"workerDeploymentName", k8s.ComputeWorkerDeploymentName(workerDeploy))
+		if forceTeardown {
+			return nil
+		}
+		if ownVersions, err = r.ownVersions(ctx, workerDeploy); err != nil {
+			return err
+		}
+		// With no workers left there is nothing for pinned work to run on, so there is nothing to
+		// wait for and no reason to depend on the Temporal server.
+		if len(ownVersions) == 0 {
+			return r.teardownChildren(ctx, l, workerDeploy)
+		}
+	}
+
 	// Resolve Temporal connection.
 	// The TemporalConnection is guaranteed to exist because we hold a finalizer on it
 	// that prevents deletion while any TWD references it.
@@ -587,6 +615,10 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 		temporalClient = c
 	}
 
+	if shared {
+		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, releaseSettle)
+	}
+
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(workerDeploy)
 	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(workerDeploymentName)
 
@@ -595,8 +627,23 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if errors.As(err, &notFound) {
-			l.Info("Worker Deployment not found on Temporal server, nothing to clean up")
-			return nil
+			l.Info("Worker Deployment not found on Temporal server, skipping routing and version cleanup",
+				"workerDeploymentName", workerDeploymentName)
+			if forceTeardown {
+				return nil
+			}
+			// A NotFound can be transient, and until steps 1-2 run the routing may still send new
+			// executions to this TWD's build. So it keeps the workers while anything is pinned to them
+			// and until notFoundSettle has passed; a held pass describes again, and a transient NotFound
+			// then clears and the full cleanup runs.
+			versions, err := r.ownVersions(ctx, workerDeploy)
+			if err != nil {
+				return err
+			}
+			if len(versions) == 0 {
+				return r.teardownChildren(ctx, l, workerDeploy)
+			}
+			return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, versions, notFoundSettle)
 		}
 		return fmt.Errorf("unable to describe worker deployment: %w", err)
 	}
@@ -717,6 +764,101 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	}
 
 	return nil
+}
+
+// releaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers before
+// trusting a count of zero pinned executions: long enough for an execution started just before
+// the deletion to complete its first workflow task, including a scale-up from zero.
+const releaseSettle = time.Minute
+
+// notFoundSettle is how long a TWD whose Worker Deployment the server reports as not found keeps
+// its workers before trusting that report, which the server can give transiently. It only has to
+// outlast that, since each held pass describes the Worker Deployment again.
+const notFoundSettle = 30 * time.Second
+
+// sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
+func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (bool, error) {
+	var twds temporaliov1alpha1.TemporalWorkerDeploymentList
+	if err := r.List(ctx, &twds, client.InNamespace(workerDeploy.Namespace)); err != nil {
+		return false, fmt.Errorf("unable to list TemporalWorkerDeployments: %w", err)
+	}
+	name := k8s.ComputeWorkerDeploymentName(workerDeploy)
+	for i := range twds.Items {
+		other := &twds.Items[i]
+		if other.UID == workerDeploy.UID || !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if other.Spec.WorkerOptions.TemporalNamespace == workerDeploy.Spec.WorkerOptions.TemporalNamespace &&
+			k8s.ComputeWorkerDeploymentName(other) == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ownVersions returns the Worker Deployment versions this TWD's own workers poll, grouped by
+// Worker Deployment name. They come from its child Deployments rather than the server, so a
+// transient describe failure cannot release workers that pinned work still needs.
+func (r *TemporalWorkerDeploymentReconciler) ownVersions(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (map[string][]sdkclient.WorkerDeploymentVersionSummary, error) {
+	var children appsv1.DeploymentList
+	if err := r.List(ctx, &children, client.InNamespace(workerDeploy.Namespace),
+		client.MatchingFields{deployOwnerKey: workerDeploy.Name}); err != nil {
+		return nil, fmt.Errorf("unable to list child deployments: %w", err)
+	}
+	fallbackName := k8s.ComputeWorkerDeploymentName(workerDeploy)
+	versions := map[string][]sdkclient.WorkerDeploymentVersionSummary{}
+	seen := map[sdkworker.WorkerDeploymentVersion]bool{}
+	for i := range children.Items {
+		v := sdkworker.WorkerDeploymentVersion{
+			DeploymentName: k8s.WorkerDeploymentNameFromDeployment(&children.Items[i]),
+			BuildID:        children.Items[i].Labels[k8s.BuildIDLabel],
+		}
+		if v.DeploymentName == "" {
+			v.DeploymentName = fallbackName
+		}
+		if v.BuildID == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		versions[v.DeploymentName] = append(versions[v.DeploymentName], sdkclient.WorkerDeploymentVersionSummary{Version: v})
+	}
+	return versions, nil
+}
+
+// releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
+// poll, then deletes only those workers. An execution is only counted once its first workflow
+// task pins it and visibility indexes it, so while the Worker Deployment is still in use a count
+// of zero is trusted only after the deletion is settle old.
+func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+	settle time.Duration,
+) error {
+	var pinned int64
+	for name, vs := range versions {
+		n, err := r.countPinnedExecutions(ctx, l, c, workerDeploy, name, vs)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errTeardownWaiting, err)
+		}
+		pinned += n
+	}
+	if pinned > 0 {
+		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
+		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
+	}
+	if time.Since(workerDeploy.DeletionTimestamp.Time) < settle {
+		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
+	}
+	return r.teardownChildren(ctx, l, workerDeploy)
 }
 
 // errTeardownWaiting marks a teardown that is deliberately incomplete: the TWD still

@@ -9,6 +9,7 @@ package internal
 //   - TWD deletion removes finalizer from TemporalConnection when no other TWDs reference it
 //   - TWD is fully deleted from K8s after cleanup (finalizer removed)
 //   - TWD deletion with TemporalConnection deleted simultaneously (Helm race condition) still succeeds
+//   - Deleting one of several TWDs that share a Worker Deployment leaves the siblings' routing alone
 
 import (
 	"context"
@@ -43,6 +44,10 @@ func runDeletionTests(
 
 	t.Run("deletion-removes-connection-finalizer", func(t *testing.T) {
 		testDeletionRemovesConnectionFinalizer(t, k8sClient, ts, testNamespace)
+	})
+
+	t.Run("deletion-on-shared-deployment-keeps-sibling-routing", func(t *testing.T) {
+		testDeletionOnSharedDeploymentKeepsSiblingRouting(t, k8sClient, ts, testNamespace)
 	})
 
 	t.Run("drained-version-pruned-from-temporal-on-sunset", func(t *testing.T) {
@@ -459,4 +464,146 @@ func testDrainedVersionPrunedOnSunset(
 		return nil
 	})
 	t.Logf("Verified: drained v1.0 (buildID=%s) was pruned from the Temporal server on sunset", buildIDv1)
+}
+
+// testDeletionOnSharedDeploymentKeepsSiblingRouting deletes one of two TWDs that share a Worker
+// Deployment and a build. The deleted TWD must finish deleting with only its own workers removed,
+// and the Worker Deployment must keep routing to the build its live sibling runs.
+func testDeletionOnSharedDeploymentKeepsSiblingRouting(
+	t *testing.T,
+	k8sClient client.Client,
+	ts *temporaltest.TestServer,
+	namespace string,
+) {
+	ctx := context.Background()
+	const (
+		sharedName = "del-shared"
+		buildID    = "shared-v1"
+		connName   = "del-shared-conn"
+	)
+
+	newTWD := func(name string) *temporaliov1alpha1.TemporalWorkerDeployment {
+		tc := testhelpers.NewTestCase().
+			WithInput(
+				testhelpers.NewTemporalWorkerDeploymentBuilder().
+					WithAllAtOnceStrategy().
+					WithTargetTemplate("v1.0").
+					WithUnsafeCustomBuildID(buildID),
+			).
+			BuildWithValues(name, namespace, ts.GetDefaultNamespace())
+		twd := tc.GetTWD()
+		twd.Spec.WorkerOptions.WorkerDeploymentName = sharedName
+		twd.Spec.WorkerOptions.TemporalConnectionRef.Name = connName
+		return twd
+	}
+	live, leaving := newTWD("del-shared-live"), newTWD("del-shared-leaving")
+
+	if err := k8sClient.Create(ctx, &temporaliov1alpha1.TemporalConnection{
+		ObjectMeta: metav1.ObjectMeta{Name: connName, Namespace: namespace},
+		Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: ts.GetFrontendHostPort()},
+	}); err != nil {
+		t.Fatalf("failed to create TemporalConnection: %v", err)
+	}
+
+	children := map[string]string{}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{live, leaving} {
+		if err := k8sClient.Create(ctx, twd); err != nil {
+			t.Fatalf("failed to create TWD %s: %v", twd.Name, err)
+		}
+		child := k8s.ComputeVersionedDeploymentName(twd.Name, buildID)
+		children[twd.Name] = child
+		eventually(t, 30*time.Second, time.Second, func() error {
+			var dep appsv1.Deployment
+			return k8sClient.Get(ctx, types.NamespacedName{Name: child, Namespace: namespace}, &dep)
+		})
+		stop := applyDeployment(t, ctx, k8sClient, child, namespace)
+		defer handleStopFuncs(stop)
+	}
+
+	handle := ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(sharedName)
+	currentIsShared := func() error {
+		resp, err := handle.Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
+		if err != nil {
+			return err
+		}
+		if cur := resp.Info.RoutingConfig.CurrentVersion; cur == nil || cur.BuildID != buildID {
+			return fmt.Errorf("current version is %v, want build %s", cur, buildID)
+		}
+		return nil
+	}
+	eventually(t, 60*time.Second, time.Second, currentIsShared)
+
+	// Executions pinned to the shared build may still schedule work on the leaving TWD's queue, so
+	// it holds while any is open, whether started before or after its deletion.
+	temporalClient := ts.GetDefaultClient()
+	startPinned := func(id string) {
+		if _, err := temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+			ID: id, TaskQueue: live.Name,
+		}, testhelpers.WaitForSignalTestWorkflowType); err != nil {
+			t.Fatalf("failed to start workflow %s: %v", id, err)
+		}
+		eventually(t, 30*time.Second, time.Second, func() error {
+			resp, err := temporalClient.DescribeWorkflowExecution(ctx, id, "")
+			if err != nil {
+				return err
+			}
+			if v := resp.GetWorkflowExecutionInfo().GetVersioningInfo(); v.GetDeploymentVersion().GetBuildId() != buildID {
+				return fmt.Errorf("workflow %s not yet pinned to %s: %v", id, buildID, v)
+			}
+			return nil
+		})
+	}
+	release := func(id string) {
+		if err := temporalClient.SignalWorkflow(ctx, id, "", testhelpers.ReleaseTestSignal, nil); err != nil {
+			t.Fatalf("failed to signal workflow %s: %v", id, err)
+		}
+	}
+	cleanup := func(id string) { _ = temporalClient.TerminateWorkflow(ctx, id, "", "test cleanup") }
+	startPinned("del-shared-before")
+	defer cleanup("del-shared-before")
+
+	if err := k8sClient.Delete(ctx, leaving); err != nil {
+		t.Fatalf("failed to delete TWD: %v", err)
+	}
+	deletedAt := time.Now()
+	startPinned("del-shared-after")
+	defer cleanup("del-shared-after")
+
+	stillHeld := func(open string, until time.Time) {
+		for ; time.Now().Before(until); time.Sleep(time.Second) {
+			var held temporaliov1alpha1.TemporalWorkerDeployment
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &held); err != nil {
+				t.Fatalf("leaving TWD was released while %s, pinned to its build, was open: %v", open, err)
+			}
+		}
+	}
+	// Past the controller's one-minute settle, a hold can only come from an open execution.
+	stillHeld("both executions", deletedAt.Add(75*time.Second))
+	release("del-shared-after")
+	stillHeld("del-shared-before", time.Now().Add(15*time.Second))
+	release("del-shared-before")
+
+	eventually(t, 2*time.Minute, time.Second, func() error {
+		var check temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &check); err == nil {
+			return errors.New("leaving TWD still exists")
+		}
+		return nil
+	})
+
+	// The live sibling's controller would restore a cleared current version within a reconcile,
+	// so sample for longer than a few requeues rather than checking once.
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(time.Second) {
+		if err := currentIsShared(); err != nil {
+			t.Fatalf("shared routing changed after a sibling was deleted: %v", err)
+		}
+	}
+
+	var dep appsv1.Deployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: children[live.Name], Namespace: namespace}, &dep); err != nil {
+		t.Fatalf("live sibling's workers must stay: %v", err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: children[leaving.Name], Namespace: namespace}, &dep); err == nil {
+		t.Fatalf("deleted TWD's workers %s must be removed", children[leaving.Name])
+	}
 }
