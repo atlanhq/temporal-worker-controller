@@ -28,7 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func sharedTWD(name, deploymentName string, deleting bool) *temporaliov1alpha1.TemporalWorkerDeployment {
+func leavingTWD(name, deploymentName string, deleting bool) *temporaliov1alpha1.TemporalWorkerDeployment {
 	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "app-ns", UID: types.UID(name + "-uid")},
 	}
@@ -42,7 +42,7 @@ func sharedTWD(name, deploymentName string, deleting bool) *temporaliov1alpha1.T
 	return twd
 }
 
-func sharedTestClient(t *testing.T, objs ...client.Object) client.Client {
+func releaseTestClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	require.NoError(t, temporaliov1alpha1.AddToScheme(scheme))
@@ -67,20 +67,20 @@ func TestSharesWorkerDeployment(t *testing.T) {
 		sibling *temporaliov1alpha1.TemporalWorkerDeployment
 		want    bool
 	}{
-		{"live sibling on the same deployment", sharedTWD("app-heavy-twd", "app", false), true},
-		{"sibling that is also being deleted", sharedTWD("app-heavy-twd", "app", true), false},
-		{"sibling on another deployment", sharedTWD("other-worker-twd", "other", false), false},
-		{"sibling on its own default deployment", sharedTWD("app-heavy-twd", "", false), false},
+		{"live sibling on the same deployment", leavingTWD("app-heavy-twd", "app", false), true},
+		{"sibling that is also being deleted", leavingTWD("app-heavy-twd", "app", true), false},
+		{"sibling on another deployment", leavingTWD("other-worker-twd", "other", false), false},
+		{"sibling on its own default deployment", leavingTWD("app-heavy-twd", "", false), false},
 		{"sibling in another Temporal namespace", func() *temporaliov1alpha1.TemporalWorkerDeployment {
-			twd := sharedTWD("app-heavy-twd", "app", false)
+			twd := leavingTWD("app-heavy-twd", "app", false)
 			twd.Spec.WorkerOptions.TemporalNamespace = "other"
 			return twd
 		}(), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			deleting := sharedTWD("app-size-s-twd", "app", true)
-			r := &TemporalWorkerDeploymentReconciler{Client: sharedTestClient(t, deleting, tc.sibling)}
+			deleting := leavingTWD("app-size-s-twd", "app", true)
+			r := &TemporalWorkerDeploymentReconciler{Client: releaseTestClient(t, deleting, tc.sibling)}
 			got, err := r.sharesWorkerDeployment(context.Background(), deleting)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
@@ -116,7 +116,7 @@ func exists(t *testing.T, c client.Client, name string) bool {
 	return true
 }
 
-func sharedReconciler(c client.Client) *TemporalWorkerDeploymentReconciler {
+func releaseReconciler(c client.Client) *TemporalWorkerDeploymentReconciler {
 	return &TemporalWorkerDeploymentReconciler{Client: c, Recorder: record.NewFakeRecorder(10)}
 }
 
@@ -130,13 +130,13 @@ func release(t *testing.T, r *TemporalWorkerDeploymentReconciler, q pinnedExecut
 // Siblings on one release share the build, so the leaving TWD's version is also theirs. Any open
 // execution pinned to it may still schedule work on this TWD's queue, so the TWD holds for it.
 func TestReleaseOwnWorkers_HoldsOnOwnBuild(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
-	sibling := sharedTWD("app-worker-twd", "app", false)
-	c := sharedTestClient(t, leaving, sibling,
+	leaving := leavingTWD("app-size-s-twd", "app", true)
+	sibling := leavingTWD("app-worker-twd", "app", false)
+	c := releaseTestClient(t, leaving, sibling,
 		ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"), ownedWorkers(sibling, "app-worker-twd-v1", "v1", "app"))
 	q := &fakePinnedQuerier{count: 1}
 
-	err := release(t, sharedReconciler(c), q, leaving)
+	err := release(t, releaseReconciler(c), q, leaving)
 
 	require.ErrorIs(t, err, errTeardownWaiting)
 	require.Len(t, q.countQueries, 1)
@@ -145,12 +145,12 @@ func TestReleaseOwnWorkers_HoldsOnOwnBuild(t *testing.T) {
 }
 
 func TestReleaseOwnWorkers_ReleasesOnlyOwnWorkers(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
-	sibling := sharedTWD("app-worker-twd", "app", false)
-	c := sharedTestClient(t, leaving, sibling,
+	leaving := leavingTWD("app-size-s-twd", "app", true)
+	sibling := leavingTWD("app-worker-twd", "app", false)
+	c := releaseTestClient(t, leaving, sibling,
 		ownedWorkers(leaving, "app-size-s-twd-old", "old", "app"), ownedWorkers(sibling, "app-worker-twd-new", "new", "app"))
 
-	require.NoError(t, release(t, sharedReconciler(c), &fakePinnedQuerier{}, leaving))
+	require.NoError(t, release(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving))
 
 	assert.False(t, exists(t, c, "app-size-s-twd-old"), "the leaving TWD's workers must go")
 	assert.True(t, exists(t, c, "app-worker-twd-new"), "the sibling's workers must stay")
@@ -160,36 +160,36 @@ func TestReleaseOwnWorkers_ReleasesOnlyOwnWorkers(t *testing.T) {
 // from a workerDeploymentName change are not released while their pinned work still runs.
 // A base Deployment and its variant on the same build are one version and one query.
 func TestReleaseOwnWorkers_CountsEachPolledVersionOnce(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
-	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false),
+	leaving := leavingTWD("app-size-s-twd", "app", true)
+	c := releaseTestClient(t, leaving, leavingTWD("app-worker-twd", "app", false),
 		ownedWorkers(leaving, "app-size-s-twd-new", "new", ""),
 		ownedWorkers(leaving, "app-size-s-twd-od-new", "new", "app"),
 		ownedWorkers(leaving, "app-size-s-twd-old", "old", "old-app"))
 	q := &fakePinnedQuerier{}
 
-	require.NoError(t, release(t, sharedReconciler(c), q, leaving))
+	require.NoError(t, release(t, releaseReconciler(c), q, leaving))
 
 	assert.ElementsMatch(t, []string{pinnedExecutionQuery("app", "new"), pinnedExecutionQuery("old-app", "old")}, q.countQueries)
 }
 
 // Right after the deletion, an execution may not be pinned or indexed yet, so zero is not trusted.
 func TestReleaseOwnWorkers_ZeroRightAfterDeletionHolds(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
+	leaving := leavingTWD("app-size-s-twd", "app", true)
 	just := metav1.NewTime(time.Now().Add(-5 * time.Second))
 	leaving.DeletionTimestamp = &just
-	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+	c := releaseTestClient(t, leaving, leavingTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
 
-	err := release(t, sharedReconciler(c), &fakePinnedQuerier{}, leaving)
+	err := release(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving)
 
 	require.ErrorIs(t, err, errTeardownWaiting)
 	assert.True(t, exists(t, c, "app-size-s-twd-v1"))
 }
 
 func TestReleaseOwnWorkers_CountFailureHolds(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
-	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-old", "old", "app"))
+	leaving := leavingTWD("app-size-s-twd", "app", true)
+	c := releaseTestClient(t, leaving, leavingTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-old", "old", "app"))
 
-	err := release(t, sharedReconciler(c), &fakePinnedQuerier{countErr: errors.New("visibility unavailable")}, leaving)
+	err := release(t, releaseReconciler(c), &fakePinnedQuerier{countErr: errors.New("visibility unavailable")}, leaving)
 
 	require.ErrorIs(t, err, errTeardownWaiting)
 	assert.True(t, exists(t, c, "app-size-s-twd-old"))
@@ -198,24 +198,24 @@ func TestReleaseOwnWorkers_CountFailureHolds(t *testing.T) {
 // A shared TWD whose workers are already gone has nothing to wait for, so it is released without
 // a Temporal client: an unreachable server must not hold it for the whole drainage budget.
 func TestHandleDeletion_SharedWithoutWorkersNeedsNoTemporal(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
+	leaving := leavingTWD("app-size-s-twd", "app", true)
 	leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
-	c := sharedTestClient(t, leaving, sharedTWD("app-worker-twd", "app", false))
+	c := releaseTestClient(t, leaving, leavingTWD("app-worker-twd", "app", false))
 
-	require.NoError(t, sharedReconciler(c).handleDeletion(context.Background(), logr.Discard(), leaving))
+	require.NoError(t, releaseReconciler(c).handleDeletion(context.Background(), logr.Discard(), leaving))
 }
 
 // Past the drainage budget a shared TWD only deletes its own workers. It needs no Temporal
 // client for that, and it must not terminate executions pinned to builds its siblings also run.
 func TestHandleDeletion_SharedPastBudgetNeedsNoTemporal(t *testing.T) {
-	leaving := sharedTWD("app-size-s-twd", "app", true)
+	leaving := leavingTWD("app-size-s-twd", "app", true)
 	leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: time.Minute}
 	past := metav1.NewTime(time.Now().Add(-time.Hour))
 	leaving.DeletionTimestamp = &past
-	sibling := sharedTWD("app-worker-twd", "app", false)
-	c := sharedTestClient(t, leaving, sibling,
+	sibling := leavingTWD("app-worker-twd", "app", false)
+	c := releaseTestClient(t, leaving, sibling,
 		ownedWorkers(leaving, "app-size-s-twd-old", "old", "app"), ownedWorkers(sibling, "app-worker-twd-new", "new", "app"))
-	r := sharedReconciler(c) // no TemporalClientPool: any Temporal call would panic
+	r := releaseReconciler(c) // no TemporalClientPool: any Temporal call would panic
 
 	require.NoError(t, r.handleDeletion(context.Background(), logr.Discard(), leaving))
 
@@ -244,11 +244,11 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 		wantHeld   bool
 	}{
 		{"pinned execution open", 1, 10 * time.Minute, true},
-		{"nothing pinned, just deleted", 0, time.Second, true},
-		{"nothing pinned, past the settle", 0, time.Minute, false},
+		{"nothing pinned, within the settle", 0, notFoundSettle - 5*time.Second, true},
+		{"nothing pinned, past the settle", 0, notFoundSettle + 5*time.Second, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			twd := sharedTWD("app-worker-twd", "", true)
+			twd := leavingTWD("app-worker-twd", "", true)
 			deleted := metav1.NewTime(time.Now().Add(-tc.deletedAgo))
 			twd.DeletionTimestamp = &deleted
 			twd.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
@@ -257,8 +257,8 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "conn", Namespace: "app-ns"},
 				Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: "temporal:7233"},
 			}
-			c := sharedTestClient(t, twd, conn, ownedWorkers(twd, "app-worker-twd-v1", "v1", ""))
-			r := sharedReconciler(c)
+			c := releaseTestClient(t, twd, conn, ownedWorkers(twd, "app-worker-twd-v1", "v1", ""))
+			r := releaseReconciler(c)
 			r.TemporalClientPool = clientpool.New(nil, c)
 			stub := &countingTemporalClient{stubTemporalClient: newStubTemporalClient(nil), pinned: fakePinnedQuerier{count: tc.pinned}}
 			r.TemporalClientPool.SetClientForTesting(noCredsPoolKey("temporal:7233", "default"), stub)

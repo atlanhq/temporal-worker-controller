@@ -536,101 +536,6 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 	return nil
 }
 
-// releaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers before
-// trusting a count of zero pinned executions: long enough for an execution started just before
-// the deletion to complete its first workflow task, including a scale-up from zero.
-const releaseSettle = time.Minute
-
-// notFoundSettle is how long a TWD whose Worker Deployment the server reports as not found keeps
-// its workers before trusting that report, which the server can give transiently. It only has to
-// outlast that, since each held pass describes the Worker Deployment again.
-const notFoundSettle = 30 * time.Second
-
-// sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
-func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
-	ctx context.Context,
-	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
-) (bool, error) {
-	var twds temporaliov1alpha1.TemporalWorkerDeploymentList
-	if err := r.List(ctx, &twds, client.InNamespace(workerDeploy.Namespace)); err != nil {
-		return false, fmt.Errorf("unable to list TemporalWorkerDeployments: %w", err)
-	}
-	name := k8s.ComputeWorkerDeploymentName(workerDeploy)
-	for i := range twds.Items {
-		other := &twds.Items[i]
-		if other.UID == workerDeploy.UID || !other.DeletionTimestamp.IsZero() {
-			continue
-		}
-		if other.Spec.WorkerOptions.TemporalNamespace == workerDeploy.Spec.WorkerOptions.TemporalNamespace &&
-			k8s.ComputeWorkerDeploymentName(other) == name {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// ownVersions returns the Worker Deployment versions this TWD's own workers poll, grouped by
-// Worker Deployment name. They come from its child Deployments rather than the server, so a
-// transient describe failure cannot release workers that pinned work still needs.
-func (r *TemporalWorkerDeploymentReconciler) ownVersions(
-	ctx context.Context,
-	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
-) (map[string][]sdkclient.WorkerDeploymentVersionSummary, error) {
-	var children appsv1.DeploymentList
-	if err := r.List(ctx, &children, client.InNamespace(workerDeploy.Namespace),
-		client.MatchingFields{deployOwnerKey: workerDeploy.Name}); err != nil {
-		return nil, fmt.Errorf("unable to list child deployments: %w", err)
-	}
-	fallbackName := k8s.ComputeWorkerDeploymentName(workerDeploy)
-	versions := map[string][]sdkclient.WorkerDeploymentVersionSummary{}
-	seen := map[sdkworker.WorkerDeploymentVersion]bool{}
-	for i := range children.Items {
-		v := sdkworker.WorkerDeploymentVersion{
-			DeploymentName: k8s.WorkerDeploymentNameFromDeployment(&children.Items[i]),
-			BuildID:        children.Items[i].Labels[k8s.BuildIDLabel],
-		}
-		if v.DeploymentName == "" {
-			v.DeploymentName = fallbackName
-		}
-		if v.BuildID == "" || seen[v] {
-			continue
-		}
-		seen[v] = true
-		versions[v.DeploymentName] = append(versions[v.DeploymentName], sdkclient.WorkerDeploymentVersionSummary{Version: v})
-	}
-	return versions, nil
-}
-
-// releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
-// poll, then deletes only those workers. An execution is only counted once its first workflow
-// task pins it and visibility indexes it, so while the Worker Deployment is still in use a count
-// of zero is trusted only after the deletion is settle old.
-func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
-	ctx context.Context,
-	l logr.Logger,
-	c pinnedExecutionQuerier,
-	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
-	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
-	settle time.Duration,
-) error {
-	var pinned int64
-	for name, vs := range versions {
-		n, err := r.countPinnedExecutions(ctx, l, c, workerDeploy, name, vs)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errTeardownWaiting, err)
-		}
-		pinned += n
-	}
-	if pinned > 0 {
-		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
-		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
-	}
-	if time.Since(workerDeploy.DeletionTimestamp.Time) < settle {
-		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
-	}
-	return r.teardownChildren(ctx, l, workerDeploy)
-}
-
 func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	ctx context.Context,
 	l logr.Logger,
@@ -722,7 +627,8 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if errors.As(err, &notFound) {
-			l.Info("Worker Deployment not found on Temporal server, releasing only this TWD's workers")
+			l.Info("Worker Deployment not found on Temporal server, skipping routing and version cleanup",
+				"workerDeploymentName", workerDeploymentName)
 			if forceTeardown {
 				return nil
 			}
@@ -858,6 +764,101 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	}
 
 	return nil
+}
+
+// releaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers before
+// trusting a count of zero pinned executions: long enough for an execution started just before
+// the deletion to complete its first workflow task, including a scale-up from zero.
+const releaseSettle = time.Minute
+
+// notFoundSettle is how long a TWD whose Worker Deployment the server reports as not found keeps
+// its workers before trusting that report, which the server can give transiently. It only has to
+// outlast that, since each held pass describes the Worker Deployment again.
+const notFoundSettle = 30 * time.Second
+
+// sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
+func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (bool, error) {
+	var twds temporaliov1alpha1.TemporalWorkerDeploymentList
+	if err := r.List(ctx, &twds, client.InNamespace(workerDeploy.Namespace)); err != nil {
+		return false, fmt.Errorf("unable to list TemporalWorkerDeployments: %w", err)
+	}
+	name := k8s.ComputeWorkerDeploymentName(workerDeploy)
+	for i := range twds.Items {
+		other := &twds.Items[i]
+		if other.UID == workerDeploy.UID || !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if other.Spec.WorkerOptions.TemporalNamespace == workerDeploy.Spec.WorkerOptions.TemporalNamespace &&
+			k8s.ComputeWorkerDeploymentName(other) == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ownVersions returns the Worker Deployment versions this TWD's own workers poll, grouped by
+// Worker Deployment name. They come from its child Deployments rather than the server, so a
+// transient describe failure cannot release workers that pinned work still needs.
+func (r *TemporalWorkerDeploymentReconciler) ownVersions(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (map[string][]sdkclient.WorkerDeploymentVersionSummary, error) {
+	var children appsv1.DeploymentList
+	if err := r.List(ctx, &children, client.InNamespace(workerDeploy.Namespace),
+		client.MatchingFields{deployOwnerKey: workerDeploy.Name}); err != nil {
+		return nil, fmt.Errorf("unable to list child deployments: %w", err)
+	}
+	fallbackName := k8s.ComputeWorkerDeploymentName(workerDeploy)
+	versions := map[string][]sdkclient.WorkerDeploymentVersionSummary{}
+	seen := map[sdkworker.WorkerDeploymentVersion]bool{}
+	for i := range children.Items {
+		v := sdkworker.WorkerDeploymentVersion{
+			DeploymentName: k8s.WorkerDeploymentNameFromDeployment(&children.Items[i]),
+			BuildID:        children.Items[i].Labels[k8s.BuildIDLabel],
+		}
+		if v.DeploymentName == "" {
+			v.DeploymentName = fallbackName
+		}
+		if v.BuildID == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		versions[v.DeploymentName] = append(versions[v.DeploymentName], sdkclient.WorkerDeploymentVersionSummary{Version: v})
+	}
+	return versions, nil
+}
+
+// releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
+// poll, then deletes only those workers. An execution is only counted once its first workflow
+// task pins it and visibility indexes it, so while the Worker Deployment is still in use a count
+// of zero is trusted only after the deletion is settle old.
+func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+	settle time.Duration,
+) error {
+	var pinned int64
+	for name, vs := range versions {
+		n, err := r.countPinnedExecutions(ctx, l, c, workerDeploy, name, vs)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errTeardownWaiting, err)
+		}
+		pinned += n
+	}
+	if pinned > 0 {
+		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
+		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
+	}
+	if time.Since(workerDeploy.DeletionTimestamp.Time) < settle {
+		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
+	}
+	return r.teardownChildren(ctx, l, workerDeploy)
 }
 
 // errTeardownWaiting marks a teardown that is deliberately incomplete: the TWD still
