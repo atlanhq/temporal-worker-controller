@@ -276,3 +276,38 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 		})
 	}
 }
+
+// Until a live sibling has switched its current version away from the leaving TWD's build, new
+// executions keep pinning to that build and may need the leaving TWD's workers, so it holds.
+func TestReleaseOwnWorkers_HoldsUntilSiblingSwitchesAwayFromItsBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		current, target   string
+		siblingIsDeleting bool
+		wantHeld          bool
+	}{
+		{"sibling still on the build, moving to another", "v1", "v2", false, true},
+		{"sibling already switched", "v2", "v2", false, false},
+		{"sibling staying on the build", "v1", "v1", false, false},
+		{"sibling also being deleted", "v1", "v2", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leaving := leavingTWD("app-size-s-twd", "app", true)
+			sibling := leavingTWD("app-worker-twd", "app", tc.siblingIsDeleting)
+			sibling.Status.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: tc.current},
+			}
+			sibling.Status.TargetVersion.BuildID = tc.target
+			c := releaseTestClient(t, leaving, sibling, ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+
+			err := release(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving)
+
+			if tc.wantHeld {
+				require.ErrorIs(t, err, errTeardownWaiting)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantHeld, exists(t, c, "app-size-s-twd-v1"))
+		})
+	}
+}

@@ -867,7 +867,8 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 }
 
 // releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
-// poll, then deletes only those workers. An execution is only counted once its first workflow
+// poll, and for any sibling still switching away from those versions, then deletes only
+// those workers. An execution is only counted once its first workflow
 // task pins it and visibility indexes it, so while the Worker Deployment is still in use a count
 // of zero is trusted only after the deletion is settle old.
 func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
@@ -893,7 +894,45 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	if time.Since(workerDeploy.DeletionTimestamp.Time) < settle {
 		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
 	}
+	pending, err := r.siblingSwitchPending(ctx, workerDeploy, versions)
+	if err != nil {
+		return err
+	}
+	if pending {
+		return fmt.Errorf("%w: a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
+	}
 	return r.teardownChildren(ctx, l, workerDeploy)
+}
+
+// siblingSwitchPending reports whether a live sibling TWD still has one of these builds as its
+// current version while it targets another. Until that sibling switches, new executions keep
+// pinning to the build and may need this TWD's workers; its switch also only skips the removed
+// queues while this TWD is still being deleted.
+func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+) (bool, error) {
+	own := map[string]bool{}
+	for _, vs := range versions {
+		for _, v := range vs {
+			own[v.Version.BuildID] = true
+		}
+	}
+	siblings, err := r.siblingTWDs(ctx, workerDeploy)
+	if err != nil {
+		return false, err
+	}
+	for _, other := range siblings {
+		if !other.DeletionTimestamp.IsZero() || other.Status.CurrentVersion == nil {
+			continue
+		}
+		current, target := other.Status.CurrentVersion.BuildID, other.Status.TargetVersion.BuildID
+		if own[current] && target != "" && target != current {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // errTeardownWaiting marks a teardown that is deliberately incomplete: the TWD still
