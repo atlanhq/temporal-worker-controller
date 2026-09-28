@@ -776,23 +776,58 @@ const releaseSettle = time.Minute
 // outlast that, since each held pass describes the Worker Deployment again.
 const notFoundSettle = 30 * time.Second
 
+// siblingTWDs returns the other TWDs in the same namespace that use the same Temporal Worker Deployment.
+func (r *TemporalWorkerDeploymentReconciler) siblingTWDs(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) ([]*temporaliov1alpha1.TemporalWorkerDeployment, error) {
+	var twds temporaliov1alpha1.TemporalWorkerDeploymentList
+	if err := r.List(ctx, &twds, client.InNamespace(workerDeploy.Namespace)); err != nil {
+		return nil, fmt.Errorf("unable to list TemporalWorkerDeployments: %w", err)
+	}
+	name := k8s.ComputeWorkerDeploymentName(workerDeploy)
+	var siblings []*temporaliov1alpha1.TemporalWorkerDeployment
+	for i := range twds.Items {
+		other := &twds.Items[i]
+		if other.UID == workerDeploy.UID {
+			continue
+		}
+		if other.Spec.WorkerOptions.TemporalNamespace == workerDeploy.Spec.WorkerOptions.TemporalNamespace &&
+			k8s.ComputeWorkerDeploymentName(other) == name {
+			siblings = append(siblings, other)
+		}
+	}
+	return siblings, nil
+}
+
 // sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
 func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) (bool, error) {
-	var twds temporaliov1alpha1.TemporalWorkerDeploymentList
-	if err := r.List(ctx, &twds, client.InNamespace(workerDeploy.Namespace)); err != nil {
-		return false, fmt.Errorf("unable to list TemporalWorkerDeployments: %w", err)
+	siblings, err := r.siblingTWDs(ctx, workerDeploy)
+	if err != nil {
+		return false, err
 	}
-	name := k8s.ComputeWorkerDeploymentName(workerDeploy)
-	for i := range twds.Items {
-		other := &twds.Items[i]
-		if other.UID == workerDeploy.UID || !other.DeletionTimestamp.IsZero() {
-			continue
+	for _, other := range siblings {
+		if other.DeletionTimestamp.IsZero() {
+			return true, nil
 		}
-		if other.Spec.WorkerOptions.TemporalNamespace == workerDeploy.Spec.WorkerOptions.TemporalNamespace &&
-			k8s.ComputeWorkerDeploymentName(other) == name {
+	}
+	return false, nil
+}
+
+// hasDeletingSibling reports whether another TWD using the same Temporal Worker Deployment is being deleted.
+func (r *TemporalWorkerDeploymentReconciler) hasDeletingSibling(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (bool, error) {
+	siblings, err := r.siblingTWDs(ctx, workerDeploy)
+	if err != nil {
+		return false, err
+	}
+	for _, other := range siblings {
+		if !other.DeletionTimestamp.IsZero() {
 			return true, nil
 		}
 	}
