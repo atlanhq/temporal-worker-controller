@@ -117,6 +117,9 @@ type TemporalWorkerDeploymentReconciler struct {
 	// server value of `matching.maxVersionsInDeployment=100`.
 	// Users who reduce `matching.maxVersionsInDeployment` in their dynamicconfig should also reduce this value.
 	MaxDeploymentVersionsIneligibleForDeletion int32
+
+	// SharedReleaseSettle overrides releaseSettle when set.
+	SharedReleaseSettle time.Duration
 }
 
 // +kubebuilder:rbac:groups=temporal.io,resources=temporalworkerdeployments,verbs=get;list;watch;create;update;patch;delete
@@ -616,7 +619,20 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	}
 
 	if shared {
-		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, releaseSettle)
+		lastRoutingChange := func(ctx context.Context) (time.Time, error) {
+			resp, err := temporalClient.WorkerDeploymentClient().
+				GetHandle(k8s.ComputeWorkerDeploymentName(workerDeploy)).
+				Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
+			if err != nil {
+				return time.Time{}, err
+			}
+			rc := resp.Info.RoutingConfig
+			if rc.RampingVersionChangedTime.After(rc.CurrentVersionChangedTime) {
+				return rc.RampingVersionChangedTime, nil
+			}
+			return rc.CurrentVersionChangedTime, nil
+		}
+		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, r.sharedReleaseSettle(), lastRoutingChange)
 	}
 
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(workerDeploy)
@@ -643,7 +659,7 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			if len(versions) == 0 {
 				return r.teardownChildren(ctx, l, workerDeploy)
 			}
-			return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, versions, notFoundSettle)
+			return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, versions, notFoundSettle, nil)
 		}
 		return fmt.Errorf("unable to describe worker deployment: %w", err)
 	}
@@ -766,10 +782,18 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	return nil
 }
 
-// releaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers before
-// trusting a count of zero pinned executions: long enough for an execution started just before
-// the deletion to complete its first workflow task, including a scale-up from zero.
-const releaseSettle = time.Minute
+// releaseSettle is how long a TWD leaving a shared Worker Deployment keeps its workers, after its
+// deletion and after the last routing change, before trusting a count of zero pinned executions:
+// an execution pinned just before either is not visible to the count until visibility indexes it.
+// It matches the grace the server itself allows visibility before it trusts a drained version.
+const releaseSettle = 3 * time.Minute
+
+func (r *TemporalWorkerDeploymentReconciler) sharedReleaseSettle() time.Duration {
+	if r.SharedReleaseSettle > 0 {
+		return r.SharedReleaseSettle
+	}
+	return releaseSettle
+}
 
 // notFoundSettle is how long a TWD whose Worker Deployment the server reports as not found keeps
 // its workers before trusting that report, which the server can give transiently. It only has to
@@ -817,21 +841,32 @@ func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
 	return false, nil
 }
 
-// hasDeletingSibling reports whether another TWD using the same Temporal Worker Deployment is being deleted.
-func (r *TemporalWorkerDeploymentReconciler) hasDeletingSibling(
+// ignoreMissingTaskQueuesFor reports whether promoting buildID may skip the server's check for task
+// queues the current version has and buildID lacks. That holds only while a sibling TWD is being
+// deleted, since its queues are then missing on purpose, and only once every live sibling targets
+// buildID with its own Deployment for it healthy, so each live pool's queue is served on buildID.
+func (r *TemporalWorkerDeploymentReconciler) ignoreMissingTaskQueuesFor(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
 ) (bool, error) {
 	siblings, err := r.siblingTWDs(ctx, workerDeploy)
 	if err != nil {
 		return false, err
 	}
+	deleting := false
 	for _, other := range siblings {
 		if !other.DeletionTimestamp.IsZero() {
-			return true, nil
+			deleting = true
+			continue
+		}
+		target := other.Status.TargetVersion
+		if target.BuildID != buildID || target.HealthySince == nil ||
+			target.Status == "" || target.Status == temporaliov1alpha1.VersionStatusNotRegistered {
+			return false, nil
 		}
 	}
-	return false, nil
+	return deleting, nil
 }
 
 // ownVersions returns the Worker Deployment versions this TWD's own workers poll, grouped by
@@ -878,6 +913,7 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
 	settle time.Duration,
+	lastRoutingChange func(context.Context) (time.Time, error),
 ) error {
 	var pinned int64
 	for name, vs := range versions {
@@ -891,15 +927,25 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
 		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
 	}
-	if time.Since(workerDeploy.DeletionTimestamp.Time) < settle {
-		return fmt.Errorf("%w: waiting for executions started before the deletion to be counted", errTeardownWaiting)
-	}
 	pending, err := r.siblingSwitchPending(ctx, workerDeploy, versions)
 	if err != nil {
 		return err
 	}
 	if pending {
 		return fmt.Errorf("%w: a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
+	}
+	settleFrom := workerDeploy.DeletionTimestamp.Time
+	if lastRoutingChange != nil {
+		changed, err := lastRoutingChange(ctx)
+		if err != nil {
+			return fmt.Errorf("%w: unable to read when routing last changed: %v", errTeardownWaiting, err)
+		}
+		if changed.After(settleFrom) {
+			settleFrom = changed
+		}
+	}
+	if time.Since(settleFrom) < settle {
+		return fmt.Errorf("%w: waiting for executions pinned before the deletion or the last routing change to be counted", errTeardownWaiting)
 	}
 	return r.teardownChildren(ctx, l, workerDeploy)
 }

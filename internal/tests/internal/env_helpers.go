@@ -158,6 +158,9 @@ func setupTestEnvironment(t *testing.T) (*rest.Config, client.Client, manager.Ma
 		Recorder:            mgr.GetEventRecorderFor("temporal-worker-controller"),
 		DisableRecoverPanic: true,
 		MaxDeploymentVersionsIneligibleForDeletion: controller.GetControllerMaxDeploymentVersionsIneligibleForDeletion(),
+		// Shorter than the default so the shared-deployment deletion tests stay quick; they time
+		// their assertions against this value.
+		SharedReleaseSettle: time.Minute,
 	}
 	err = reconciler.SetupWithManager(mgr)
 	if err != nil {

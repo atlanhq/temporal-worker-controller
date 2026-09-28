@@ -249,7 +249,7 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 	// A sibling TWD being deleted takes its task queues out of new versions on purpose. While those
 	// queues still carry work pinned to the current version, the server would refuse to promote a
 	// version without them, so new work would keep landing on the old version and it could never drain.
-	ignoreMissingTaskQueues, err := r.hasDeletingSibling(ctx, workerDeploy)
+	ignoreMissingTaskQueues, err := r.ignoreMissingTaskQueuesFor(ctx, workerDeploy, vcfg.BuildID)
 	if err != nil {
 		return err
 	}

@@ -29,6 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -134,15 +135,17 @@ func testDeletionSetsCurrentToUnversioned(
 	// Update the TWD to target v2.0, creating a second version to use as a ramping version.
 	// This exercises the ramping-version clear path in handleDeletion.
 	var twdForUpdate temporaliov1alpha1.TemporalWorkerDeployment
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdForUpdate); err != nil {
-		t.Fatalf("failed to get TWD for v2.0 update: %v", err)
-	}
-	twdForUpdate.Spec.Template.Spec.Containers[0].Image = "v2.0"
-	buildIDv2 := k8s.ComputeBuildID(&twdForUpdate)
-	deploymentNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
-	if err := k8sClient.Update(ctx, &twdForUpdate); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdForUpdate); err != nil {
+			return err
+		}
+		twdForUpdate.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &twdForUpdate)
+	}); err != nil {
 		t.Fatalf("failed to update TWD to v2.0: %v", err)
 	}
+	buildIDv2 := k8s.ComputeBuildID(&twdForUpdate)
+	deploymentNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
 
 	// Wait for the controller to create the v2.0 K8s Deployment
 	eventually(t, 30*time.Second, time.Second, func() error {
@@ -416,15 +419,17 @@ func testDrainedVersionPrunedOnSunset(
 
 	// Roll out v2.0 and make it current, so v1.0 becomes deprecated and starts draining.
 	var twdV2 temporaliov1alpha1.TemporalWorkerDeployment
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdV2); err != nil {
-		t.Fatalf("failed to get TWD for v2.0 update: %v", err)
-	}
-	twdV2.Spec.Template.Spec.Containers[0].Image = "v2.0"
-	buildIDv2 := k8s.ComputeBuildID(&twdV2)
-	depNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
-	if err := k8sClient.Update(ctx, &twdV2); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdV2); err != nil {
+			return err
+		}
+		twdV2.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &twdV2)
+	}); err != nil {
 		t.Fatalf("failed to update TWD to v2.0: %v", err)
 	}
+	buildIDv2 := k8s.ComputeBuildID(&twdV2)
+	depNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
 	eventually(t, 30*time.Second, time.Second, func() error {
 		var dep appsv1.Deployment
 		return k8sClient.Get(ctx, types.NamespacedName{Name: depNameV2, Namespace: namespace}, &dep)
@@ -722,13 +727,15 @@ func testSiblingPromotesWhileDeletingQueueIsBusy(
 	if err := k8sClient.Delete(ctx, leaving); err != nil {
 		t.Fatalf("failed to delete TWD: %v", err)
 	}
-	var fresh temporaliov1alpha1.TemporalWorkerDeployment
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: live.Name, Namespace: namespace}, &fresh); err != nil {
-		t.Fatalf("failed to get live TWD: %v", err)
-	}
-	fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
-	fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
-	if err := k8sClient.Update(ctx, &fresh); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: live.Name, Namespace: namespace}, &fresh); err != nil {
+			return err
+		}
+		fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
+		fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &fresh)
+	}); err != nil {
 		t.Fatalf("failed to move live TWD to %s: %v", newBuild, err)
 	}
 	startWorkers(live.Name, newBuild)
@@ -801,7 +808,8 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 	}
 	liveOld := startWorkers(live.Name, oldBuild)
 	defer handleStopFuncs(liveOld)
-	// The removed TWD's workers stop when it is released, the way its pods would go away.
+	// The removed TWD's in-process workers are stopped once it is released, the way its pods would go
+	// away; otherwise they would keep polling and hide a run stranded on its queue.
 	leavingWorkers := startWorkers(leaving.Name, oldBuild)
 	leavingStopped := false
 	stopLeaving := func() {
@@ -831,13 +839,15 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 	if err := k8sClient.Delete(ctx, leaving); err != nil {
 		t.Fatalf("failed to delete TWD: %v", err)
 	}
-	var fresh temporaliov1alpha1.TemporalWorkerDeployment
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: live.Name, Namespace: namespace}, &fresh); err != nil {
-		t.Fatalf("failed to get live TWD: %v", err)
-	}
-	fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
-	fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
-	if err := k8sClient.Update(ctx, &fresh); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: live.Name, Namespace: namespace}, &fresh); err != nil {
+			return err
+		}
+		fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
+		fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &fresh)
+	}); err != nil {
 		t.Fatalf("failed to move live TWD to %s: %v", newBuild, err)
 	}
 
@@ -862,11 +872,12 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 	defer handleStopFuncs(liveNew)
 	eventually(t, 90*time.Second, time.Second, currentIs(newBuild))
 
-	eventually(t, 2*time.Minute, time.Second, func() error {
+	eventually(t, 3*time.Minute, time.Second, func() error {
 		var check temporaliov1alpha1.TemporalWorkerDeployment
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &check); err == nil {
 			return errors.New("removed TWD still exists")
 		}
 		return nil
 	})
+	stopLeaving()
 }

@@ -124,7 +124,7 @@ func release(t *testing.T, r *TemporalWorkerDeploymentReconciler, q pinnedExecut
 	t.Helper()
 	versions, err := r.ownVersions(context.Background(), twd)
 	require.NoError(t, err)
-	return r.releaseOwnWorkers(context.Background(), logr.Discard(), q, twd, versions, releaseSettle)
+	return r.releaseOwnWorkers(context.Background(), logr.Discard(), q, twd, versions, releaseSettle, nil)
 }
 
 // Siblings on one release share the build, so the leaving TWD's version is also theirs. Any open
@@ -301,6 +301,40 @@ func TestReleaseOwnWorkers_HoldsUntilSiblingSwitchesAwayFromItsBuild(t *testing.
 			c := releaseTestClient(t, leaving, sibling, ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
 
 			err := release(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving)
+
+			if tc.wantHeld {
+				require.ErrorIs(t, err, errTeardownWaiting)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantHeld, exists(t, c, "app-size-s-twd-v1"))
+		})
+	}
+}
+
+// A switch of the current or ramping version pins executions to the new routing just before it.
+// Those may not be visible to the count yet, so the settle also runs from the last routing change,
+// and an unknown change time holds.
+func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		changed  time.Time
+		err      error
+		wantHeld bool
+	}{
+		{"routing changed just now", time.Now().Add(-10 * time.Second), nil, true},
+		{"routing changed long ago", time.Now().Add(-time.Hour), nil, false},
+		{"change time unknown", time.Time{}, errors.New("describe failed"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leaving := leavingTWD("app-size-s-twd", "app", true)
+			c := releaseTestClient(t, leaving, leavingTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+			r := releaseReconciler(c)
+			versions, err := r.ownVersions(context.Background(), leaving)
+			require.NoError(t, err)
+
+			err = r.releaseOwnWorkers(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, versions, releaseSettle,
+				func(context.Context) (time.Time, error) { return tc.changed, tc.err })
 
 			if tc.wantHeld {
 				require.ErrorIs(t, err, errTeardownWaiting)
