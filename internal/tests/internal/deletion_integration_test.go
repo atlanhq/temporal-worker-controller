@@ -60,7 +60,11 @@ func runDeletionTests(
 	})
 
 	t.Run("removed-twd-waits-for-sibling-to-switch-builds", func(t *testing.T) {
-		testRemovedTWDWaitsForSiblingToSwitchBuilds(t, k8sClient, ts, testNamespace)
+		testRemovedTWDWaitsForSiblingToSwitchBuilds(t, k8sClient, ts, testNamespace, "del-quiet", 0)
+	})
+
+	t.Run("removed-twd-past-its-budget-waits-for-sibling-to-switch-builds", func(t *testing.T) {
+		testRemovedTWDWaitsForSiblingToSwitchBuilds(t, k8sClient, ts, testNamespace, "del-budget", 30*time.Second)
 	})
 
 	t.Run("sibling-waits-for-live-pools-queues-before-skipping-missing-queues", func(t *testing.T) {
@@ -762,19 +766,24 @@ func testSiblingPromotesWhileDeletingQueueIsBusy(
 // in the release that moves the other to a new build, on a quiet queue, while the new build's
 // workers take longer than the settle to come up. Until the sibling has switched, the old build is
 // still current, so a new run can still need the removed TWD's queue: the removed TWD must stay
-// until the switch, or that run strands and the switch is refused for the stranded queue.
+// until the switch, or that run strands and the switch is refused for the stranded queue. With a
+// budget, the removed TWD's drainage budget runs out while the sibling is still waiting for its new
+// workers: the budget ends the wait for pinned runs, but not the wait for that switch.
 func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 	t *testing.T,
 	k8sClient client.Client,
 	ts *temporaltest.TestServer,
 	namespace string,
+	prefix string,
+	budget time.Duration,
 ) {
 	ctx := context.Background()
-	const (
-		sharedName = "del-quiet"
-		oldBuild   = "quiet-v1"
-		newBuild   = "quiet-v2"
-		connName   = "del-quiet-conn"
+	var (
+		sharedName = prefix
+		oldBuild   = prefix + "-v1"
+		newBuild   = prefix + "-v2"
+		connName   = prefix + "-conn"
+		lateRun    = prefix + "-late-run"
 	)
 
 	newTWD := func(name string) *temporaliov1alpha1.TemporalWorkerDeployment {
@@ -791,7 +800,10 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 		twd.Spec.WorkerOptions.TemporalConnectionRef.Name = connName
 		return twd
 	}
-	live, leaving := newTWD("del-quiet-live"), newTWD("del-quiet-leaving")
+	live, leaving := newTWD(prefix+"-live"), newTWD(prefix+"-leaving")
+	if budget > 0 {
+		leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: budget}
+	}
 
 	if err := k8sClient.Create(ctx, &temporaliov1alpha1.TemporalConnection{
 		ObjectMeta: metav1.ObjectMeta{Name: connName, Namespace: namespace},
@@ -857,8 +869,8 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 		t.Fatalf("failed to move live TWD to %s: %v", newBuild, err)
 	}
 
-	// Past the controller's one-minute settle, with nothing pinned, the old build still current and
-	// the sibling not yet switched, the removed TWD must still be here.
+	// Past the controller's one-minute settle, and past the budget when there is one, with nothing
+	// pinned, the old build still current and the sibling not yet switched, the removed TWD must still be here.
 	time.Sleep(75 * time.Second)
 	var held temporaliov1alpha1.TemporalWorkerDeployment
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &held); err != nil {
@@ -868,15 +880,15 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 
 	temporalClient := ts.GetDefaultClient()
 	if _, err := temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
-		ID: "del-quiet-late-run", TaskQueue: leaving.Name,
+		ID: lateRun, TaskQueue: leaving.Name,
 	}, "successTestWorkflow"); err != nil {
 		t.Fatalf("failed to start workflow: %v", err)
 	}
-	defer func() { _ = temporalClient.TerminateWorkflow(ctx, "del-quiet-late-run", "", "test cleanup") }()
+	defer func() { _ = temporalClient.TerminateWorkflow(ctx, lateRun, "", "test cleanup") }()
 	// The run lands on the old build, still current, and needs the removed TWD's queue, so it only
 	// completes if the removed TWD's workers are still there.
 	eventually(t, 60*time.Second, time.Second, func() error {
-		resp, err := temporalClient.DescribeWorkflowExecution(ctx, "del-quiet-late-run", "")
+		resp, err := temporalClient.DescribeWorkflowExecution(ctx, lateRun, "")
 		if err != nil {
 			return err
 		}

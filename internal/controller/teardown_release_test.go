@@ -216,9 +216,10 @@ func TestHandleDeletion_SharedWithoutWorkersNeedsNoTemporal(t *testing.T) {
 	require.NoError(t, releaseReconciler(c).handleDeletion(context.Background(), logr.Discard(), leaving))
 }
 
-// Past the drainage budget a shared TWD only deletes its own workers. It needs no Temporal
-// client for that, and it must not terminate executions pinned to builds its siblings also run.
-func TestHandleDeletion_SharedPastBudgetNeedsNoTemporal(t *testing.T) {
+// Past the drainage budget a shared TWD only deletes its own workers, and an unreachable Temporal
+// server can't hold them: here it has no TemporalConnection at all. It must not terminate executions
+// pinned to builds its siblings also run.
+func TestHandleDeletion_SharedPastBudgetReleasesWhenTemporalUnreachable(t *testing.T) {
 	leaving := leavingTWD("app-size-s-twd", "app", true)
 	leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: time.Minute}
 	past := metav1.NewTime(time.Now().Add(-time.Hour))
@@ -232,6 +233,75 @@ func TestHandleDeletion_SharedPastBudgetNeedsNoTemporal(t *testing.T) {
 
 	assert.False(t, exists(t, c, "app-size-s-twd-old"))
 	assert.True(t, exists(t, c, "app-worker-twd-new"))
+}
+
+// A budget of zero means no wait at all, so a shared TWD releases at once, even while Temporal still
+// sends new work to its build and a live sibling is switching away from it.
+func TestHandleDeletion_SharedZeroBudgetReleasesAtOnce(t *testing.T) {
+	leaving := leavingTWD("app-size-s-twd", "app", true)
+	leaving.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
+	leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 0}
+	c := releaseTestClient(t, leaving, liveSibling("v2", false), testConnection(), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+	r := releaseReconciler(c)
+	stub := withStubTemporal(r, c, fakePinnedQuerier{count: 3})
+	h := stubHandle(stub)
+	h.versionExists = true
+	h.describeErr = nil
+	h.describeResp.Info.RoutingConfig.CurrentVersion = &sdkworker.WorkerDeploymentVersion{DeploymentName: "app", BuildID: "v1"}
+	h.describeResp.Info.RoutingConfig.CurrentVersionChangedTime = time.Now().Add(-time.Hour)
+
+	require.NoError(t, r.handleDeletion(context.Background(), logr.Discard(), leaving))
+
+	assert.False(t, exists(t, c, "app-size-s-twd-v1"))
+}
+
+// Past its drainage budget a shared TWD stops waiting for pinned executions but still holds while
+// Temporal sends new work to its build and a live sibling targets another: released then, the
+// switch would be refused for good once it is gone. A NotFound while its version exists is a
+// transient answer from a reachable server, so it holds too; any other routing failure releases.
+func TestHandleDeletion_SharedPastBudgetHoldsWhileSiblingSwitches(t *testing.T) {
+	longAgo := time.Now().Add(-2 * time.Hour)
+	for _, tc := range []struct {
+		name          string
+		describe      error
+		current       string
+		versionExists bool
+		wantHeld      bool
+	}{
+		{"its build still current, sibling moving on", nil, "v1", true, true},
+		{"sibling already switched", nil, "v2", true, false},
+		{"routing unreadable", errors.New("unavailable"), "", true, false},
+		{"not found while its version exists", &serviceerror.NotFound{}, "", true, true},
+		{"never registered", &serviceerror.NotFound{}, "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leaving := leavingTWD("app-size-s-twd", "app", true)
+			past := metav1.NewTime(time.Now().Add(-time.Hour))
+			leaving.DeletionTimestamp = &past
+			leaving.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
+			leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: time.Minute}
+			c := releaseTestClient(t, leaving, liveSibling("v2", false), testConnection(), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+			r := releaseReconciler(c)
+			stub := withStubTemporal(r, c, fakePinnedQuerier{count: 3})
+			h := stubHandle(stub)
+			h.describeErr = tc.describe
+			h.versionExists = tc.versionExists
+			if tc.current != "" {
+				h.describeResp.Info.RoutingConfig.CurrentVersion = &sdkworker.WorkerDeploymentVersion{DeploymentName: "app", BuildID: tc.current}
+				h.describeResp.Info.RoutingConfig.CurrentVersionChangedTime = longAgo
+			}
+
+			err := r.handleDeletion(context.Background(), logr.Discard(), leaving)
+
+			if tc.wantHeld {
+				require.ErrorIs(t, err, errTeardownWaiting)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantHeld, exists(t, c, "app-size-s-twd-v1"))
+			assert.Empty(t, stub.pinned.countQueries, "past the budget pinned executions are no longer waited for")
+		})
+	}
 }
 
 // countingTemporalClient answers the pinned-execution count on top of a stub whose Worker

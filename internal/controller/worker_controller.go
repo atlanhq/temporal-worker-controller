@@ -547,29 +547,34 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
 	// Workers are torn down once nothing is pinned to them any more, or once the drainage
-	// budget runs out. Past the budget the teardown is unconditional and runs before the
-	// Temporal dial, so an unreachable server cannot hold the children hostage - the
-	// original ordering, kept as the fallback rather than the default.
+	// budget runs out. Past the budget the teardown runs before the Temporal dial, so an
+	// unreachable server cannot hold the children hostage - the original ordering, kept as
+	// the fallback rather than the default. A shared TWD past its budget first checks for a
+	// sibling still switching away from its build, and still releases if the server can't answer.
 	disposition := teardownDispositionFor(workerDeploy)
 	forceTeardown := disposition != teardownWait
-	if forceTeardown {
+
+	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave
+	// them to the siblings and release only this TWD's workers.
+	siblings, listErr := r.siblingTWDs(ctx, workerDeploy)
+	shared := listErr == nil && hasLiveSibling(siblings)
+	// A shared TWD whose budget ran out still checks whether a sibling is switching away from its
+	// build before it lets go (see holdPastBudget), so its teardown waits for that check.
+	pastBudget := shared && drainageBudgetExpired(workerDeploy)
+	if forceTeardown && !pastBudget {
 		if err := r.teardownChildren(ctx, l, workerDeploy); err != nil {
 			return err
 		}
 	}
-
-	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave
-	// them to the siblings and release only this TWD's workers.
-	siblings, err := r.siblingTWDs(ctx, workerDeploy)
-	if err != nil {
-		return err
+	if listErr != nil {
+		return listErr
 	}
-	shared := hasLiveSibling(siblings)
 	var ownVersions map[string][]sdkclient.WorkerDeploymentVersionSummary
+	var err error
 	if shared {
 		l.Info("Worker Deployment is shared with other TWDs, releasing only this TWD's workers",
 			"workerDeploymentName", k8s.ComputeWorkerDeploymentName(workerDeploy))
-		if forceTeardown {
+		if forceTeardown && !pastBudget {
 			return nil
 		}
 		if ownVersions, err = r.ownVersions(ctx, workerDeploy); err != nil {
@@ -582,43 +587,14 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 		}
 	}
 
-	// Resolve Temporal connection.
-	// The TemporalConnection is guaranteed to exist because we hold a finalizer on it
-	// that prevents deletion while any TWD references it.
-	var temporalConnection temporaliov1alpha1.TemporalConnection
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      workerDeploy.Spec.WorkerOptions.TemporalConnectionRef.Name,
-		Namespace: workerDeploy.Namespace,
-	}, &temporalConnection); err != nil {
-		return fmt.Errorf("unable to fetch TemporalConnection: %w", err)
-	}
-
-	authMode, secretName, err := resolveAuthSecretName(&temporalConnection)
+	temporalClient, err := r.temporalClientFor(ctx, workerDeploy)
 	if err != nil {
-		return fmt.Errorf("unable to resolve auth secret name: %w", err)
-	}
-
-	temporalClient, ok := r.TemporalClientPool.GetSDKClient(clientpool.ClientPoolKey{
-		HostPort:   temporalConnection.Spec.HostPort,
-		Namespace:  workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		SecretName: secretName,
-		AuthMode:   authMode,
-	})
-	if !ok {
-		clientOpts, key, clientAuth, err := r.TemporalClientPool.ParseClientSecret(ctx, secretName, authMode, clientpool.NewClientOptions{
-			K8sNamespace:      workerDeploy.Namespace,
-			TemporalNamespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-			Spec:              temporalConnection.Spec,
-			Identity:          getControllerIdentity(),
-		})
-		if err != nil {
-			return fmt.Errorf("unable to parse Temporal auth secret: %w", err)
+		// Past the budget an unreachable server must not hold the workers.
+		if pastBudget {
+			l.Info("Past the drainage budget and unable to reach Temporal, releasing this TWD's workers", "error", err.Error())
+			return r.teardownChildren(ctx, l, workerDeploy)
 		}
-		c, err := r.TemporalClientPool.DialAndUpsertClient(*clientOpts, *key, *clientAuth)
-		if err != nil {
-			return fmt.Errorf("unable to create TemporalClient: %w", err)
-		}
-		temporalClient = c
+		return err
 	}
 
 	if shared {
@@ -643,6 +619,9 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 				return sharedRouting{}, err
 			}
 			return routingOf(resp.Info.RoutingConfig), nil
+		}
+		if pastBudget {
+			return r.holdPastBudget(ctx, l, workerDeploy, siblings, ownVersions, readRouting)
 		}
 		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, siblings, ownVersions, readRouting)
 	}
@@ -1022,6 +1001,89 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	}
 	if time.Since(settleFrom) < r.sharedReleaseSettle() {
 		return fmt.Errorf("%w: waiting for executions pinned before the deletion or the last routing change to be counted", errTeardownWaiting)
+	}
+	return r.teardownChildren(ctx, l, workerDeploy)
+}
+
+// temporalClientFor returns a Temporal client for the TWD's TemporalConnection.
+func (r *TemporalWorkerDeploymentReconciler) temporalClientFor(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (sdkclient.Client, error) {
+	// The TemporalConnection is guaranteed to exist because we hold a finalizer on it
+	// that prevents deletion while any TWD references it.
+	var temporalConnection temporaliov1alpha1.TemporalConnection
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      workerDeploy.Spec.WorkerOptions.TemporalConnectionRef.Name,
+		Namespace: workerDeploy.Namespace,
+	}, &temporalConnection); err != nil {
+		return nil, fmt.Errorf("unable to fetch TemporalConnection: %w", err)
+	}
+
+	authMode, secretName, err := resolveAuthSecretName(&temporalConnection)
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve auth secret name: %w", err)
+	}
+
+	temporalClient, ok := r.TemporalClientPool.GetSDKClient(clientpool.ClientPoolKey{
+		HostPort:   temporalConnection.Spec.HostPort,
+		Namespace:  workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+		SecretName: secretName,
+		AuthMode:   authMode,
+	})
+	if !ok {
+		clientOpts, key, clientAuth, err := r.TemporalClientPool.ParseClientSecret(ctx, secretName, authMode, clientpool.NewClientOptions{
+			K8sNamespace:      workerDeploy.Namespace,
+			TemporalNamespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+			Spec:              temporalConnection.Spec,
+			Identity:          getControllerIdentity(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse Temporal auth secret: %w", err)
+		}
+		c, err := r.TemporalClientPool.DialAndUpsertClient(*clientOpts, *key, *clientAuth)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create TemporalClient: %w", err)
+		}
+		temporalClient = c
+	}
+	return temporalClient, nil
+}
+
+// drainageBudgetExpired reports whether the TWD had a drainage budget and it has run out.
+func drainageBudgetExpired(workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+	timeout := workerDeploy.Spec.SunsetStrategy.TeardownDrainageTimeout
+	deletedAt := workerDeploy.DeletionTimestamp
+	return timeout != nil && timeout.Duration > 0 && deletedAt != nil && !deletedAt.IsZero() &&
+		time.Since(deletedAt.Time) >= timeout.Duration
+}
+
+// holdPastBudget decides a shared TWD's teardown once its drainage budget has run out. The budget
+// ends the wait for pinned executions, but not the wait for a sibling still switching away from this
+// TWD's build: released then, the old build stays current with nothing polling this TWD's queue, and
+// once this TWD is gone the switch no longer skips that queue, so the server refuses it for good.
+// So it holds while that switch is pending, and while the server answers NotFound although this
+// TWD's versions exist. Any other failure to read the routing releases, so an unreachable server
+// cannot hold the workers past the budget.
+func (r *TemporalWorkerDeploymentReconciler) holdPastBudget(
+	ctx context.Context,
+	l logr.Logger,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	siblings []*temporaliov1alpha1.TemporalWorkerDeployment,
+	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+	readRouting func(context.Context) (sharedRouting, error),
+) error {
+	routing, err := readRouting(ctx)
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return fmt.Errorf("%w: past the drainage budget, and the Worker Deployment was reported not found while its versions exist", errTeardownWaiting)
+		}
+		l.Info("Past the drainage budget and unable to read the Worker Deployment's routing, releasing this TWD's workers", "error", err.Error())
+		return r.teardownChildren(ctx, l, workerDeploy)
+	}
+	if !routing.neverRegistered && siblingSwitchPending(siblings, versions, routing.builds) {
+		return fmt.Errorf("%w: past the drainage budget, but a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
 	}
 	return r.teardownChildren(ctx, l, workerDeploy)
 }
