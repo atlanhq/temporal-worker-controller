@@ -620,32 +620,28 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 	}
 
 	if shared {
-		lastRoutingChange := func(ctx context.Context) (time.Time, error) {
+		readRouting := func(ctx context.Context) (sharedRouting, error) {
 			resp, err := temporalClient.WorkerDeploymentClient().
 				GetHandle(k8s.ComputeWorkerDeploymentName(workerDeploy)).
 				Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
 			if err != nil {
-				// A NotFound can be transient. Only when no live sibling has a current version has the
-				// Worker Deployment really never been registered, and so never had routing to change.
+				// A NotFound can be transient. Only when none of this TWD's versions exist either has
+				// the Worker Deployment really never been registered, and so never routed anything.
 				var notFound *serviceerror.NotFound
 				if errors.As(err, &notFound) {
-					registered, lerr := r.siblingHasCurrentVersion(ctx, workerDeploy)
-					if lerr != nil {
-						return time.Time{}, lerr
+					registered, verr := anyVersionRegistered(ctx, temporalClient, ownVersions)
+					if verr != nil {
+						return sharedRouting{}, verr
 					}
 					if !registered {
-						return time.Time{}, nil
+						return sharedRouting{}, nil
 					}
 				}
-				return time.Time{}, err
+				return sharedRouting{}, err
 			}
-			rc := resp.Info.RoutingConfig
-			if rc.RampingVersionChangedTime.After(rc.CurrentVersionChangedTime) {
-				return rc.RampingVersionChangedTime, nil
-			}
-			return rc.CurrentVersionChangedTime, nil
+			return routingOf(resp.Info.RoutingConfig), nil
 		}
-		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, r.sharedReleaseSettle(), lastRoutingChange)
+		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, r.sharedReleaseSettle(), readRouting)
 	}
 
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(workerDeploy)
@@ -671,6 +667,15 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			}
 			if len(versions) == 0 {
 				return r.teardownChildren(ctx, l, workerDeploy)
+			}
+			// A version exists only once its workers have polled, and the server answers for it
+			// separately, so a version it still knows means this NotFound is the transient kind.
+			registered, err := anyVersionRegistered(ctx, temporalClient, versions)
+			if err != nil {
+				return fmt.Errorf("%w: unable to check whether this TWD's versions exist: %v", errTeardownWaiting, err)
+			}
+			if registered {
+				return fmt.Errorf("%w: Worker Deployment reported not found while its versions exist", errTeardownWaiting)
 			}
 			return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, versions, notFoundSettle, nil)
 		}
@@ -939,11 +944,59 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 	return versions, nil
 }
 
+// sharedRouting is what a shared Worker Deployment's routing says about new executions: the builds
+// they pin to (current and ramping), and when that last changed.
+type sharedRouting struct {
+	builds  []string
+	changed time.Time
+}
+
+func routingOf(rc sdkclient.WorkerDeploymentRoutingConfig) sharedRouting {
+	var sr sharedRouting
+	if rc.CurrentVersion != nil {
+		sr.builds = append(sr.builds, rc.CurrentVersion.BuildID)
+	}
+	if rc.RampingVersion != nil {
+		sr.builds = append(sr.builds, rc.RampingVersion.BuildID)
+	}
+	sr.changed = rc.CurrentVersionChangedTime
+	if rc.RampingVersionChangedTime.After(sr.changed) {
+		sr.changed = rc.RampingVersionChangedTime
+	}
+	return sr
+}
+
+// anyVersionRegistered reports whether the server knows any of these versions. The server answers
+// for a version from the version's own record, apart from the Worker Deployment's, so it tells a
+// transient NotFound for the Worker Deployment from one that has never been registered.
+func anyVersionRegistered(
+	ctx context.Context,
+	c sdkclient.Client,
+	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+) (bool, error) {
+	for name, vs := range versions {
+		handle := c.WorkerDeploymentClient().GetHandle(name)
+		for _, v := range vs {
+			_, err := handle.DescribeVersion(ctx, sdkclient.WorkerDeploymentDescribeVersionOptions{BuildID: v.Version.BuildID})
+			if err == nil {
+				return true, nil
+			}
+			var notFound *serviceerror.NotFound
+			if !errors.As(err, &notFound) {
+				return false, err
+			}
+		}
+	}
+	return false, nil
+}
+
 // releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
 // poll, and for any sibling still switching away from those versions, then deletes only
 // those workers. An execution is only counted once its first workflow
 // task pins it and visibility indexes it, so a count of zero is trusted only once settle has passed
-// since both the deletion and the last routing change.
+// since both the deletion and the last routing change. The routing is read from the server on each
+// pass, never from a sibling's status: that status is rebuilt from the same describe, and a
+// transient NotFound leaves it without a current version.
 func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	ctx context.Context,
 	l logr.Logger,
@@ -951,7 +1004,7 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
 	settle time.Duration,
-	lastRoutingChange func(context.Context) (time.Time, error),
+	readRouting func(context.Context) (sharedRouting, error),
 ) error {
 	var pinned int64
 	for name, vs := range versions {
@@ -965,21 +1018,21 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
 		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
 	}
-	pending, err := r.siblingSwitchPending(ctx, workerDeploy, versions)
-	if err != nil {
-		return err
-	}
-	if pending {
-		return fmt.Errorf("%w: a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
-	}
 	settleFrom := workerDeploy.DeletionTimestamp.Time
-	if lastRoutingChange != nil {
-		changed, err := lastRoutingChange(ctx)
+	if readRouting != nil {
+		routing, err := readRouting(ctx)
 		if err != nil {
-			return fmt.Errorf("%w: unable to read when routing last changed: %v", errTeardownWaiting, err)
+			return fmt.Errorf("%w: unable to read the Worker Deployment's routing: %v", errTeardownWaiting, err)
 		}
-		if changed.After(settleFrom) {
-			settleFrom = changed
+		pending, err := r.siblingSwitchPending(ctx, workerDeploy, versions, routing.builds)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return fmt.Errorf("%w: a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
+		}
+		if routing.changed.After(settleFrom) {
+			settleFrom = routing.changed
 		}
 	}
 	if time.Since(settleFrom) < settle {
@@ -988,14 +1041,16 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	return r.teardownChildren(ctx, l, workerDeploy)
 }
 
-// siblingSwitchPending reports whether a live sibling TWD still has one of these builds as its
-// current version while it targets another. Until that sibling switches, new executions keep
+// siblingSwitchPending reports whether the routing still sends new executions to one of these
+// builds while a live sibling TWD targets another. Until that sibling switches, new executions keep
 // pinning to the build and may need this TWD's workers; its switch also only skips the removed
-// queues while this TWD is still being deleted.
+// queues while this TWD is still being deleted. The sibling's target comes from its spec, which
+// the server's answers cannot blank.
 func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
+	routed []string,
 ) (bool, error) {
 	own := map[string]bool{}
 	for _, vs := range versions {
@@ -1003,35 +1058,28 @@ func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
 			own[v.Version.BuildID] = true
 		}
 	}
+	var routedOwn []string
+	for _, b := range routed {
+		if own[b] {
+			routedOwn = append(routedOwn, b)
+		}
+	}
+	if len(routedOwn) == 0 {
+		return false, nil
+	}
 	siblings, err := r.siblingTWDs(ctx, workerDeploy)
 	if err != nil {
 		return false, err
 	}
 	for _, other := range siblings {
-		if !other.DeletionTimestamp.IsZero() || other.Status.CurrentVersion == nil {
+		if !other.DeletionTimestamp.IsZero() {
 			continue
 		}
-		current, target := other.Status.CurrentVersion.BuildID, other.Status.TargetVersion.BuildID
-		if own[current] && target != "" && target != current {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// siblingHasCurrentVersion reports whether a live sibling TWD records a current version, which
-// only a registered Worker Deployment can have.
-func (r *TemporalWorkerDeploymentReconciler) siblingHasCurrentVersion(
-	ctx context.Context,
-	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
-) (bool, error) {
-	siblings, err := r.siblingTWDs(ctx, workerDeploy)
-	if err != nil {
-		return false, err
-	}
-	for _, other := range siblings {
-		if other.DeletionTimestamp.IsZero() && other.Status.CurrentVersion != nil {
-			return true, nil
+		target := k8s.ComputeBuildID(other)
+		for _, b := range routedOwn {
+			if target != b {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

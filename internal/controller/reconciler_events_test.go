@@ -193,14 +193,30 @@ func assertNoEventEmitted(t *testing.T, events []string, reason string) {
 // stubWDHandle implements sdkclient.WorkerDeploymentHandle with configurable per-method errors.
 type stubWDHandle struct {
 	sdkclient.WorkerDeploymentHandle
+	describeResp  sdkclient.WorkerDeploymentDescribeResponse
 	describeErr   error
 	setCurrentErr error
 	setRampingErr error
 	updateMetaErr error
+	// versionExists makes DescribeVersion find the version; otherwise it answers NotFound, or
+	// describeVersionErr when set.
+	versionExists      bool
+	describeVersionErr error
 }
 
 func (s *stubWDHandle) Describe(_ context.Context, _ sdkclient.WorkerDeploymentDescribeOptions) (sdkclient.WorkerDeploymentDescribeResponse, error) {
-	return sdkclient.WorkerDeploymentDescribeResponse{}, s.describeErr
+	return s.describeResp, s.describeErr
+}
+
+func (s *stubWDHandle) DescribeVersion(_ context.Context, _ sdkclient.WorkerDeploymentDescribeVersionOptions) (sdkclient.WorkerDeploymentVersionDescription, error) {
+	switch {
+	case s.describeVersionErr != nil:
+		return sdkclient.WorkerDeploymentVersionDescription{}, s.describeVersionErr
+	case s.versionExists:
+		return sdkclient.WorkerDeploymentVersionDescription{}, nil
+	default:
+		return sdkclient.WorkerDeploymentVersionDescription{}, serviceerror.NewNotFound("Worker Deployment Version not found")
+	}
 }
 
 func (s *stubWDHandle) SetCurrentVersion(_ context.Context, _ sdkclient.WorkerDeploymentSetCurrentVersionOptions) (sdkclient.WorkerDeploymentSetCurrentVersionResponse, error) {

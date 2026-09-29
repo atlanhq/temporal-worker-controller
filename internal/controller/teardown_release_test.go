@@ -18,6 +18,7 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
+	sdkworker "go.temporal.io/sdk/worker"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -236,17 +237,20 @@ func (c *countingTemporalClient) CountWorkflow(ctx context.Context, req *workflo
 }
 
 // A NotFound from the server can be transient, so a TWD on its own Worker Deployment keeps its
-// workers while executions are pinned to them, and right after its deletion even when none are.
+// workers while executions are pinned to them, right after its deletion even when none are, and
+// for as long as the server still knows its version.
 func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		pinned     int64
-		deletedAgo time.Duration
-		wantHeld   bool
+		name          string
+		pinned        int64
+		deletedAgo    time.Duration
+		versionExists bool
+		wantHeld      bool
 	}{
-		{"pinned execution open", 1, 10 * time.Minute, true},
-		{"nothing pinned, within the settle", 0, notFoundSettle - 5*time.Second, true},
-		{"nothing pinned, past the settle", 0, notFoundSettle + 5*time.Second, false},
+		{"pinned execution open", 1, 10 * time.Minute, false, true},
+		{"nothing pinned, within the settle", 0, notFoundSettle - 5*time.Second, false, true},
+		{"nothing pinned, past the settle", 0, notFoundSettle + 5*time.Second, false, false},
+		{"nothing pinned, long past the settle, version still exists", 0, 10 * time.Hour, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			twd := leavingTWD("app-worker-twd", "", true)
@@ -254,15 +258,10 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 			twd.DeletionTimestamp = &deleted
 			twd.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
 			twd.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
-			conn := &temporaliov1alpha1.TemporalConnection{
-				ObjectMeta: metav1.ObjectMeta{Name: "conn", Namespace: "app-ns"},
-				Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: "temporal:7233"},
-			}
-			c := releaseTestClient(t, twd, conn, ownedWorkers(twd, "app-worker-twd-v1", "v1", ""))
+			c := releaseTestClient(t, twd, testConnection(), ownedWorkers(twd, "app-worker-twd-v1", "v1", ""))
 			r := releaseReconciler(c)
-			r.TemporalClientPool = clientpool.New(nil, c)
-			stub := &countingTemporalClient{stubTemporalClient: newStubTemporalClient(nil), pinned: fakePinnedQuerier{count: tc.pinned}}
-			r.TemporalClientPool.SetClientForTesting(noCredsPoolKey("temporal:7233", "default"), stub)
+			stub := withStubTemporal(r, c, fakePinnedQuerier{count: tc.pinned})
+			stubHandle(stub).versionExists = tc.versionExists
 
 			err := r.handleDeletion(context.Background(), logr.Discard(), twd)
 
@@ -272,36 +271,67 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 				require.NoError(t, err)
 			}
 			assert.Equal(t, tc.wantHeld, exists(t, c, "app-worker-twd-v1"))
-			require.Len(t, stub.pinned.countQueries, 1)
-			assert.Equal(t, pinnedExecutionQuery(k8s.ComputeWorkerDeploymentName(twd), "v1"), stub.pinned.countQueries[0])
+			if !tc.versionExists {
+				require.Len(t, stub.pinned.countQueries, 1)
+				assert.Equal(t, pinnedExecutionQuery(k8s.ComputeWorkerDeploymentName(twd), "v1"), stub.pinned.countQueries[0])
+			}
 		})
 	}
 }
 
-// Until a live sibling has switched its current version away from the leaving TWD's build, new
-// executions keep pinning to that build and may need the leaving TWD's workers, so it holds.
-func TestReleaseOwnWorkers_HoldsUntilSiblingSwitchesAwayFromItsBuild(t *testing.T) {
+func testConnection() *temporaliov1alpha1.TemporalConnection {
+	return &temporaliov1alpha1.TemporalConnection{
+		ObjectMeta: metav1.ObjectMeta{Name: "conn", Namespace: "app-ns"},
+		Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: "temporal:7233"},
+	}
+}
+
+func withStubTemporal(r *TemporalWorkerDeploymentReconciler, c client.Client, pinned fakePinnedQuerier) *countingTemporalClient {
+	r.TemporalClientPool = clientpool.New(nil, c)
+	stub := &countingTemporalClient{stubTemporalClient: newStubTemporalClient(nil), pinned: pinned}
+	r.TemporalClientPool.SetClientForTesting(noCredsPoolKey("temporal:7233", "default"), stub)
+	return stub
+}
+
+func stubHandle(stub *countingTemporalClient) *stubWDHandle {
+	return stub.wdClient.(*stubWDClient).handle.(*stubWDHandle)
+}
+
+// liveSibling is a live TWD on the "app" Worker Deployment whose spec targets buildID, with no
+// status at all: the release must not depend on it.
+func liveSibling(buildID string, deleting bool) *temporaliov1alpha1.TemporalWorkerDeployment {
+	twd := leavingTWD("app-worker-twd", "app", deleting)
+	twd.Spec.WorkerOptions.UnsafeCustomBuildID = buildID
+	return twd
+}
+
+// While the routing still sends new executions to the leaving TWD's build, as current or ramping,
+// and a live sibling targets another build, those executions may need the leaving TWD's workers,
+// so it holds. The routing comes from the server and the sibling's target from its spec.
+func TestReleaseOwnWorkers_HoldsWhileRoutingSendsNewWorkToItsBuild(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
-		current, target   string
+		routed            []string
+		siblingTarget     string
 		siblingIsDeleting bool
 		wantHeld          bool
 	}{
-		{"sibling still on the build, moving to another", "v1", "v2", false, true},
-		{"sibling already switched", "v2", "v2", false, false},
-		{"sibling staying on the build", "v1", "v1", false, false},
-		{"sibling also being deleted", "v1", "v2", true, false},
+		{"current on its build, sibling moving to another", []string{"v1"}, "v2", false, true},
+		{"ramping to its build, sibling moving to another", []string{"v0", "v1"}, "v2", false, true},
+		{"sibling already switched", []string{"v2"}, "v2", false, false},
+		{"sibling staying on the build", []string{"v1"}, "v1", false, false},
+		{"sibling also being deleted", []string{"v1"}, "v2", true, false},
+		{"nothing routed", nil, "v2", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			leaving := leavingTWD("app-size-s-twd", "app", true)
-			sibling := leavingTWD("app-worker-twd", "app", tc.siblingIsDeleting)
-			sibling.Status.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
-				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: tc.current},
-			}
-			sibling.Status.TargetVersion.BuildID = tc.target
-			c := releaseTestClient(t, leaving, sibling, ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+			c := releaseTestClient(t, leaving, liveSibling(tc.siblingTarget, tc.siblingIsDeleting), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+			r := releaseReconciler(c)
+			versions, err := r.ownVersions(context.Background(), leaving)
+			require.NoError(t, err)
 
-			err := release(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving)
+			err = r.releaseOwnWorkers(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, versions, releaseSettle,
+				func(context.Context) (sharedRouting, error) { return sharedRouting{builds: tc.routed}, nil })
 
 			if tc.wantHeld {
 				require.ErrorIs(t, err, errTeardownWaiting)
@@ -315,7 +345,7 @@ func TestReleaseOwnWorkers_HoldsUntilSiblingSwitchesAwayFromItsBuild(t *testing.
 
 // A switch of the current or ramping version pins executions to the new routing just before it.
 // Those may not be visible to the count yet, so the settle also runs from the last routing change,
-// and an unknown change time holds.
+// and an unreadable routing holds.
 func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -325,7 +355,7 @@ func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 	}{
 		{"routing changed just now", time.Now().Add(-10 * time.Second), nil, true},
 		{"routing changed long ago", time.Now().Add(-time.Hour), nil, false},
-		{"change time unknown", time.Time{}, errors.New("describe failed"), true},
+		{"routing unreadable", time.Time{}, errors.New("describe failed"), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			leaving := leavingTWD("app-size-s-twd", "app", true)
@@ -335,7 +365,7 @@ func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 			require.NoError(t, err)
 
 			err = r.releaseOwnWorkers(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, versions, releaseSettle,
-				func(context.Context) (time.Time, error) { return tc.changed, tc.err })
+				func(context.Context) (sharedRouting, error) { return sharedRouting{changed: tc.changed}, tc.err })
 
 			if tc.wantHeld {
 				require.ErrorIs(t, err, errTeardownWaiting)
@@ -347,41 +377,47 @@ func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 	}
 }
 
-// A NotFound from the routing lookup can be transient. It lets the release go ahead only when no
-// live sibling has a current version, so the Worker Deployment was never registered; otherwise, and
-// on any other lookup failure, the TWD holds.
+// The shared path reads the routing with the Worker Deployment's describe. A NotFound lets the
+// release go ahead only when the TWD's own version is unknown too, so nothing was ever registered;
+// otherwise it is transient and, like any other failure, holds. A sibling's status plays no part.
 func TestHandleDeletion_SharedRoutingLookup(t *testing.T) {
+	longAgo := time.Now().Add(-time.Hour)
 	for _, tc := range []struct {
-		name              string
-		describe          error
-		siblingRegistered bool
-		wantHeld          bool
+		name               string
+		describe           error
+		current, ramping   string
+		versionExists      bool
+		describeVersionErr error
+		wantHeld           bool
 	}{
-		{"never registered", &serviceerror.NotFound{}, false, false},
-		{"not found while a sibling has a current version", &serviceerror.NotFound{}, true, true},
-		{"lookup failed", errors.New("unavailable"), false, true},
+		{"never registered", &serviceerror.NotFound{}, "", "", false, nil, false},
+		{"not found while its version exists", &serviceerror.NotFound{}, "", "", true, nil, true},
+		{"not found and version lookup failed", &serviceerror.NotFound{}, "", "", false, errors.New("unavailable"), true},
+		{"lookup failed", errors.New("unavailable"), "", "", false, nil, true},
+		{"its build still current, sibling moving on", nil, "v1", "", true, nil, true},
+		{"its build ramping, sibling moving on", nil, "v0", "v1", true, nil, true},
+		{"sibling's build current", nil, "v2", "", true, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			leaving := leavingTWD("app-size-s-twd", "app", true)
 			leaving.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
 			leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
-			sibling := leavingTWD("app-worker-twd", "app", false)
-			if tc.siblingRegistered {
-				sibling.Status.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
-					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: "v1"},
-				}
-				sibling.Status.TargetVersion.BuildID = "v1"
-			}
-			conn := &temporaliov1alpha1.TemporalConnection{
-				ObjectMeta: metav1.ObjectMeta{Name: "conn", Namespace: "app-ns"},
-				Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: "temporal:7233"},
-			}
-			c := releaseTestClient(t, leaving, sibling, conn, ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+			c := releaseTestClient(t, leaving, liveSibling("v2", false), testConnection(), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
 			r := releaseReconciler(c)
-			r.TemporalClientPool = clientpool.New(nil, c)
-			stub := &countingTemporalClient{stubTemporalClient: newStubTemporalClient(nil)}
-			stub.wdClient.(*stubWDClient).handle.(*stubWDHandle).describeErr = tc.describe
-			r.TemporalClientPool.SetClientForTesting(noCredsPoolKey("temporal:7233", "default"), stub)
+			stub := withStubTemporal(r, c, fakePinnedQuerier{})
+			h := stubHandle(stub)
+			h.describeErr = tc.describe
+			h.versionExists = tc.versionExists
+			h.describeVersionErr = tc.describeVersionErr
+			rc := &h.describeResp.Info.RoutingConfig
+			if tc.current != "" {
+				rc.CurrentVersion = &sdkworker.WorkerDeploymentVersion{DeploymentName: "app", BuildID: tc.current}
+				rc.CurrentVersionChangedTime = longAgo
+			}
+			if tc.ramping != "" {
+				rc.RampingVersion = &sdkworker.WorkerDeploymentVersion{DeploymentName: "app", BuildID: tc.ramping}
+				rc.RampingVersionChangedTime = longAgo
+			}
 
 			err := r.handleDeletion(context.Background(), logr.Discard(), leaving)
 
