@@ -16,6 +16,7 @@ import (
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/controller/clientpool"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -335,6 +336,54 @@ func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 
 			err = r.releaseOwnWorkers(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, versions, releaseSettle,
 				func(context.Context) (time.Time, error) { return tc.changed, tc.err })
+
+			if tc.wantHeld {
+				require.ErrorIs(t, err, errTeardownWaiting)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantHeld, exists(t, c, "app-size-s-twd-v1"))
+		})
+	}
+}
+
+// A NotFound from the routing lookup can be transient. It lets the release go ahead only when no
+// live sibling has a current version, so the Worker Deployment was never registered; otherwise, and
+// on any other lookup failure, the TWD holds.
+func TestHandleDeletion_SharedRoutingLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		describe          error
+		siblingRegistered bool
+		wantHeld          bool
+	}{
+		{"never registered", &serviceerror.NotFound{}, false, false},
+		{"not found while a sibling has a current version", &serviceerror.NotFound{}, true, true},
+		{"lookup failed", errors.New("unavailable"), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leaving := leavingTWD("app-size-s-twd", "app", true)
+			leaving.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
+			leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
+			sibling := leavingTWD("app-worker-twd", "app", false)
+			if tc.siblingRegistered {
+				sibling.Status.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: "v1"},
+				}
+				sibling.Status.TargetVersion.BuildID = "v1"
+			}
+			conn := &temporaliov1alpha1.TemporalConnection{
+				ObjectMeta: metav1.ObjectMeta{Name: "conn", Namespace: "app-ns"},
+				Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: "temporal:7233"},
+			}
+			c := releaseTestClient(t, leaving, sibling, conn, ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
+			r := releaseReconciler(c)
+			r.TemporalClientPool = clientpool.New(nil, c)
+			stub := &countingTemporalClient{stubTemporalClient: newStubTemporalClient(nil)}
+			stub.wdClient.(*stubWDClient).handle.(*stubWDHandle).describeErr = tc.describe
+			r.TemporalClientPool.SetClientForTesting(noCredsPoolKey("temporal:7233", "default"), stub)
+
+			err := r.handleDeletion(context.Background(), logr.Discard(), leaving)
 
 			if tc.wantHeld {
 				require.ErrorIs(t, err, errTeardownWaiting)

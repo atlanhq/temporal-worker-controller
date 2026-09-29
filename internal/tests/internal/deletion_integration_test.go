@@ -23,6 +23,7 @@ import (
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/testhelpers"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/server/temporaltest"
@@ -867,6 +868,21 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 		t.Fatalf("failed to start workflow: %v", err)
 	}
 	defer func() { _ = temporalClient.TerminateWorkflow(ctx, "del-quiet-late-run", "", "test cleanup") }()
+	// The run lands on the old build, still current, and needs the removed TWD's queue, so it only
+	// completes if the removed TWD's workers are still there.
+	eventually(t, 60*time.Second, time.Second, func() error {
+		resp, err := temporalClient.DescribeWorkflowExecution(ctx, "del-quiet-late-run", "")
+		if err != nil {
+			return err
+		}
+		if st := resp.GetWorkflowExecutionInfo().GetStatus(); st != enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED {
+			return fmt.Errorf("late run is %v", st)
+		}
+		return nil
+	})
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &held); err != nil {
+		t.Errorf("removed TWD was released before its sibling switched builds: %v", err)
+	}
 
 	liveNew := startWorkers(live.Name, newBuild)
 	defer handleStopFuncs(liveNew)

@@ -624,6 +624,18 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 				GetHandle(k8s.ComputeWorkerDeploymentName(workerDeploy)).
 				Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
 			if err != nil {
+				// A NotFound can be transient. Only when no live sibling has a current version has the
+				// Worker Deployment really never been registered, and so never had routing to change.
+				var notFound *serviceerror.NotFound
+				if errors.As(err, &notFound) {
+					registered, lerr := r.siblingHasCurrentVersion(ctx, workerDeploy)
+					if lerr != nil {
+						return time.Time{}, lerr
+					}
+					if !registered {
+						return time.Time{}, nil
+					}
+				}
 				return time.Time{}, err
 			}
 			rc := resp.Info.RoutingConfig
@@ -844,7 +856,7 @@ func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
 // ignoreMissingTaskQueuesFor reports whether promoting buildID may skip the server's check for task
 // queues the current version has and buildID lacks. That holds only while a sibling TWD is being
 // deleted, since its queues are then missing on purpose, and only once every live sibling targets
-// buildID with its own Deployment for it healthy, so each live pool's queue is served on buildID.
+// buildID and its Deployment for it is available, the readiness the planner itself promotes on.
 func (r *TemporalWorkerDeploymentReconciler) ignoreMissingTaskQueuesFor(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
@@ -904,8 +916,8 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 // releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
 // poll, and for any sibling still switching away from those versions, then deletes only
 // those workers. An execution is only counted once its first workflow
-// task pins it and visibility indexes it, so while the Worker Deployment is still in use a count
-// of zero is trusted only after the deletion is settle old.
+// task pins it and visibility indexes it, so a count of zero is trusted only once settle has passed
+// since both the deletion and the last routing change.
 func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	ctx context.Context,
 	l logr.Logger,
@@ -975,6 +987,24 @@ func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
 		}
 		current, target := other.Status.CurrentVersion.BuildID, other.Status.TargetVersion.BuildID
 		if own[current] && target != "" && target != current {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// siblingHasCurrentVersion reports whether a live sibling TWD records a current version, which
+// only a registered Worker Deployment can have.
+func (r *TemporalWorkerDeploymentReconciler) siblingHasCurrentVersion(
+	ctx context.Context,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+) (bool, error) {
+	siblings, err := r.siblingTWDs(ctx, workerDeploy)
+	if err != nil {
+		return false, err
+	}
+	for _, other := range siblings {
+		if other.DeletionTimestamp.IsZero() && other.Status.CurrentVersion != nil {
 			return true, nil
 		}
 	}
