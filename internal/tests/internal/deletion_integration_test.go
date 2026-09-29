@@ -908,7 +908,8 @@ func testRemovedTWDWaitsForSiblingToSwitchBuilds(
 // its workers do not poll yet, while its queue is busy. The new build is registered by the other
 // pool's workers, so it looks registered to both; only the version's queues show the slow pool is
 // not on it. Until they do, promotion must keep the server's missing-queue check, which keeps the
-// old build current, where the slow pool's old workers still serve its queue.
+// old build current, where the slow pool's old workers still serve its queue. The removed TWD's
+// queue is kept busy too, so the server refuses the final switch unless it skips that check.
 func testSiblingWaitsForLivePoolsQueues(
 	t *testing.T,
 	k8sClient client.Client,
@@ -992,7 +993,7 @@ func testSiblingWaitsForLivePoolsQueues(
 	}
 	eventually(t, 60*time.Second, time.Second, currentIs(oldBuild))
 
-	// Keep the slow pool's queue busy, well inside the server's 30s add-rate window.
+	// Keep the slow pool's and the removed TWD's queues busy, well inside the server's 30s add-rate window.
 	temporalClient := ts.GetDefaultClient()
 	stopTraffic := make(chan struct{})
 	trafficDone := make(chan struct{})
@@ -1004,9 +1005,11 @@ func testSiblingWaitsForLivePoolsQueues(
 				return
 			case <-time.After(2 * time.Second):
 			}
-			_, _ = temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
-				ID: fmt.Sprintf("del-late-traffic-%d", i), TaskQueue: slow.Name,
-			}, "successTestWorkflow")
+			for _, queue := range []string{slow.Name, leaving.Name} {
+				_, _ = temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+					ID: fmt.Sprintf("del-late-traffic-%s-%d", queue, i), TaskQueue: queue,
+				}, "successTestWorkflow")
+			}
 		}
 	}()
 	stop := func() {

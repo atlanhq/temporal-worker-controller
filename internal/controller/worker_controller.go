@@ -482,9 +482,10 @@ func (r *TemporalWorkerDeploymentReconciler) markWRTsTWDNotFound(ctx context.Con
 //  4. Delete all registered versions (with SkipDrainage, now that the wait has cleared them)
 //  5. Delete the deployment record itself once all versions are gone
 //
-// When a live sibling TWD shares the Worker Deployment name, or the server reports no Worker
-// Deployment, steps 1, 2, 4 and 5 are skipped and only this TWD's own workers are released
-// (see releaseOwnWorkers).
+// When a live sibling TWD shares the Worker Deployment name, steps 1, 2, 4 and 5 are skipped and
+// only this TWD's own workers are released (see releaseOwnWorkers). When the server reports no
+// Worker Deployment, the TWD holds while any of its versions still exists, since the NotFound is
+// then transient, and otherwise releases its own workers.
 //
 // teardownChildren deletes the TWD's owned ScaledObjects and child Deployments.
 // Without this, deletion deadlocks: the children are owner-referenced to the TWD,
@@ -559,10 +560,11 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 
 	// A shared Worker Deployment's routing and versions also serve its sibling TWDs, so leave
 	// them to the siblings and release only this TWD's workers.
-	shared, err := r.sharesWorkerDeployment(ctx, workerDeploy)
+	siblings, err := r.siblingTWDs(ctx, workerDeploy)
 	if err != nil {
 		return err
 	}
+	shared := hasLiveSibling(siblings)
 	var ownVersions map[string][]sdkclient.WorkerDeploymentVersionSummary
 	if shared {
 		l.Info("Worker Deployment is shared with other TWDs, releasing only this TWD's workers",
@@ -626,7 +628,8 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 				Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
 			if err != nil {
 				// A NotFound can be transient. Only when none of this TWD's versions exist either has
-				// the Worker Deployment really never been registered, and so never routed anything.
+				// the Worker Deployment really never been registered: then it never routed anything
+				// and nothing can be pinned to it.
 				var notFound *serviceerror.NotFound
 				if errors.As(err, &notFound) {
 					registered, verr := anyVersionRegistered(ctx, temporalClient, ownVersions)
@@ -634,14 +637,14 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 						return sharedRouting{}, verr
 					}
 					if !registered {
-						return sharedRouting{}, nil
+						return sharedRouting{neverRegistered: true}, nil
 					}
 				}
 				return sharedRouting{}, err
 			}
 			return routingOf(resp.Info.RoutingConfig), nil
 		}
-		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, ownVersions, r.sharedReleaseSettle(), readRouting)
+		return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, siblings, ownVersions, readRouting)
 	}
 
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(workerDeploy)
@@ -657,19 +660,14 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			if forceTeardown {
 				return nil
 			}
-			// A NotFound can be transient, and until steps 1-2 run the routing may still send new
-			// executions to this TWD's build. So it keeps the workers while anything is pinned to them
-			// and until notFoundSettle has passed; a held pass describes again, and a transient NotFound
-			// then clears and the full cleanup runs.
+			// A NotFound can be transient. A version exists only once its workers have polled, and the
+			// server answers for it separately, so while it still knows one of this TWD's versions the
+			// TWD holds; a later pass describes again and runs the full cleanup. When it knows none,
+			// nothing was ever registered, so nothing can be pinned to these workers.
 			versions, err := r.ownVersions(ctx, workerDeploy)
 			if err != nil {
 				return err
 			}
-			if len(versions) == 0 {
-				return r.teardownChildren(ctx, l, workerDeploy)
-			}
-			// A version exists only once its workers have polled, and the server answers for it
-			// separately, so a version it still knows means this NotFound is the transient kind.
 			registered, err := anyVersionRegistered(ctx, temporalClient, versions)
 			if err != nil {
 				return fmt.Errorf("%w: unable to check whether this TWD's versions exist: %v", errTeardownWaiting, err)
@@ -677,7 +675,7 @@ func (r *TemporalWorkerDeploymentReconciler) handleDeletion(
 			if registered {
 				return fmt.Errorf("%w: Worker Deployment reported not found while its versions exist", errTeardownWaiting)
 			}
-			return r.releaseOwnWorkers(ctx, l, temporalClient, workerDeploy, versions, notFoundSettle, nil)
+			return r.teardownChildren(ctx, l, workerDeploy)
 		}
 		return fmt.Errorf("unable to describe worker deployment: %w", err)
 	}
@@ -813,11 +811,6 @@ func (r *TemporalWorkerDeploymentReconciler) sharedReleaseSettle() time.Duration
 	return releaseSettle
 }
 
-// notFoundSettle is how long a TWD whose Worker Deployment the server reports as not found keeps
-// its workers before trusting that report, which the server can give transiently. It only has to
-// outlast that, since each held pass describes the Worker Deployment again.
-const notFoundSettle = 30 * time.Second
-
 // siblingTWDs returns the other TWDs in the same namespace that use the same Temporal Worker Deployment.
 func (r *TemporalWorkerDeploymentReconciler) siblingTWDs(
 	ctx context.Context,
@@ -842,21 +835,14 @@ func (r *TemporalWorkerDeploymentReconciler) siblingTWDs(
 	return siblings, nil
 }
 
-// sharesWorkerDeployment reports whether another TWD that is not being deleted uses the same Temporal Worker Deployment.
-func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
-	ctx context.Context,
-	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
-) (bool, error) {
-	siblings, err := r.siblingTWDs(ctx, workerDeploy)
-	if err != nil {
-		return false, err
-	}
+// hasLiveSibling reports whether any of these siblings is not being deleted.
+func hasLiveSibling(siblings []*temporaliov1alpha1.TemporalWorkerDeployment) bool {
 	for _, other := range siblings {
 		if other.DeletionTimestamp.IsZero() {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // ignoreMissingTaskQueuesFor reports whether promoting buildID may skip the server's check for task
@@ -945,10 +931,12 @@ func (r *TemporalWorkerDeploymentReconciler) ownVersions(
 }
 
 // sharedRouting is what a shared Worker Deployment's routing says about new executions: the builds
-// they pin to (current and ramping), and when that last changed.
+// they pin to (current and ramping), and when that last changed. neverRegistered means the server
+// knows neither the Worker Deployment nor any of this TWD's versions.
 type sharedRouting struct {
-	builds  []string
-	changed time.Time
+	builds          []string
+	changed         time.Time
+	neverRegistered bool
 }
 
 func routingOf(rc sdkclient.WorkerDeploymentRoutingConfig) sharedRouting {
@@ -993,17 +981,17 @@ func anyVersionRegistered(
 // releaseOwnWorkers waits for executions pinned to the versions this TWD's own workers
 // poll, and for any sibling still switching away from those versions, then deletes only
 // those workers. An execution is only counted once its first workflow
-// task pins it and visibility indexes it, so a count of zero is trusted only once settle has passed
-// since both the deletion and the last routing change. The routing is read from the server on each
-// pass, never from a sibling's status: that status is rebuilt from the same describe, and a
+// task pins it and visibility indexes it, so a count of zero is trusted only once the settle has
+// passed since both the deletion and the last routing change. The routing is read from the server
+// on each pass, never from a sibling's status: that status is rebuilt from the same describe, and a
 // transient NotFound leaves it without a current version.
 func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 	ctx context.Context,
 	l logr.Logger,
 	c pinnedExecutionQuerier,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	siblings []*temporaliov1alpha1.TemporalWorkerDeployment,
 	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
-	settle time.Duration,
 	readRouting func(context.Context) (sharedRouting, error),
 ) error {
 	var pinned int64
@@ -1018,24 +1006,21 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 		r.recordTeardownHeld(ctx, l, workerDeploy, pinned)
 		return fmt.Errorf("%w: %d open pinned execution(s)", errTeardownWaiting, pinned)
 	}
-	settleFrom := workerDeploy.DeletionTimestamp.Time
-	if readRouting != nil {
-		routing, err := readRouting(ctx)
-		if err != nil {
-			return fmt.Errorf("%w: unable to read the Worker Deployment's routing: %v", errTeardownWaiting, err)
-		}
-		pending, err := r.siblingSwitchPending(ctx, workerDeploy, versions, routing.builds)
-		if err != nil {
-			return err
-		}
-		if pending {
-			return fmt.Errorf("%w: a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
-		}
-		if routing.changed.After(settleFrom) {
-			settleFrom = routing.changed
-		}
+	routing, err := readRouting(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: unable to read the Worker Deployment's routing: %v", errTeardownWaiting, err)
 	}
-	if time.Since(settleFrom) < settle {
+	if routing.neverRegistered {
+		return r.teardownChildren(ctx, l, workerDeploy)
+	}
+	if siblingSwitchPending(siblings, versions, routing.builds) {
+		return fmt.Errorf("%w: a sibling TWD has not yet switched away from this TWD's build", errTeardownWaiting)
+	}
+	settleFrom := workerDeploy.DeletionTimestamp.Time
+	if routing.changed.After(settleFrom) {
+		settleFrom = routing.changed
+	}
+	if time.Since(settleFrom) < r.sharedReleaseSettle() {
 		return fmt.Errorf("%w: waiting for executions pinned before the deletion or the last routing change to be counted", errTeardownWaiting)
 	}
 	return r.teardownChildren(ctx, l, workerDeploy)
@@ -1046,12 +1031,11 @@ func (r *TemporalWorkerDeploymentReconciler) releaseOwnWorkers(
 // pinning to the build and may need this TWD's workers; its switch also only skips the removed
 // queues while this TWD is still being deleted. The sibling's target comes from its spec, which
 // the server's answers cannot blank.
-func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
-	ctx context.Context,
-	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+func siblingSwitchPending(
+	siblings []*temporaliov1alpha1.TemporalWorkerDeployment,
 	versions map[string][]sdkclient.WorkerDeploymentVersionSummary,
 	routed []string,
-) (bool, error) {
+) bool {
 	own := map[string]bool{}
 	for _, vs := range versions {
 		for _, v := range vs {
@@ -1065,11 +1049,7 @@ func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
 		}
 	}
 	if len(routedOwn) == 0 {
-		return false, nil
-	}
-	siblings, err := r.siblingTWDs(ctx, workerDeploy)
-	if err != nil {
-		return false, err
+		return false
 	}
 	for _, other := range siblings {
 		if !other.DeletionTimestamp.IsZero() {
@@ -1078,11 +1058,11 @@ func (r *TemporalWorkerDeploymentReconciler) siblingSwitchPending(
 		target := k8s.ComputeBuildID(other)
 		for _, b := range routedOwn {
 			if target != b {
-				return true, nil
+				return true
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 // errTeardownWaiting marks a teardown that is deliberately incomplete: the TWD still

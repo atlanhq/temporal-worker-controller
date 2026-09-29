@@ -83,9 +83,9 @@ func TestSharesWorkerDeployment(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			deleting := leavingTWD("app-size-s-twd", "app", true)
 			r := &TemporalWorkerDeploymentReconciler{Client: releaseTestClient(t, deleting, tc.sibling)}
-			got, err := r.sharesWorkerDeployment(context.Background(), deleting)
+			siblings, err := r.siblingTWDs(context.Background(), deleting)
 			require.NoError(t, err)
-			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.want, hasLiveSibling(siblings))
 		})
 	}
 }
@@ -124,9 +124,18 @@ func releaseReconciler(c client.Client) *TemporalWorkerDeploymentReconciler {
 
 func release(t *testing.T, r *TemporalWorkerDeploymentReconciler, q pinnedExecutionQuerier, twd *temporaliov1alpha1.TemporalWorkerDeployment) error {
 	t.Helper()
+	return releaseWith(t, r, q, twd, func(context.Context) (sharedRouting, error) { return sharedRouting{}, nil })
+}
+
+// releaseWith runs releaseOwnWorkers for twd with its real siblings and own versions, and the given
+// routing lookup.
+func releaseWith(t *testing.T, r *TemporalWorkerDeploymentReconciler, q pinnedExecutionQuerier, twd *temporaliov1alpha1.TemporalWorkerDeployment, readRouting func(context.Context) (sharedRouting, error)) error {
+	t.Helper()
+	siblings, err := r.siblingTWDs(context.Background(), twd)
+	require.NoError(t, err)
 	versions, err := r.ownVersions(context.Background(), twd)
 	require.NoError(t, err)
-	return r.releaseOwnWorkers(context.Background(), logr.Discard(), q, twd, versions, releaseSettle, nil)
+	return r.releaseOwnWorkers(context.Background(), logr.Discard(), q, twd, siblings, versions, readRouting)
 }
 
 // Siblings on one release share the build, so the leaving TWD's version is also theirs. Any open
@@ -236,21 +245,22 @@ func (c *countingTemporalClient) CountWorkflow(ctx context.Context, req *workflo
 	return c.pinned.CountWorkflow(ctx, req)
 }
 
-// A NotFound from the server can be transient, so a TWD on its own Worker Deployment keeps its
-// workers while executions are pinned to them, right after its deletion even when none are, and
-// for as long as the server still knows its version.
-func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
+// A NotFound from the server can be transient, so a TWD on its own Worker Deployment holds while the
+// server still knows one of its versions, however long ago it was deleted, and when it can't tell.
+// When the server knows none, nothing can be pinned to its workers and it releases them without
+// counting.
+func TestHandleDeletion_NotFoundHoldsWhileItsVersionsExist(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		pinned        int64
-		deletedAgo    time.Duration
-		versionExists bool
-		wantHeld      bool
+		name               string
+		deletedAgo         time.Duration
+		versionExists      bool
+		describeVersionErr error
+		wantHeld           bool
 	}{
-		{"pinned execution open", 1, 10 * time.Minute, false, true},
-		{"nothing pinned, within the settle", 0, notFoundSettle - 5*time.Second, false, true},
-		{"nothing pinned, past the settle", 0, notFoundSettle + 5*time.Second, false, false},
-		{"nothing pinned, long past the settle, version still exists", 0, 10 * time.Hour, true, true},
+		{"version exists, right after deletion", time.Second, true, nil, true},
+		{"version exists, long after deletion", 10 * time.Hour, true, nil, true},
+		{"version lookup failed", 10 * time.Hour, false, errors.New("unavailable"), true},
+		{"no version, right after deletion", time.Second, false, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			twd := leavingTWD("app-worker-twd", "", true)
@@ -260,8 +270,10 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 			twd.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
 			c := releaseTestClient(t, twd, testConnection(), ownedWorkers(twd, "app-worker-twd-v1", "v1", ""))
 			r := releaseReconciler(c)
-			stub := withStubTemporal(r, c, fakePinnedQuerier{count: tc.pinned})
-			stubHandle(stub).versionExists = tc.versionExists
+			stub := withStubTemporal(r, c, fakePinnedQuerier{})
+			h := stubHandle(stub)
+			h.versionExists = tc.versionExists
+			h.describeVersionErr = tc.describeVersionErr
 
 			err := r.handleDeletion(context.Background(), logr.Discard(), twd)
 
@@ -271,10 +283,7 @@ func TestHandleDeletion_NotFoundHoldsForPinnedExecutions(t *testing.T) {
 				require.NoError(t, err)
 			}
 			assert.Equal(t, tc.wantHeld, exists(t, c, "app-worker-twd-v1"))
-			if !tc.versionExists {
-				require.Len(t, stub.pinned.countQueries, 1)
-				assert.Equal(t, pinnedExecutionQuery(k8s.ComputeWorkerDeploymentName(twd), "v1"), stub.pinned.countQueries[0])
-			}
+			assert.Empty(t, stub.pinned.countQueries)
 		})
 	}
 }
@@ -326,11 +335,7 @@ func TestReleaseOwnWorkers_HoldsWhileRoutingSendsNewWorkToItsBuild(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			leaving := leavingTWD("app-size-s-twd", "app", true)
 			c := releaseTestClient(t, leaving, liveSibling(tc.siblingTarget, tc.siblingIsDeleting), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
-			r := releaseReconciler(c)
-			versions, err := r.ownVersions(context.Background(), leaving)
-			require.NoError(t, err)
-
-			err = r.releaseOwnWorkers(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, versions, releaseSettle,
+			err := releaseWith(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving,
 				func(context.Context) (sharedRouting, error) { return sharedRouting{builds: tc.routed}, nil })
 
 			if tc.wantHeld {
@@ -360,11 +365,7 @@ func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			leaving := leavingTWD("app-size-s-twd", "app", true)
 			c := releaseTestClient(t, leaving, leavingTWD("app-worker-twd", "app", false), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
-			r := releaseReconciler(c)
-			versions, err := r.ownVersions(context.Background(), leaving)
-			require.NoError(t, err)
-
-			err = r.releaseOwnWorkers(context.Background(), logr.Discard(), &fakePinnedQuerier{}, leaving, versions, releaseSettle,
+			err := releaseWith(t, releaseReconciler(c), &fakePinnedQuerier{}, leaving,
 				func(context.Context) (sharedRouting, error) { return sharedRouting{changed: tc.changed}, tc.err })
 
 			if tc.wantHeld {
@@ -377,9 +378,9 @@ func TestReleaseOwnWorkers_SettlesFromTheLastRoutingChange(t *testing.T) {
 	}
 }
 
-// The shared path reads the routing with the Worker Deployment's describe. A NotFound lets the
-// release go ahead only when the TWD's own version is unknown too, so nothing was ever registered;
-// otherwise it is transient and, like any other failure, holds. A sibling's status plays no part.
+// The shared path reads the routing with the Worker Deployment's describe. A NotFound releases the
+// TWD at once only when its own version is unknown too, so nothing was ever registered; otherwise it
+// is transient and, like any other failure, holds. A sibling's status plays no part.
 func TestHandleDeletion_SharedRoutingLookup(t *testing.T) {
 	longAgo := time.Now().Add(-time.Hour)
 	for _, tc := range []struct {
@@ -388,20 +389,27 @@ func TestHandleDeletion_SharedRoutingLookup(t *testing.T) {
 		current, ramping   string
 		versionExists      bool
 		describeVersionErr error
+		justDeleted        bool
 		wantHeld           bool
 	}{
-		{"never registered", &serviceerror.NotFound{}, "", "", false, nil, false},
-		{"not found while its version exists", &serviceerror.NotFound{}, "", "", true, nil, true},
-		{"not found and version lookup failed", &serviceerror.NotFound{}, "", "", false, errors.New("unavailable"), true},
-		{"lookup failed", errors.New("unavailable"), "", "", false, nil, true},
-		{"its build still current, sibling moving on", nil, "v1", "", true, nil, true},
-		{"its build ramping, sibling moving on", nil, "v0", "v1", true, nil, true},
-		{"sibling's build current", nil, "v2", "", true, nil, false},
+		{"never registered", &serviceerror.NotFound{}, "", "", false, nil, false, false},
+		{"never registered, right after deletion", &serviceerror.NotFound{}, "", "", false, nil, true, false},
+		{"not found while its version exists, right after deletion", &serviceerror.NotFound{}, "", "", true, nil, true, true},
+		{"not found while its version exists", &serviceerror.NotFound{}, "", "", true, nil, false, true},
+		{"not found and version lookup failed", &serviceerror.NotFound{}, "", "", false, errors.New("unavailable"), false, true},
+		{"lookup failed", errors.New("unavailable"), "", "", false, nil, false, true},
+		{"its build still current, sibling moving on", nil, "v1", "", true, nil, false, true},
+		{"its build ramping, sibling moving on", nil, "v0", "v1", true, nil, false, true},
+		{"sibling's build current", nil, "v2", "", true, nil, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			leaving := leavingTWD("app-size-s-twd", "app", true)
 			leaving.Spec.WorkerOptions.TemporalConnectionRef.Name = "conn"
 			leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: 72 * time.Hour}
+			if tc.justDeleted {
+				deleted := metav1.NewTime(time.Now().Add(-time.Second))
+				leaving.DeletionTimestamp = &deleted
+			}
 			c := releaseTestClient(t, leaving, liveSibling("v2", false), testConnection(), ownedWorkers(leaving, "app-size-s-twd-v1", "v1", "app"))
 			r := releaseReconciler(c)
 			stub := withStubTemporal(r, c, fakePinnedQuerier{})
