@@ -15,6 +15,7 @@ import (
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/controller/clientpool"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
+	"github.com/temporalio/temporal-worker-controller/internal/planner"
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
@@ -855,11 +856,17 @@ func (r *TemporalWorkerDeploymentReconciler) sharesWorkerDeployment(
 
 // ignoreMissingTaskQueuesFor reports whether promoting buildID may skip the server's check for task
 // queues the current version has and buildID lacks. That holds only while a sibling TWD is being
-// deleted, since its queues are then missing on purpose, and only once every live sibling targets
-// buildID and its Deployment for it is available, the readiness the planner itself promotes on.
+// deleted, since its queues are then missing on purpose, and only once every live TWD on the Worker
+// Deployment, this one included, targets buildID with its Deployment for it available and the queues
+// its spec declares polled on buildID. The version's status is shared by every TWD on the Worker
+// Deployment, and a Deployment is available before its workers poll, so only the version's queues
+// show that a TWD's own workers have reached it; without that, the skipped check could drop a live
+// pool's queue. The queues are read from the server, of every type, since a pool may only run
+// activities. A TWD that declares no queue cannot be checked, as for a gated rollout.
 func (r *TemporalWorkerDeploymentReconciler) ignoreMissingTaskQueuesFor(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	deploymentHandler sdkclient.WorkerDeploymentHandle,
 	buildID string,
 ) (bool, error) {
 	siblings, err := r.siblingTWDs(ctx, workerDeploy)
@@ -867,6 +874,7 @@ func (r *TemporalWorkerDeploymentReconciler) ignoreMissingTaskQueuesFor(
 		return false, err
 	}
 	deleting := false
+	expected := planner.ExpectedGateQueues(&workerDeploy.Spec)
 	for _, other := range siblings {
 		if !other.DeletionTimestamp.IsZero() {
 			deleting = true
@@ -877,8 +885,26 @@ func (r *TemporalWorkerDeploymentReconciler) ignoreMissingTaskQueuesFor(
 			target.Status == "" || target.Status == temporaliov1alpha1.VersionStatusNotRegistered {
 			return false, nil
 		}
+		expected = append(expected, planner.ExpectedGateQueues(&other.Spec)...)
 	}
-	return deleting, nil
+	if !deleting || len(expected) == 0 {
+		return deleting, nil
+	}
+	desc, err := deploymentHandler.DescribeVersion(ctx, sdkclient.WorkerDeploymentDescribeVersionOptions{BuildID: buildID})
+	if err != nil {
+		// Without the version's queues, keep the server's check; it refuses only if a queue is missing.
+		return false, nil
+	}
+	polled := map[string]bool{}
+	for _, tq := range desc.Info.TaskQueuesInfos {
+		polled[tq.Name] = true
+	}
+	for _, q := range expected {
+		if !polled[q] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // ownVersions returns the Worker Deployment versions this TWD's own workers poll, grouped by
