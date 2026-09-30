@@ -230,7 +230,7 @@ test-unit: envtest ## Run unit tests and webhook integration tests (requires env
 .PHONY: test-integration
 test-integration: manifests generate envtest ## Run integration tests against local Temporal dev server.
 	@echo "Running integration tests..."
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -v -tags test_dep ./internal/tests/internal -run TestIntegration
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -v -timeout 30m -tags test_dep ./internal/tests/internal -run TestIntegration
 
 ##@ Build
 

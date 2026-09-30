@@ -19,6 +19,11 @@ import (
 const (
 	successTestWorkflowType = "successTestWorkflow"
 	failTestWorkflowType    = "failTestWorkflow"
+
+	// WaitForSignalTestWorkflowType stays open until it receives ReleaseTestSignal, so a test
+	// can hold a pinned execution open for as long as it needs.
+	WaitForSignalTestWorkflowType = "waitForSignalTestWorkflow"
+	ReleaseTestSignal             = "release"
 )
 
 func getEnv(podTemplateSpec corev1.PodTemplateSpec, key string) (string, error) {
@@ -123,6 +128,7 @@ func RunHelloWorldWorker(ctx context.Context, podTemplateSpec corev1.PodTemplate
 	// Register activities and workflows
 	w.RegisterWorkflowWithOptions(successTestWorkflow, workflow.RegisterOptions{Name: successTestWorkflowType})
 	w.RegisterWorkflowWithOptions(failTestWorkflow, workflow.RegisterOptions{Name: failTestWorkflowType})
+	w.RegisterWorkflowWithOptions(waitForSignalTestWorkflow, workflow.RegisterOptions{Name: WaitForSignalTestWorkflowType})
 	w.RegisterActivity(getSubjectTestActivity)
 	w.RegisterActivity(sleepTestActivity)
 
@@ -160,6 +166,11 @@ func successTestWorkflow(ctx workflow.Context) (string, error) {
 
 	// Return the greeting
 	return fmt.Sprintf("Hello %s", subject), nil
+}
+
+func waitForSignalTestWorkflow(ctx workflow.Context) error {
+	workflow.GetSignalChannel(ctx, ReleaseTestSignal).Receive(ctx, nil)
+	return nil
 }
 
 func failTestWorkflow(ctx workflow.Context) (string, error) {

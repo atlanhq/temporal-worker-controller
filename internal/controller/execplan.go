@@ -246,12 +246,21 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 		}
 	}
 
+	// A sibling TWD being deleted takes its task queues out of new versions on purpose. While those
+	// queues still carry work pinned to the current version, the server would refuse to promote a
+	// version without them, so new work would keep landing on the old version and it could never drain.
+	ignoreMissingTaskQueues, err := r.ignoreMissingTaskQueuesFor(ctx, workerDeploy, deploymentHandler, vcfg.BuildID)
+	if err != nil {
+		return err
+	}
+
 	if vcfg.SetCurrent {
 		l.Info("registering new current version", "buildID", vcfg.BuildID)
 		if _, err := deploymentHandler.SetCurrentVersion(ctx, sdkclient.WorkerDeploymentSetCurrentVersionOptions{
-			BuildID:       vcfg.BuildID,
-			ConflictToken: vcfg.ConflictToken,
-			Identity:      getControllerIdentity(),
+			BuildID:                 vcfg.BuildID,
+			ConflictToken:           vcfg.ConflictToken,
+			Identity:                getControllerIdentity(),
+			IgnoreMissingTaskQueues: ignoreMissingTaskQueues,
 		}); err != nil {
 			l.Error(err, "unable to set current deployment version", "buildID", vcfg.BuildID)
 			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonVersionPromotionFailed,
@@ -271,10 +280,11 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 		}
 
 		if _, err := deploymentHandler.SetRampingVersion(ctx, sdkclient.WorkerDeploymentSetRampingVersionOptions{
-			BuildID:       vcfg.BuildID,
-			Percentage:    float32(vcfg.RampPercentage),
-			ConflictToken: vcfg.ConflictToken,
-			Identity:      getControllerIdentity(),
+			BuildID:                 vcfg.BuildID,
+			Percentage:              float32(vcfg.RampPercentage),
+			ConflictToken:           vcfg.ConflictToken,
+			Identity:                getControllerIdentity(),
+			IgnoreMissingTaskQueues: ignoreMissingTaskQueues,
 		}); err != nil {
 			l.Error(err, "unable to set ramping deployment version", "buildID", vcfg.BuildID, "percentage", vcfg.RampPercentage)
 			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonVersionPromotionFailed,

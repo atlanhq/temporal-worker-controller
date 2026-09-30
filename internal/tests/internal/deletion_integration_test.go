@@ -9,6 +9,10 @@ package internal
 //   - TWD deletion removes finalizer from TemporalConnection when no other TWDs reference it
 //   - TWD is fully deleted from K8s after cleanup (finalizer removed)
 //   - TWD deletion with TemporalConnection deleted simultaneously (Helm race condition) still succeeds
+//   - Deleting one of several TWDs that share a Worker Deployment leaves the siblings' routing alone
+//   - A sibling rolls out a build without the deleting TWD's queue while that queue is busy
+//   - A removed TWD stays until its sibling has switched away from its build, even when nothing is pinned
+//   - A promotion skips missing queues only once every live pool's own queue is on the new build
 
 import (
 	"context"
@@ -20,12 +24,14 @@ import (
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/testhelpers"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/server/temporaltest"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -43,6 +49,26 @@ func runDeletionTests(
 
 	t.Run("deletion-removes-connection-finalizer", func(t *testing.T) {
 		testDeletionRemovesConnectionFinalizer(t, k8sClient, ts, testNamespace)
+	})
+
+	t.Run("deletion-on-shared-deployment-keeps-sibling-routing", func(t *testing.T) {
+		testDeletionOnSharedDeploymentKeepsSiblingRouting(t, k8sClient, ts, testNamespace)
+	})
+
+	t.Run("sibling-promotes-while-deleting-twds-queue-is-busy", func(t *testing.T) {
+		testSiblingPromotesWhileDeletingQueueIsBusy(t, k8sClient, ts, testNamespace)
+	})
+
+	t.Run("removed-twd-waits-for-sibling-to-switch-builds", func(t *testing.T) {
+		testRemovedTWDWaitsForSiblingToSwitchBuilds(t, k8sClient, ts, testNamespace, "del-quiet", 0)
+	})
+
+	t.Run("removed-twd-past-its-budget-waits-for-sibling-to-switch-builds", func(t *testing.T) {
+		testRemovedTWDWaitsForSiblingToSwitchBuilds(t, k8sClient, ts, testNamespace, "del-budget", 30*time.Second)
+	})
+
+	t.Run("sibling-waits-for-live-pools-queues-before-skipping-missing-queues", func(t *testing.T) {
+		testSiblingWaitsForLivePoolsQueues(t, k8sClient, ts, testNamespace)
 	})
 
 	t.Run("drained-version-pruned-from-temporal-on-sunset", func(t *testing.T) {
@@ -119,15 +145,17 @@ func testDeletionSetsCurrentToUnversioned(
 	// Update the TWD to target v2.0, creating a second version to use as a ramping version.
 	// This exercises the ramping-version clear path in handleDeletion.
 	var twdForUpdate temporaliov1alpha1.TemporalWorkerDeployment
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdForUpdate); err != nil {
-		t.Fatalf("failed to get TWD for v2.0 update: %v", err)
-	}
-	twdForUpdate.Spec.Template.Spec.Containers[0].Image = "v2.0"
-	buildIDv2 := k8s.ComputeBuildID(&twdForUpdate)
-	deploymentNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
-	if err := k8sClient.Update(ctx, &twdForUpdate); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdForUpdate); err != nil {
+			return err
+		}
+		twdForUpdate.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &twdForUpdate)
+	}); err != nil {
 		t.Fatalf("failed to update TWD to v2.0: %v", err)
 	}
+	buildIDv2 := k8s.ComputeBuildID(&twdForUpdate)
+	deploymentNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
 
 	// Wait for the controller to create the v2.0 K8s Deployment
 	eventually(t, 30*time.Second, time.Second, func() error {
@@ -401,15 +429,17 @@ func testDrainedVersionPrunedOnSunset(
 
 	// Roll out v2.0 and make it current, so v1.0 becomes deprecated and starts draining.
 	var twdV2 temporaliov1alpha1.TemporalWorkerDeployment
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdV2); err != nil {
-		t.Fatalf("failed to get TWD for v2.0 update: %v", err)
-	}
-	twdV2.Spec.Template.Spec.Containers[0].Image = "v2.0"
-	buildIDv2 := k8s.ComputeBuildID(&twdV2)
-	depNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
-	if err := k8sClient.Update(ctx, &twdV2); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &twdV2); err != nil {
+			return err
+		}
+		twdV2.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &twdV2)
+	}); err != nil {
 		t.Fatalf("failed to update TWD to v2.0: %v", err)
 	}
+	buildIDv2 := k8s.ComputeBuildID(&twdV2)
+	depNameV2 := k8s.ComputeVersionedDeploymentName(twd.Name, buildIDv2)
 	eventually(t, 30*time.Second, time.Second, func() error {
 		var dep appsv1.Deployment
 		return k8sClient.Get(ctx, types.NamespacedName{Name: depNameV2, Namespace: namespace}, &dep)
@@ -459,4 +489,621 @@ func testDrainedVersionPrunedOnSunset(
 		return nil
 	})
 	t.Logf("Verified: drained v1.0 (buildID=%s) was pruned from the Temporal server on sunset", buildIDv1)
+}
+
+// testDeletionOnSharedDeploymentKeepsSiblingRouting deletes one of two TWDs that share a Worker
+// Deployment and a build. The deleted TWD must finish deleting with only its own workers removed,
+// and the Worker Deployment must keep routing to the build its live sibling runs.
+func testDeletionOnSharedDeploymentKeepsSiblingRouting(
+	t *testing.T,
+	k8sClient client.Client,
+	ts *temporaltest.TestServer,
+	namespace string,
+) {
+	ctx := context.Background()
+	const (
+		sharedName = "del-shared"
+		buildID    = "shared-v1"
+		connName   = "del-shared-conn"
+	)
+
+	newTWD := func(name string) *temporaliov1alpha1.TemporalWorkerDeployment {
+		tc := testhelpers.NewTestCase().
+			WithInput(
+				testhelpers.NewTemporalWorkerDeploymentBuilder().
+					WithAllAtOnceStrategy().
+					WithTargetTemplate("v1.0").
+					WithUnsafeCustomBuildID(buildID),
+			).
+			BuildWithValues(name, namespace, ts.GetDefaultNamespace())
+		twd := tc.GetTWD()
+		twd.Spec.WorkerOptions.WorkerDeploymentName = sharedName
+		twd.Spec.WorkerOptions.TemporalConnectionRef.Name = connName
+		return twd
+	}
+	live, leaving := newTWD("del-shared-live"), newTWD("del-shared-leaving")
+
+	if err := k8sClient.Create(ctx, &temporaliov1alpha1.TemporalConnection{
+		ObjectMeta: metav1.ObjectMeta{Name: connName, Namespace: namespace},
+		Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: ts.GetFrontendHostPort()},
+	}); err != nil {
+		t.Fatalf("failed to create TemporalConnection: %v", err)
+	}
+
+	children := map[string]string{}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{live, leaving} {
+		if err := k8sClient.Create(ctx, twd); err != nil {
+			t.Fatalf("failed to create TWD %s: %v", twd.Name, err)
+		}
+		child := k8s.ComputeVersionedDeploymentName(twd.Name, buildID)
+		children[twd.Name] = child
+		eventually(t, 30*time.Second, time.Second, func() error {
+			var dep appsv1.Deployment
+			return k8sClient.Get(ctx, types.NamespacedName{Name: child, Namespace: namespace}, &dep)
+		})
+		stop := applyDeployment(t, ctx, k8sClient, child, namespace)
+		defer handleStopFuncs(stop)
+	}
+
+	handle := ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(sharedName)
+	currentIsShared := func() error {
+		resp, err := handle.Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
+		if err != nil {
+			return err
+		}
+		if cur := resp.Info.RoutingConfig.CurrentVersion; cur == nil || cur.BuildID != buildID {
+			return fmt.Errorf("current version is %v, want build %s", cur, buildID)
+		}
+		return nil
+	}
+	eventually(t, 60*time.Second, time.Second, currentIsShared)
+
+	// Executions pinned to the shared build may still schedule work on the leaving TWD's queue, so
+	// it holds while any is open, whether started before or after its deletion.
+	temporalClient := ts.GetDefaultClient()
+	startPinned := func(id string) {
+		if _, err := temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+			ID: id, TaskQueue: live.Name,
+		}, testhelpers.WaitForSignalTestWorkflowType); err != nil {
+			t.Fatalf("failed to start workflow %s: %v", id, err)
+		}
+		eventually(t, 30*time.Second, time.Second, func() error {
+			resp, err := temporalClient.DescribeWorkflowExecution(ctx, id, "")
+			if err != nil {
+				return err
+			}
+			if v := resp.GetWorkflowExecutionInfo().GetVersioningInfo(); v.GetDeploymentVersion().GetBuildId() != buildID {
+				return fmt.Errorf("workflow %s not yet pinned to %s: %v", id, buildID, v)
+			}
+			return nil
+		})
+	}
+	release := func(id string) {
+		if err := temporalClient.SignalWorkflow(ctx, id, "", testhelpers.ReleaseTestSignal, nil); err != nil {
+			t.Fatalf("failed to signal workflow %s: %v", id, err)
+		}
+	}
+	cleanup := func(id string) { _ = temporalClient.TerminateWorkflow(ctx, id, "", "test cleanup") }
+	startPinned("del-shared-before")
+	defer cleanup("del-shared-before")
+
+	if err := k8sClient.Delete(ctx, leaving); err != nil {
+		t.Fatalf("failed to delete TWD: %v", err)
+	}
+	deletedAt := time.Now()
+	startPinned("del-shared-after")
+	defer cleanup("del-shared-after")
+
+	stillHeld := func(open string, until time.Time) {
+		for ; time.Now().Before(until); time.Sleep(time.Second) {
+			var held temporaliov1alpha1.TemporalWorkerDeployment
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &held); err != nil {
+				t.Fatalf("leaving TWD was released while %s, pinned to its build, was open: %v", open, err)
+			}
+		}
+	}
+	// Past the controller's one-minute settle, a hold can only come from an open execution.
+	stillHeld("both executions", deletedAt.Add(75*time.Second))
+	release("del-shared-after")
+	stillHeld("del-shared-before", time.Now().Add(15*time.Second))
+	release("del-shared-before")
+
+	eventually(t, 2*time.Minute, time.Second, func() error {
+		var check temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &check); err == nil {
+			return errors.New("leaving TWD still exists")
+		}
+		return nil
+	})
+
+	// The live sibling's controller would restore a cleared current version within a reconcile,
+	// so sample for longer than a few requeues rather than checking once.
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(time.Second) {
+		if err := currentIsShared(); err != nil {
+			t.Fatalf("shared routing changed after a sibling was deleted: %v", err)
+		}
+	}
+
+	var dep appsv1.Deployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: children[live.Name], Namespace: namespace}, &dep); err != nil {
+		t.Fatalf("live sibling's workers must stay: %v", err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: children[leaving.Name], Namespace: namespace}, &dep); err == nil {
+		t.Fatalf("deleted TWD's workers %s must be removed", children[leaving.Name])
+	}
+}
+
+// testSiblingPromotesWhileDeletingQueueIsBusy removes one of two TWDs sharing a Worker Deployment
+// in the same release that moves the other to a new build. The new build has no worker on the
+// removed TWD's queue, and that queue keeps receiving work pinned to the old build. The sibling's
+// promotion must still go through, so new work stops landing on the old build and the removed
+// TWD can drain and be released.
+func testSiblingPromotesWhileDeletingQueueIsBusy(
+	t *testing.T,
+	k8sClient client.Client,
+	ts *temporaltest.TestServer,
+	namespace string,
+) {
+	ctx := context.Background()
+	const (
+		sharedName = "del-roll"
+		oldBuild   = "roll-v1"
+		newBuild   = "roll-v2"
+		connName   = "del-roll-conn"
+	)
+
+	newTWD := func(name string) *temporaliov1alpha1.TemporalWorkerDeployment {
+		tc := testhelpers.NewTestCase().
+			WithInput(
+				testhelpers.NewTemporalWorkerDeploymentBuilder().
+					WithAllAtOnceStrategy().
+					WithTargetTemplate("v1.0").
+					WithUnsafeCustomBuildID(oldBuild),
+			).
+			BuildWithValues(name, namespace, ts.GetDefaultNamespace())
+		twd := tc.GetTWD()
+		twd.Spec.WorkerOptions.WorkerDeploymentName = sharedName
+		twd.Spec.WorkerOptions.TemporalConnectionRef.Name = connName
+		return twd
+	}
+	live, leaving := newTWD("del-roll-live"), newTWD("del-roll-leaving")
+
+	if err := k8sClient.Create(ctx, &temporaliov1alpha1.TemporalConnection{
+		ObjectMeta: metav1.ObjectMeta{Name: connName, Namespace: namespace},
+		Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: ts.GetFrontendHostPort()},
+	}); err != nil {
+		t.Fatalf("failed to create TemporalConnection: %v", err)
+	}
+	startWorkers := func(twdName, buildID string) {
+		child := k8s.ComputeVersionedDeploymentName(twdName, buildID)
+		eventually(t, 30*time.Second, time.Second, func() error {
+			var dep appsv1.Deployment
+			return k8sClient.Get(ctx, types.NamespacedName{Name: child, Namespace: namespace}, &dep)
+		})
+		stop := applyDeployment(t, ctx, k8sClient, child, namespace)
+		t.Cleanup(func() { handleStopFuncs(stop) })
+	}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{live, leaving} {
+		if err := k8sClient.Create(ctx, twd); err != nil {
+			t.Fatalf("failed to create TWD %s: %v", twd.Name, err)
+		}
+		startWorkers(twd.Name, oldBuild)
+	}
+
+	handle := ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(sharedName)
+	currentIs := func(buildID string) func() error {
+		return func() error {
+			resp, err := handle.Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
+			if err != nil {
+				return err
+			}
+			if cur := resp.Info.RoutingConfig.CurrentVersion; cur == nil || cur.BuildID != buildID {
+				return fmt.Errorf("current version is %v, want build %s", cur, buildID)
+			}
+			return nil
+		}
+	}
+	eventually(t, 60*time.Second, time.Second, currentIs(oldBuild))
+
+	// Keep the leaving TWD's queue busy on the old build, well inside the server's 30s add-rate window.
+	temporalClient := ts.GetDefaultClient()
+	stopTraffic := make(chan struct{})
+	trafficDone := make(chan struct{})
+	go func() {
+		defer close(trafficDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stopTraffic:
+				return
+			case <-time.After(2 * time.Second):
+			}
+			_, _ = temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+				ID: fmt.Sprintf("del-roll-traffic-%d", i), TaskQueue: leaving.Name,
+			}, "successTestWorkflow")
+		}
+	}()
+	stop := func() {
+		select {
+		case <-stopTraffic:
+		default:
+			close(stopTraffic)
+			<-trafficDone
+		}
+	}
+	defer stop()
+	time.Sleep(5 * time.Second)
+
+	// One release: the leaving TWD is removed and its sibling moves to a build without its queue.
+	if err := k8sClient.Delete(ctx, leaving); err != nil {
+		t.Fatalf("failed to delete TWD: %v", err)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: live.Name, Namespace: namespace}, &fresh); err != nil {
+			return err
+		}
+		fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
+		fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &fresh)
+	}); err != nil {
+		t.Fatalf("failed to move live TWD to %s: %v", newBuild, err)
+	}
+	startWorkers(live.Name, newBuild)
+
+	eventually(t, 60*time.Second, time.Second, currentIs(newBuild))
+	stop()
+
+	eventually(t, 2*time.Minute, time.Second, func() error {
+		var check temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &check); err == nil {
+			return errors.New("leaving TWD still exists")
+		}
+		return nil
+	})
+}
+
+// testRemovedTWDWaitsForSiblingToSwitchBuilds removes one of two TWDs sharing a Worker Deployment
+// in the release that moves the other to a new build, on a quiet queue, while the new build's
+// workers take longer than the settle to come up. Until the sibling has switched, the old build is
+// still current, so a new run can still need the removed TWD's queue: the removed TWD must stay
+// until the switch, or that run strands and the switch is refused for the stranded queue. With a
+// budget, the removed TWD's drainage budget runs out while the sibling is still waiting for its new
+// workers: the budget ends the wait for pinned runs, but not the wait for that switch.
+func testRemovedTWDWaitsForSiblingToSwitchBuilds(
+	t *testing.T,
+	k8sClient client.Client,
+	ts *temporaltest.TestServer,
+	namespace string,
+	prefix string,
+	budget time.Duration,
+) {
+	ctx := context.Background()
+	var (
+		sharedName = prefix
+		oldBuild   = prefix + "-v1"
+		newBuild   = prefix + "-v2"
+		connName   = prefix + "-conn"
+		lateRun    = prefix + "-late-run"
+	)
+
+	newTWD := func(name string) *temporaliov1alpha1.TemporalWorkerDeployment {
+		tc := testhelpers.NewTestCase().
+			WithInput(
+				testhelpers.NewTemporalWorkerDeploymentBuilder().
+					WithAllAtOnceStrategy().
+					WithTargetTemplate("v1.0").
+					WithUnsafeCustomBuildID(oldBuild),
+			).
+			BuildWithValues(name, namespace, ts.GetDefaultNamespace())
+		twd := tc.GetTWD()
+		twd.Spec.WorkerOptions.WorkerDeploymentName = sharedName
+		twd.Spec.WorkerOptions.TemporalConnectionRef.Name = connName
+		return twd
+	}
+	live, leaving := newTWD(prefix+"-live"), newTWD(prefix+"-leaving")
+	if budget > 0 {
+		leaving.Spec.SunsetStrategy.TeardownDrainageTimeout = &metav1.Duration{Duration: budget}
+	}
+
+	if err := k8sClient.Create(ctx, &temporaliov1alpha1.TemporalConnection{
+		ObjectMeta: metav1.ObjectMeta{Name: connName, Namespace: namespace},
+		Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: ts.GetFrontendHostPort()},
+	}); err != nil {
+		t.Fatalf("failed to create TemporalConnection: %v", err)
+	}
+	startWorkers := func(twdName, buildID string) []func() {
+		child := k8s.ComputeVersionedDeploymentName(twdName, buildID)
+		eventually(t, 30*time.Second, time.Second, func() error {
+			var dep appsv1.Deployment
+			return k8sClient.Get(ctx, types.NamespacedName{Name: child, Namespace: namespace}, &dep)
+		})
+		return applyDeployment(t, ctx, k8sClient, child, namespace)
+	}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{live, leaving} {
+		if err := k8sClient.Create(ctx, twd); err != nil {
+			t.Fatalf("failed to create TWD %s: %v", twd.Name, err)
+		}
+	}
+	liveOld := startWorkers(live.Name, oldBuild)
+	defer handleStopFuncs(liveOld)
+	// The removed TWD's in-process workers are stopped once it is released, the way its pods would go
+	// away; otherwise they would keep polling and hide a run stranded on its queue.
+	leavingWorkers := startWorkers(leaving.Name, oldBuild)
+	leavingStopped := false
+	stopLeaving := func() {
+		if !leavingStopped {
+			handleStopFuncs(leavingWorkers)
+			leavingStopped = true
+		}
+	}
+	defer stopLeaving()
+
+	handle := ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(sharedName)
+	currentIs := func(buildID string) func() error {
+		return func() error {
+			resp, err := handle.Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
+			if err != nil {
+				return err
+			}
+			if cur := resp.Info.RoutingConfig.CurrentVersion; cur == nil || cur.BuildID != buildID {
+				return fmt.Errorf("current version is %v, want build %s", cur, buildID)
+			}
+			return nil
+		}
+	}
+	eventually(t, 60*time.Second, time.Second, currentIs(oldBuild))
+
+	// One release: the leaving TWD is removed and its sibling moves to a build whose workers are slow to start.
+	if err := k8sClient.Delete(ctx, leaving); err != nil {
+		t.Fatalf("failed to delete TWD: %v", err)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: live.Name, Namespace: namespace}, &fresh); err != nil {
+			return err
+		}
+		fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
+		fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
+		return k8sClient.Update(ctx, &fresh)
+	}); err != nil {
+		t.Fatalf("failed to move live TWD to %s: %v", newBuild, err)
+	}
+
+	// Past the controller's one-minute settle, and past the budget when there is one, with nothing
+	// pinned, the old build still current and the sibling not yet switched, the removed TWD must still be here.
+	time.Sleep(75 * time.Second)
+	var held temporaliov1alpha1.TemporalWorkerDeployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &held); err != nil {
+		t.Errorf("removed TWD was released while its build was still current and its sibling had not switched: %v", err)
+		stopLeaving()
+	}
+
+	temporalClient := ts.GetDefaultClient()
+	if _, err := temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+		ID: lateRun, TaskQueue: leaving.Name,
+	}, "successTestWorkflow"); err != nil {
+		t.Fatalf("failed to start workflow: %v", err)
+	}
+	defer func() { _ = temporalClient.TerminateWorkflow(ctx, lateRun, "", "test cleanup") }()
+	// The run lands on the old build, still current, and needs the removed TWD's queue, so it only
+	// completes if the removed TWD's workers are still there.
+	eventually(t, 60*time.Second, time.Second, func() error {
+		resp, err := temporalClient.DescribeWorkflowExecution(ctx, lateRun, "")
+		if err != nil {
+			return err
+		}
+		if st := resp.GetWorkflowExecutionInfo().GetStatus(); st != enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED {
+			return fmt.Errorf("late run is %v", st)
+		}
+		return nil
+	})
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &held); err != nil {
+		t.Errorf("removed TWD was released before its sibling switched builds: %v", err)
+	}
+
+	liveNew := startWorkers(live.Name, newBuild)
+	defer handleStopFuncs(liveNew)
+	eventually(t, 90*time.Second, time.Second, currentIs(newBuild))
+
+	eventually(t, 3*time.Minute, time.Second, func() error {
+		var check temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &check); err == nil {
+			return errors.New("removed TWD still exists")
+		}
+		return nil
+	})
+	stopLeaving()
+}
+
+// testSiblingWaitsForLivePoolsQueues removes one of three TWDs sharing a Worker Deployment in the
+// release that moves the other two to a new build. One live pool's new Deployment is available but
+// its workers do not poll yet, while its queue is busy. The new build is registered by the other
+// pool's workers, so it looks registered to both; only the version's queues show the slow pool is
+// not on it. Until they do, promotion must keep the server's missing-queue check, which keeps the
+// old build current, where the slow pool's old workers still serve its queue. The removed TWD's
+// queue is kept busy too, so the server refuses the final switch unless it skips that check.
+func testSiblingWaitsForLivePoolsQueues(
+	t *testing.T,
+	k8sClient client.Client,
+	ts *temporaltest.TestServer,
+	namespace string,
+) {
+	ctx := context.Background()
+	const (
+		sharedName = "del-late"
+		oldBuild   = "late-v1"
+		newBuild   = "late-v2"
+		connName   = "del-late-conn"
+	)
+
+	newTWD := func(name string) *temporaliov1alpha1.TemporalWorkerDeployment {
+		tc := testhelpers.NewTestCase().
+			WithInput(
+				testhelpers.NewTemporalWorkerDeploymentBuilder().
+					WithAllAtOnceStrategy().
+					WithTargetTemplate("v1.0").
+					WithUnsafeCustomBuildID(oldBuild),
+			).
+			BuildWithValues(name, namespace, ts.GetDefaultNamespace())
+		twd := tc.GetTWD()
+		twd.Spec.WorkerOptions.WorkerDeploymentName = sharedName
+		twd.Spec.WorkerOptions.TemporalConnectionRef.Name = connName
+		twd.Spec.WorkerScaling = &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: name}
+		return twd
+	}
+	fast, slow, leaving := newTWD("del-late-fast"), newTWD("del-late-slow"), newTWD("del-late-leaving")
+
+	if err := k8sClient.Create(ctx, &temporaliov1alpha1.TemporalConnection{
+		ObjectMeta: metav1.ObjectMeta{Name: connName, Namespace: namespace},
+		Spec:       temporaliov1alpha1.TemporalConnectionSpec{HostPort: ts.GetFrontendHostPort()},
+	}); err != nil {
+		t.Fatalf("failed to create TemporalConnection: %v", err)
+	}
+	childOf := func(twdName, buildID string) appsv1.Deployment {
+		var dep appsv1.Deployment
+		eventually(t, 60*time.Second, time.Second, func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: k8s.ComputeVersionedDeploymentName(twdName, buildID), Namespace: namespace}, &dep)
+		})
+		return dep
+	}
+	startWorkers := func(twdName, buildID string) {
+		dep := childOf(twdName, buildID)
+		stop := applyDeployment(t, ctx, k8sClient, dep.Name, namespace)
+		t.Cleanup(func() { handleStopFuncs(stop) })
+	}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{fast, slow, leaving} {
+		if err := k8sClient.Create(ctx, twd); err != nil {
+			t.Fatalf("failed to create TWD %s: %v", twd.Name, err)
+		}
+	}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{fast, slow, leaving} {
+		startWorkers(twd.Name, oldBuild)
+	}
+
+	handle := ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(sharedName)
+	current := func() (string, error) {
+		resp, err := handle.Describe(ctx, sdkclient.WorkerDeploymentDescribeOptions{})
+		if err != nil {
+			return "", err
+		}
+		if cur := resp.Info.RoutingConfig.CurrentVersion; cur != nil {
+			return cur.BuildID, nil
+		}
+		return "", nil
+	}
+	currentIs := func(buildID string) func() error {
+		return func() error {
+			cur, err := current()
+			if err != nil {
+				return err
+			}
+			if cur != buildID {
+				return fmt.Errorf("current version is %q, want %q", cur, buildID)
+			}
+			return nil
+		}
+	}
+	eventually(t, 60*time.Second, time.Second, currentIs(oldBuild))
+
+	// Keep the slow pool's and the removed TWD's queues busy, well inside the server's 30s add-rate window.
+	temporalClient := ts.GetDefaultClient()
+	stopTraffic := make(chan struct{})
+	trafficDone := make(chan struct{})
+	go func() {
+		defer close(trafficDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stopTraffic:
+				return
+			case <-time.After(2 * time.Second):
+			}
+			for _, queue := range []string{slow.Name, leaving.Name} {
+				_, _ = temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+					ID: fmt.Sprintf("del-late-traffic-%s-%d", queue, i), TaskQueue: queue,
+				}, "successTestWorkflow")
+			}
+		}
+	}()
+	stop := func() {
+		select {
+		case <-stopTraffic:
+		default:
+			close(stopTraffic)
+			<-trafficDone
+		}
+	}
+	defer stop()
+	time.Sleep(5 * time.Second)
+
+	// One release: the leaving TWD is removed and both live TWDs move to the new build.
+	if err := k8sClient.Delete(ctx, leaving); err != nil {
+		t.Fatalf("failed to delete TWD: %v", err)
+	}
+	for _, twd := range []*temporaliov1alpha1.TemporalWorkerDeployment{fast, slow} {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var fresh temporaliov1alpha1.TemporalWorkerDeployment
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: twd.Name, Namespace: namespace}, &fresh); err != nil {
+				return err
+			}
+			fresh.Spec.WorkerOptions.UnsafeCustomBuildID = newBuild
+			fresh.Spec.Template.Spec.Containers[0].Image = "v2.0"
+			return k8sClient.Update(ctx, &fresh)
+		}); err != nil {
+			t.Fatalf("failed to move TWD %s to %s: %v", twd.Name, newBuild, err)
+		}
+	}
+	// The fast pool's workers register the new build. The slow pool's new Deployment is available,
+	// as a pod without a readiness probe is, but its workers have not polled.
+	startWorkers(fast.Name, newBuild)
+	setHealthyDeploymentStatus(t, ctx, k8sClient, childOf(slow.Name, newBuild))
+
+	// While the slow pool is off the new build, the old build stays current and keeps serving its queue.
+	windowEnd := time.Now().Add(45 * time.Second)
+	probeStarted := false
+	for ; time.Now().Before(windowEnd); time.Sleep(time.Second) {
+		cur, err := current()
+		if err != nil {
+			// The server answers a describe from the Worker Deployment's own workflow, which can be
+			// slow while it refuses promotions; the next tick asks again.
+			continue
+		}
+		if cur != oldBuild {
+			desc, _ := handle.DescribeVersion(ctx, sdkclient.WorkerDeploymentDescribeVersionOptions{BuildID: newBuild})
+			var queues []string
+			for _, tq := range desc.Info.TaskQueuesInfos {
+				queues = append(queues, tq.Name)
+			}
+			t.Fatalf("current version moved to %q while %s's workers were not polling it (its task queues: %v)", cur, slow.Name, queues)
+		}
+		if !probeStarted && time.Until(windowEnd) < 30*time.Second {
+			if _, err := temporalClient.ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+				ID: "del-late-probe", TaskQueue: slow.Name,
+			}, "successTestWorkflow"); err != nil {
+				t.Fatalf("failed to start workflow: %v", err)
+			}
+			probeStarted = true
+		}
+	}
+	eventually(t, 30*time.Second, time.Second, func() error {
+		resp, err := temporalClient.DescribeWorkflowExecution(ctx, "del-late-probe", "")
+		if err != nil {
+			return err
+		}
+		if st := resp.GetWorkflowExecutionInfo().GetStatus(); st != enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED {
+			return fmt.Errorf("run on the slow pool's queue is %v", st)
+		}
+		return nil
+	})
+
+	// Once the slow pool's workers poll the new build, the switch goes through and the removed TWD is released.
+	startWorkers(slow.Name, newBuild)
+	eventually(t, 3*time.Minute, time.Second, currentIs(newBuild))
+	stop()
+	eventually(t, 3*time.Minute, time.Second, func() error {
+		var check temporaliov1alpha1.TemporalWorkerDeployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaving.Name, Namespace: namespace}, &check); err == nil {
+			return errors.New("removed TWD still exists")
+		}
+		return nil
+	})
 }
