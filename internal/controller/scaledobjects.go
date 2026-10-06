@@ -517,8 +517,9 @@ func variantVersionsForScaling(
 // target superseded never received traffic and will never be promoted, so it
 // runs at 0 whatever the configured min, as the planner does for versions
 // KEDA doesn't manage; work pinned to it still scales it up through the
-// scaler's per-build backlog and running-workflow terms. Once a version
-// becomes Current the floor is released and the user's configured min applies.
+// scaler's per-build backlog (and running-workflow count, when enabled).
+// Once a version becomes Current the floor is released and the user's
+// configured min applies.
 func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDeployment) (int64, bool) {
 	var base int32
 	var baseSet bool
