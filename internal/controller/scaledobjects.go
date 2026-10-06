@@ -508,13 +508,15 @@ func variantVersionsForScaling(
 // Some versions are floored at 1 even when the user's configured min is 0,
 // so Temporal always has somewhere to route work and we avoid a cold-start
 // chicken-and-egg (no workers → no traffic → never scales up). This applies
-// to Ramping and Inactive versions, and to a NotRegistered *target*: with no
-// worker it can never poll Temporal to register its build ID, so a
-// KEDA-managed target would read 0 backlog and stay at 0 forever - never
-// registered, never promoted. The NotRegistered floor is scoped to the
-// target so a stale version that was deleted server-side (also NotRegistered,
-// pending cleanup) is not pinned. Once a version becomes Current the floor is
-// released and the user's configured min applies.
+// to Ramping versions and to an Inactive or NotRegistered *target*: with no
+// worker a target can never poll Temporal to register its build ID or be
+// promoted, so a KEDA-managed target would read 0 backlog and stay at 0
+// forever. The Inactive and NotRegistered floors are scoped to the target:
+// an Inactive version that a newer target superseded never received traffic
+// and will never be promoted, and a NotRegistered non-target may have been
+// deleted server-side, so pinning either would keep idle pods up
+// indefinitely. Once a version becomes Current the floor is released and the
+// user's configured min applies.
 func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDeployment) (int64, bool) {
 	var base int32
 	var baseSet bool
@@ -532,7 +534,7 @@ func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDepl
 
 	// Warm-start invariant for new versions.
 	if v.Status == temporaliov1alpha1.VersionStatusRamping ||
-		v.Status == temporaliov1alpha1.VersionStatusInactive ||
+		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusInactive) ||
 		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) {
 		if !baseSet || base < 1 {
 			return 1, true
