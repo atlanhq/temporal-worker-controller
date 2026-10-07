@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,8 @@ import (
 	sdkclient "go.temporal.io/sdk/client"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/flowcontrol"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -50,12 +53,14 @@ func (q *perBuildPinnedQuerier) CountWorkflow(_ context.Context, req *workflowse
 // has deleted, or never knew, answers NotFound.
 type versionDeletingHandle struct {
 	stubWDHandle
-	known   map[string]bool
-	refuse  map[string]error
-	deleted []string
+	known    map[string]bool
+	refuse   map[string]error
+	deleted  []string
+	attempts int
 }
 
 func (h *versionDeletingHandle) DeleteVersion(_ context.Context, o sdkclient.WorkerDeploymentDeleteVersionOptions) (sdkclient.WorkerDeploymentDeleteVersionResponse, error) {
+	h.attempts++
 	if err := h.refuse[o.BuildID]; err != nil {
 		return sdkclient.WorkerDeploymentDeleteVersionResponse{}, err
 	}
@@ -234,4 +239,98 @@ func TestExecutePlan_VariantDeleteFailureKeepsVersion(t *testing.T) {
 	require.Error(t, r.executePlan(context.Background(), logr.Discard(), twd, temporalClient, p))
 	assert.True(t, exists(t, r.Client, "app-worker-b"))
 	assert.True(t, handle.known["b"])
+}
+
+// A refused delete is not retried until the version's backoff expires, so a server that keeps
+// failing is not called on every reconcile, and a later success resets the backoff.
+func TestDeleteInactiveVersions_BacksOffAfterRefusal(t *testing.T) {
+	twd := makeTWD("w", "app-ns", "conn")
+	twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+		deprecatedVersion("b", temporaliov1alpha1.VersionStatusInactive),
+	}
+	q := &perBuildPinnedQuerier{deploymentName: "w", count: map[string]int64{"b": 0}}
+	h := &versionDeletingHandle{known: map[string]bool{"b": true}, refuse: map[string]error{"b": errors.New("context deadline exceeded")}}
+	r, _ := newTestReconciler(nil)
+	fakeClock := clocktesting.NewFakeClock(time.Now())
+	r.deleteBackoff = flowcontrol.NewFakeBackOff(10*time.Second, 30*time.Minute, fakeClock)
+	attempt := func() []string {
+		p := &plan{WorkerDeploymentName: "w", DeleteDeployments: []*appsv1.Deployment{buildDeployment("w-b", "b", k8s.BaseVariantName)}}
+		r.deleteInactiveVersions(context.Background(), logr.Discard(), q, h, twd, p)
+		var kept []string
+		for _, d := range p.DeleteDeployments {
+			kept = append(kept, d.Name)
+		}
+		return kept
+	}
+
+	assert.Empty(t, attempt())
+	assert.Equal(t, 1, h.attempts)
+
+	fakeClock.Step(5 * time.Second)
+	assert.Empty(t, attempt())
+	assert.Equal(t, 1, h.attempts, "no retry inside the backoff window")
+
+	fakeClock.Step(6 * time.Second)
+	assert.Empty(t, attempt())
+	assert.Equal(t, 2, h.attempts, "retried once the window expired")
+
+	fakeClock.Step(15 * time.Second)
+	assert.Empty(t, attempt())
+	assert.Equal(t, 2, h.attempts, "the window doubled after the second refusal")
+
+	h.refuse = nil
+	fakeClock.Step(10 * time.Second)
+	assert.Equal(t, []string{"w-b"}, attempt())
+	assert.Equal(t, 3, h.attempts)
+}
+
+// The version record is shared by every TWD on the Worker Deployment, so it is deleted only once
+// no sibling targets it, runs it as current, or has a pod for it.
+func TestDeleteInactiveVersions_WaitsForSiblings(t *testing.T) {
+	sibling := func(target, current string) *temporaliov1alpha1.TemporalWorkerDeployment {
+		s := makeTWD("w-size-s", "app-ns", "conn")
+		s.UID = "sibling-uid"
+		s.Spec.WorkerOptions.WorkerDeploymentName = "w"
+		s.Status.TargetVersion.BuildID = target
+		if current != "" {
+			s.Status.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+				BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: current},
+			}
+		}
+		return s
+	}
+	siblingDeployment := func(replicas int32) *appsv1.Deployment {
+		d := buildDeployment("w-size-s-b", "b", k8s.BaseVariantName)
+		d.Spec.Replicas = &replicas
+		d.Status.Replicas = replicas
+		return d
+	}
+	for _, tc := range []struct {
+		name        string
+		objs        []client.Object
+		wantDeleted bool
+	}{
+		{"sibling moved on and scaled down, deleted", []client.Object{sibling("c", "c"), siblingDeployment(0)}, true},
+		{"sibling still targets the version, kept", []client.Object{sibling("b", "a"), siblingDeployment(0)}, false},
+		{"sibling runs the version as current, kept", []client.Object{sibling("c", "b"), siblingDeployment(0)}, false},
+		{"sibling still has a pod for the version, kept", []client.Object{sibling("c", "c"), siblingDeployment(1)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			twd := makeTWD("w-size-m", "app-ns", "conn")
+			twd.Spec.WorkerOptions.WorkerDeploymentName = "w"
+			twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+				deprecatedVersion("b", temporaliov1alpha1.VersionStatusInactive),
+			}
+			r, _ := newTestReconciler(append(tc.objs, twd))
+			name := k8s.ComputeWorkerDeploymentName(twd)
+			q := &perBuildPinnedQuerier{deploymentName: name, count: map[string]int64{"b": 0}}
+			h := &versionDeletingHandle{known: map[string]bool{"b": true}}
+			p := &plan{WorkerDeploymentName: name, DeleteDeployments: []*appsv1.Deployment{buildDeployment("w-size-m-b", "b", k8s.BaseVariantName)}}
+
+			r.deleteInactiveVersions(context.Background(), logr.Discard(), q, h, twd, p)
+
+			assert.Equal(t, tc.wantDeleted, len(p.DeleteDeployments) == 1)
+			assert.Equal(t, !tc.wantDeleted, h.known["b"], "server-side version exists")
+		})
+	}
 }
