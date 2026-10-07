@@ -754,13 +754,14 @@ func getDeleteDeployments(
 ) []*appsv1.Deployment {
 	var deleteDeployments []*appsv1.Deployment
 
-	// deleteWithVariants appends a version's base Deployment and cascades to its
-	// variant Deployments: a variant must never outlive its version's base.
+	// deleteWithVariants appends a version's variant Deployments and then its base. The base
+	// goes last because deletes stop at the first failure and the version stays in status only
+	// while its base exists, so a failed delete leaves the whole version to retry.
 	deleteWithVariants := func(d *appsv1.Deployment, buildID string) {
-		deleteDeployments = append(deleteDeployments, d)
 		for _, vd := range k8sState.VariantDeployments[buildID] {
 			deleteDeployments = append(deleteDeployments, vd)
 		}
+		deleteDeployments = append(deleteDeployments, d)
 	}
 
 	for _, version := range status.DeprecatedVersions {

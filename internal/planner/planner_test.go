@@ -3914,3 +3914,36 @@ func TestGetDeleteDeployments_InactiveRecordGoneDeploymentLeft(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{"w-b", "w-od-b"}, got)
 }
+
+// Deletes stop at the first failure, and a version stays in status only while its base exists,
+// so a version's variants are deleted before its base.
+func TestGetDeleteDeployments_VariantsBeforeBase(t *testing.T) {
+	zero := int32(0)
+	deploy := func(name string) *appsv1.Deployment {
+		return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: appsv1.DeploymentSpec{Replicas: &zero}}
+	}
+	state := &k8s.DeploymentState{
+		Deployments:        map[string]*appsv1.Deployment{"b": deploy("w-b")},
+		VariantDeployments: map[string]map[string]*appsv1.Deployment{"b": {"od": deploy("w-od-b")}},
+	}
+	drained := metav1.NewTime(time.Now().Add(-24 * time.Hour))
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID: "b", Status: temporaliov1alpha1.VersionStatusDrained, Deployment: &corev1.ObjectReference{Name: "w-b"},
+			},
+			DrainedSince:        &drained,
+			EligibleForDeletion: true,
+		}},
+	}
+	spec := &temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+		Variants:       []temporaliov1alpha1.WorkerVariant{{Name: "od"}},
+		SunsetStrategy: temporaliov1alpha1.SunsetStrategy{DeleteDelay: &metav1.Duration{}, ScaledownDelay: &metav1.Duration{}},
+	}
+
+	var got []string
+	for _, d := range getDeleteDeployments(state, status, spec, true, "w") {
+		got = append(got, d.Name)
+	}
+	assert.Equal(t, []string{"w-od-b", "w-b"}, got)
+}

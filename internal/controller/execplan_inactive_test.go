@@ -212,3 +212,26 @@ func TestExecutePlan_RemovedVariantKeepsVersion(t *testing.T) {
 	assert.True(t, handle.known["b"])
 	assert.Empty(t, temporalClient.pinned.countQueries)
 }
+
+// A version whose variant delete fails keeps its base, and so its status entry and its server
+// record, for the next reconcile to retry as a whole.
+func TestExecutePlan_VariantDeleteFailureKeepsVersion(t *testing.T) {
+	twd := makeTWD("app-worker", "app-ns", "conn")
+	base := buildDeployment("app-worker-b", "b", k8s.BaseVariantName)
+	variant := buildDeployment("app-worker-od-b", "b", "od")
+	r, _ := newTestReconcilerWithInterceptors([]client.Object{base.DeepCopy(), variant.DeepCopy()}, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == variant.Name {
+				return errors.New("apiserver unavailable")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	handle := &versionDeletingHandle{known: map[string]bool{"b": true}}
+	temporalClient := &countingTemporalClient{stubTemporalClient: &stubTemporalClient{wdClient: &stubWDClient{handle: handle}}}
+	p := &plan{WorkerDeploymentName: "app", DeleteDeployments: []*appsv1.Deployment{variant, base}}
+
+	require.Error(t, r.executePlan(context.Background(), logr.Discard(), twd, temporalClient, p))
+	assert.True(t, exists(t, r.Client, "app-worker-b"))
+	assert.True(t, handle.known["b"])
+}
