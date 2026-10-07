@@ -283,3 +283,46 @@ func TestBuildScaledObject_VariantScalingFlagsAreVariantOnly(t *testing.T) {
 	assert.NotContains(t, bm, "gateSlotsOnRunningWorkflow", "base SO must NOT inherit the variant's gate")
 	assert.NotContains(t, bm, "activitySlotsPerWorker", "base SO must NOT inherit the variant's slot ceiling")
 }
+
+// A version superseded before promotion (deprecated Inactive) must not keep a
+// pod on either pool, while the Inactive target keeps its warm-start floor on
+// both. Covers the hand-off from status, through activeVersionsForScaling and
+// variantVersionsForScaling, to each generated ScaledObject.
+func TestSupersededInactiveVersionScalesToZero(t *testing.T) {
+	twd := variantTWD()
+	ver := func(build string, status temporaliov1alpha1.VersionStatus) temporaliov1alpha1.BaseWorkerDeploymentVersion {
+		return temporaliov1alpha1.BaseWorkerDeploymentVersion{
+			BuildID:    build,
+			Status:     status,
+			Deployment: &corev1.ObjectReference{Name: "app-worker-twd-" + build},
+			Variants: []temporaliov1alpha1.VariantStatus{
+				{Name: "od", Deployment: &corev1.ObjectReference{Name: "app-worker-twd-od-" + build}},
+			},
+		}
+	}
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		CurrentVersion: &temporaliov1alpha1.CurrentWorkerDeploymentVersion{BaseWorkerDeploymentVersion: ver("a", temporaliov1alpha1.VersionStatusCurrent)},
+		TargetVersion:  temporaliov1alpha1.TargetWorkerDeploymentVersion{BaseWorkerDeploymentVersion: ver("c", temporaliov1alpha1.VersionStatusInactive)},
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+			{BaseWorkerDeploymentVersion: ver("b", temporaliov1alpha1.VersionStatusInactive)},
+		},
+	}
+
+	base := activeVersionsForScaling(status)
+	refs := append(base, variantVersionsForScaling(base, status, twd)...)
+	require.Len(t, refs, 6, "base and od refs for a, b and c")
+
+	want := map[string]int64{"a": 0, "b": 0, "c": 1}
+	for _, v := range refs {
+		pool := "base"
+		if v.Variant != nil {
+			pool = v.Variant.Name
+		}
+		assert.Equal(t, v.BuildID == "c", v.IsTarget, "%s/%s IsTarget", v.BuildID, pool)
+		so := buildScaledObject(twd, v, "temporal:7233")
+		minR, found, err := unstructured.NestedInt64(so.Object, "spec", "minReplicaCount")
+		require.NoError(t, err)
+		require.True(t, found, "%s/%s minReplicaCount set", v.BuildID, pool)
+		assert.Equal(t, want[v.BuildID], minR, "%s/%s minReplicaCount", v.BuildID, pool)
+	}
+}

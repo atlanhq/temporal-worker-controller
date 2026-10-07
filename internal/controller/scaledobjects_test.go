@@ -229,10 +229,18 @@ func TestResolveMinReplicas(t *testing.T) {
 		{"current, no config - omit", twdNoConfig, temporaliov1alpha1.VersionStatusCurrent, false, 0, false},
 		{"drained, no config - omit", twdNoConfig, temporaliov1alpha1.VersionStatusDrained, false, 0, false},
 
-		// Ramping/Inactive: warm-start invariant → at least 1
+		// Ramping / Inactive target: warm-start invariant → at least 1
 		{"ramping, no config - warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusRamping, false, 1, true},
-		{"inactive, no config - warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusInactive, false, 1, true},
+		{"inactive target, no config - warm-start bumps to 1", twdNoConfig, temporaliov1alpha1.VersionStatusInactive, true, 1, true},
+		{"inactive target, user min=0 - warm-start still bumps to 1", twdMin0, temporaliov1alpha1.VersionStatusInactive, true, 1, true},
 		{"ramping, user min=0 - warm-start still bumps to 1", twdMin0, temporaliov1alpha1.VersionStatusRamping, false, 1, true},
+
+		// Inactive but NOT the target: a newer target superseded it before it
+		// was promoted. It never received traffic and never will, so it runs
+		// at 0 whatever the configured min instead of holding pods forever.
+		{"inactive non-target, no config - 0", twdNoConfig, temporaliov1alpha1.VersionStatusInactive, false, 0, true},
+		{"inactive non-target, user min=0 - 0", twdMin0, temporaliov1alpha1.VersionStatusInactive, false, 0, true},
+		{"inactive non-target, user min=3 - still 0", twdMin3, temporaliov1alpha1.VersionStatusInactive, false, 0, true},
 
 		// NotRegistered target: floored to 1 so a worker can start, poll
 		// Temporal and register the build ID. Without this, a KEDA-managed

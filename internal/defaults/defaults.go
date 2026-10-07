@@ -22,6 +22,11 @@ const (
 	// into an unbounded hold.
 	TeardownDrainageTimeout = 72 * time.Hour
 
+	// VersionDeleteBaseInterval and VersionDeleteMaxInterval bound the per-version backoff
+	// between DeleteVersion attempts the server refused or failed.
+	VersionDeleteBaseInterval = 10 * time.Second
+	VersionDeleteMaxInterval  = 30 * time.Minute
+
 	// ToBeDeprecatedDefaultControllerIdentity will stop being used in the next release.
 	ToBeDeprecatedDefaultControllerIdentity = "temporal-worker-controller"
 )

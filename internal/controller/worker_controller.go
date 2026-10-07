@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -121,6 +123,10 @@ type TemporalWorkerDeploymentReconciler struct {
 
 	// SharedReleaseSettle overrides releaseSettle when set.
 	SharedReleaseSettle time.Duration
+
+	// deleteBackoff spaces out DeleteVersion retries per (worker deployment, build ID).
+	deleteBackoff     *flowcontrol.Backoff
+	deleteBackoffOnce sync.Once
 }
 
 // +kubebuilder:rbac:groups=temporal.io,resources=temporalworkerdeployments,verbs=get;list;watch;create;update;patch;delete

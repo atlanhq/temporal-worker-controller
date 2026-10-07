@@ -78,6 +78,7 @@ type WorkerResourceRef struct {
 	Name       string
 	APIVersion string
 	Kind       string
+	BuildID    string
 }
 
 // WRTOwnerRefPatch holds a WRT pair for a single merge-patch:
@@ -366,6 +367,7 @@ func getDeleteWorkerResources(
 				Name:       resourceName,
 				APIVersion: templateMeta.APIVersion,
 				Kind:       templateMeta.Kind,
+				BuildID:    buildID,
 			})
 		}
 	}
@@ -724,6 +726,24 @@ func updateVariantDeploymentWithPodTemplateSpec(
 	deployment.Spec.MinReadySeconds = spec.MinReadySeconds
 }
 
+// isScaledDown reports whether a Deployment is set to zero replicas and has no pods left,
+// including pods still terminating, as of a status that reflects its latest spec.
+func isScaledDown(d *appsv1.Deployment) bool {
+	return d.Spec.Replicas != nil && *d.Spec.Replicas == 0 &&
+		d.Status.ObservedGeneration >= d.Generation &&
+		d.Status.Replicas == 0 &&
+		(d.Status.TerminatingReplicas == nil || *d.Status.TerminatingReplicas == 0)
+}
+
+func variantsScaledDown(variants map[string]*appsv1.Deployment) bool {
+	for _, vd := range variants {
+		if !isScaledDown(vd) {
+			return false
+		}
+	}
+	return true
+}
+
 // getDeleteDeployments determines which deployments should be deleted
 func getDeleteDeployments(
 	k8sState *k8s.DeploymentState,
@@ -734,13 +754,14 @@ func getDeleteDeployments(
 ) []*appsv1.Deployment {
 	var deleteDeployments []*appsv1.Deployment
 
-	// deleteWithVariants appends a version's base Deployment and cascades to its
-	// variant Deployments: a variant must never outlive its version's base.
+	// deleteWithVariants appends a version's variant Deployments and then its base. The base
+	// goes last because deletes stop at the first failure and the version stays in status only
+	// while its base exists, so a failed delete leaves the whole version to retry.
 	deleteWithVariants := func(d *appsv1.Deployment, buildID string) {
-		deleteDeployments = append(deleteDeployments, d)
 		for _, vd := range k8sState.VariantDeployments[buildID] {
 			deleteDeployments = append(deleteDeployments, vd)
 		}
+		deleteDeployments = append(deleteDeployments, d)
 	}
 
 	for _, version := range status.DeprecatedVersions {
@@ -755,6 +776,17 @@ func getDeleteDeployments(
 		}
 
 		switch version.Status {
+		case temporaliov1alpha1.VersionStatusInactive:
+			// A version superseded before it was ever current or ramping never becomes
+			// Drained, so it would otherwise be kept forever. Delete it once every pool of
+			// the version has finished scaling down; execution still holds it while any
+			// workflow pinned to it is running.
+			if foundDeploymentInTemporal &&
+				status.TargetVersion.BuildID != version.BuildID &&
+				(status.CurrentVersion == nil || status.CurrentVersion.BuildID != version.BuildID) &&
+				isScaledDown(d) && variantsScaledDown(k8sState.VariantDeployments[version.BuildID]) {
+				deleteWithVariants(d, version.BuildID)
+			}
 		case temporaliov1alpha1.VersionStatusDrained:
 			// Deleting a deployment is only possible when:
 			// 1. The deployment has been drained for deleteDelay + scaledownDelay.

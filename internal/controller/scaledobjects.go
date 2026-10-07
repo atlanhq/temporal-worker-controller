@@ -508,13 +508,18 @@ func variantVersionsForScaling(
 // Some versions are floored at 1 even when the user's configured min is 0,
 // so Temporal always has somewhere to route work and we avoid a cold-start
 // chicken-and-egg (no workers → no traffic → never scales up). This applies
-// to Ramping and Inactive versions, and to a NotRegistered *target*: with no
-// worker it can never poll Temporal to register its build ID, so a
-// KEDA-managed target would read 0 backlog and stay at 0 forever - never
-// registered, never promoted. The NotRegistered floor is scoped to the
-// target so a stale version that was deleted server-side (also NotRegistered,
-// pending cleanup) is not pinned. Once a version becomes Current the floor is
-// released and the user's configured min applies.
+// to Ramping versions and to an Inactive or NotRegistered *target*: with no
+// worker a target can never poll Temporal to register its build ID or be
+// promoted, so a KEDA-managed target would read 0 backlog and stay at 0
+// forever. The Inactive and NotRegistered floors are scoped to the target: a
+// NotRegistered non-target may have been deleted server-side, so pinning it
+// would keep idle pods up indefinitely. An Inactive version that a newer
+// target superseded never received traffic and will never be promoted, so it
+// runs at 0 whatever the configured min, as the planner does for versions
+// KEDA doesn't manage; work pinned to it still scales it up through the
+// scaler's per-build backlog (and running-workflow count, when enabled).
+// Once a version becomes Current the floor is released and the user's
+// configured min applies.
 func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDeployment) (int64, bool) {
 	var base int32
 	var baseSet bool
@@ -530,9 +535,14 @@ func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDepl
 		baseSet = true
 	}
 
+	// Superseded before promotion: no traffic now or later.
+	if !v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusInactive {
+		return 0, true
+	}
+
 	// Warm-start invariant for new versions.
 	if v.Status == temporaliov1alpha1.VersionStatusRamping ||
-		v.Status == temporaliov1alpha1.VersionStatusInactive ||
+		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusInactive) ||
 		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) {
 		if !baseSet || base < 1 {
 			return 1, true

@@ -15,10 +15,12 @@ import (
 
 	"github.com/go-logr/logr"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
+	"github.com/temporalio/temporal-worker-controller/internal/defaults"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/planner"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/flowcontrol"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -333,7 +336,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 // status.DeprecatedVersions while its Deployment does (see state_mapper.go), so once
 // the Deployment is gone there is no way to retry on a later reconcile. Left unpruned,
 // these accumulate one per rollout and eventually hit the server's per-deployment
-// version cap, after which every new build ID fails to register (#377).
+// version cap, after which every new build ID fails to register (#377). A superseded
+// Inactive version's record is deleted earlier, before its Deployments (see
+// deleteInactiveVersions), and is NotFound here.
 //
 // Build IDs are read off the in-memory Deployment objects, which survive their cluster
 // deletion, so this runs in the Temporal phase without reaching back into k8sState.
@@ -343,6 +348,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 // they have no server-side version and return NotFound, which is skipped.
 func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.Context, l logr.Logger, deploymentHandler sdkclient.WorkerDeploymentHandle, p *plan) {
 	for _, d := range p.DeleteDeployments {
+		if !isBaseDeployment(d) {
+			continue
+		}
 		buildID, ok := d.GetLabels()[k8s.BuildIDLabel]
 		if !ok {
 			l.Info("deployment has no build ID label, skipping Temporal server-side version cleanup", "deployment", d.Name)
@@ -362,12 +370,213 @@ func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.C
 	}
 }
 
+// deleteInactiveVersions deletes the server-side record of each Inactive version the planner
+// nominated, before its Deployments are deleted, and keeps in the plan only the versions the
+// server confirmed gone. Every check must pass first:
+//   - No sibling TWD on the same Worker Deployment still uses the version (see
+//     siblingsReleasedVersion), since the record is shared.
+//   - No workflow pinned to the version is running. The server only refuses a version that
+//     still has pollers, and an Inactive version at zero replicas has none, so it would
+//     otherwise strand them with no worker.
+//   - The server deletes the record. It refuses while the version's last pollers are still
+//     recorded, which lasts for some minutes after its pods are gone. Once the Deployment is
+//     deleted the version leaves status and the record could never be retried.
+//
+// A version that fails any check keeps its Deployments and rendered worker resources and
+// stays nominated, so the next reconcile retries. Base and variant Deployments of a version
+// share one decision.
+func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersions(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	deploymentHandler sdkclient.WorkerDeploymentHandle,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	p *plan,
+) {
+	inactive := make(map[string]struct{})
+	for _, v := range workerDeploy.Status.DeprecatedVersions {
+		if v.Status == temporaliov1alpha1.VersionStatusInactive {
+			inactive[v.BuildID] = struct{}{}
+		}
+	}
+	// A version is nominated when its base Deployment is. A variant alone is being removed
+	// from spec.variants, which leaves the version in place.
+	nominated := make(map[string]struct{})
+	for _, d := range p.DeleteDeployments {
+		buildID := d.GetLabels()[k8s.BuildIDLabel]
+		if _, ok := inactive[buildID]; ok && isBaseDeployment(d) {
+			nominated[buildID] = struct{}{}
+		}
+	}
+	if len(nominated) == 0 {
+		return
+	}
+
+	siblings, siblingsErr := r.siblingTWDs(ctx, workerDeploy)
+
+	hold := make(map[string]bool)
+	isHeld := func(buildID string) bool {
+		if _, ok := nominated[buildID]; !ok {
+			return false
+		}
+		if held, decided := hold[buildID]; decided {
+			return held
+		}
+		switch {
+		case siblingsErr != nil:
+			l.Info("could not list sibling TWDs, keeping inactive version", "buildID", buildID, "error", siblingsErr)
+			hold[buildID] = true
+		case !r.siblingsReleasedVersion(ctx, l, workerDeploy, siblings, p, buildID):
+			hold[buildID] = true
+		default:
+			hold[buildID] = !r.deleteInactiveVersion(ctx, l, c, deploymentHandler, p, buildID)
+		}
+		return hold[buildID]
+	}
+
+	keptDeployments := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	for _, d := range p.DeleteDeployments {
+		if !isHeld(d.GetLabels()[k8s.BuildIDLabel]) {
+			keptDeployments = append(keptDeployments, d)
+		}
+	}
+	p.DeleteDeployments = keptDeployments
+
+	keptResources := make([]planner.WorkerResourceRef, 0, len(p.DeleteWorkerResources))
+	for _, res := range p.DeleteWorkerResources {
+		if !hold[res.BuildID] {
+			keptResources = append(keptResources, res)
+		}
+	}
+	p.DeleteWorkerResources = keptResources
+}
+
+// isBaseDeployment reports whether d is its version's base Deployment rather than a variant.
+// Only deleting the base retires the version; a variant alone is removed from spec.variants.
+func isBaseDeployment(d *appsv1.Deployment) bool {
+	variant := d.GetLabels()[k8s.VariantLabel]
+	return variant == "" || variant == k8s.BaseVariantName
+}
+
+// siblingsReleasedVersion reports whether every other TWD on the same Worker Deployment is done
+// with the version, which they share with this TWD: none targets it or runs it as current, and
+// none still has a pod for it. A sibling whose pods for the version have stopped polling for a
+// while would otherwise lose the shared record while it still needs the version.
+func (r *TemporalWorkerDeploymentReconciler) siblingsReleasedVersion(
+	ctx context.Context,
+	l logr.Logger,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	siblings []*temporaliov1alpha1.TemporalWorkerDeployment,
+	p *plan,
+	buildID string,
+) bool {
+	if len(siblings) == 0 {
+		return true
+	}
+	for _, sibling := range siblings {
+		if sibling.Status.TargetVersion.BuildID == buildID ||
+			(sibling.Status.CurrentVersion != nil && sibling.Status.CurrentVersion.BuildID == buildID) {
+			l.Info("sibling TWD still uses inactive version, keeping it", "buildID", buildID, "sibling", sibling.Name)
+			return false
+		}
+	}
+	deleting := make(map[string]struct{}, len(p.DeleteDeployments))
+	for _, d := range p.DeleteDeployments {
+		deleting[d.Name] = struct{}{}
+	}
+	var deployments appsv1.DeploymentList
+	if err := r.List(ctx, &deployments, client.InNamespace(workerDeploy.Namespace), client.MatchingLabels{k8s.BuildIDLabel: buildID}); err != nil {
+		l.Info("could not list sibling Deployments, keeping inactive version", "buildID", buildID, "error", err)
+		return false
+	}
+	for i := range deployments.Items {
+		d := &deployments.Items[i]
+		if _, ours := deleting[d.Name]; ours {
+			continue
+		}
+		// Another app in the namespace can ship the same build ID under its own Worker Deployment.
+		if recorded := k8s.WorkerDeploymentNameFromDeployment(d); recorded != "" && recorded != p.WorkerDeploymentName {
+			continue
+		}
+		if (d.Spec.Replicas != nil && *d.Spec.Replicas > 0) || d.Status.Replicas > 0 {
+			l.Info("sibling TWD still has pods for inactive version, keeping it", "buildID", buildID, "deployment", d.Name)
+			return false
+		}
+	}
+	return true
+}
+
+// deleteInactiveVersion reports whether the version has no running pinned workflows and its
+// server-side record is gone. A version whose count or delete failed is not tried again until its
+// backoff expires, so a server that keeps failing is not called on every reconcile.
+func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersion(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	deploymentHandler sdkclient.WorkerDeploymentHandle,
+	p *plan,
+	buildID string,
+) bool {
+	backoffKey := p.WorkerDeploymentName + "/" + buildID
+	if r.inVersionDeleteBackoff(backoffKey) {
+		return false
+	}
+	resp, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+		Namespace: p.TemporalNamespace,
+		Query:     pinnedExecutionQuery(p.WorkerDeploymentName, buildID),
+	})
+	if err != nil {
+		l.Info("could not confirm inactive version has no running pinned workflows, keeping it", "buildID", buildID, "error", err)
+		r.noteVersionDeleteFailure(backoffKey)
+		return false
+	}
+	if n := resp.GetCount(); n > 0 {
+		l.Info("inactive version has running pinned workflows, keeping it", "buildID", buildID, "pinnedExecutions", n)
+		return false
+	}
+	if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
+		BuildID:  buildID,
+		Identity: getControllerIdentity(),
+	}); err != nil {
+		var notFound *serviceerror.NotFound
+		if !errors.As(err, &notFound) {
+			l.Info("server has not deleted inactive version yet, keeping it", "buildID", buildID, "error", err)
+			r.noteVersionDeleteFailure(backoffKey)
+			return false
+		}
+	}
+	r.versionDeleteBackoff().Reset(backoffKey)
+	l.Info("deleted inactive worker deployment version", "buildID", buildID)
+	return true
+}
+
+func (r *TemporalWorkerDeploymentReconciler) versionDeleteBackoff() *flowcontrol.Backoff {
+	r.deleteBackoffOnce.Do(func() {
+		if r.deleteBackoff == nil {
+			r.deleteBackoff = flowcontrol.NewBackOff(defaults.VersionDeleteBaseInterval, defaults.VersionDeleteMaxInterval)
+		}
+	})
+	return r.deleteBackoff
+}
+
+func (r *TemporalWorkerDeploymentReconciler) inVersionDeleteBackoff(key string) bool {
+	b := r.versionDeleteBackoff()
+	return b.IsInBackOffSinceUpdate(key, b.Clock.Now())
+}
+
+func (r *TemporalWorkerDeploymentReconciler) noteVersionDeleteFailure(key string) {
+	b := r.versionDeleteBackoff()
+	b.Next(key, b.Clock.Now())
+}
+
 func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, temporalClient sdkclient.Client, p *plan) error {
+	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(p.WorkerDeploymentName)
+
+	r.deleteInactiveVersions(ctx, l, temporalClient, deploymentHandler, workerDeploy, p)
+
 	if err := r.executeK8sOperations(ctx, l, workerDeploy, p); err != nil {
 		return err
 	}
-
-	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(p.WorkerDeploymentName)
 
 	// Prune Temporal server-side version records for the versions whose Deployments
 	// were just deleted in executeK8sOperations. Must happen in the same reconcile as
