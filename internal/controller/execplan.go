@@ -19,6 +19,7 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/planner"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	appsv1 "k8s.io/api/apps/v1"
@@ -326,7 +327,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 // record for each Deployment deleted this reconcile (executeK8sOperations, called
 // first). The planner only adds a drained version to DeleteDeployments once it is
 // EligibleForDeletion (see planner.getDeleteDeployments): drained past the sunset
-// delays with no active worker pods. Deleting the Kubernetes Deployment alone would
+// delays with no active worker pods. It adds a superseded Inactive version once all
+// of its pools are scaled down and no workflow is pinned to it (see
+// holdPinnedInactiveVersions). Deleting the Kubernetes Deployment alone would
 // leave the server-side version registered forever — the only other cleanup path is
 // the CRD-deletion finalizer, which never runs during a normal rollout. This is also
 // the only point that can reliably prune it: a version's status entry only exists in
@@ -348,7 +351,7 @@ func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.C
 			l.Info("deployment has no build ID label, skipping Temporal server-side version cleanup", "deployment", d.Name)
 			continue
 		}
-		l.Info("deleting drained worker deployment version", "buildID", buildID)
+		l.Info("deleting worker deployment version", "buildID", buildID)
 		if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
 			BuildID:  buildID,
 			Identity: getControllerIdentity(),
@@ -362,7 +365,64 @@ func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.C
 	}
 }
 
+// holdPinnedInactiveVersions removes from p.DeleteDeployments every Deployment of an Inactive
+// version that still has running workflows pinned to it, or whose count could not be read.
+// The server's DeleteVersion only refuses a version with pollers, and an Inactive version at
+// zero replicas has none, so without this check its pinned workflows would be stranded with
+// no worker. A held version stays nominated and is retried on the next reconcile. Base and
+// variant Deployments share one count per build, so they are held or deleted together.
+func (r *TemporalWorkerDeploymentReconciler) holdPinnedInactiveVersions(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
+	p *plan,
+) {
+	inactive := make(map[string]struct{})
+	for _, v := range workerDeploy.Status.DeprecatedVersions {
+		if v.Status == temporaliov1alpha1.VersionStatusInactive {
+			inactive[v.BuildID] = struct{}{}
+		}
+	}
+	if len(inactive) == 0 {
+		return
+	}
+
+	hold := make(map[string]bool)
+	kept := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	for _, d := range p.DeleteDeployments {
+		buildID := d.GetLabels()[k8s.BuildIDLabel]
+		if _, ok := inactive[buildID]; !ok {
+			kept = append(kept, d)
+			continue
+		}
+		held, checked := hold[buildID]
+		if !checked {
+			query := pinnedExecutionQuery(p.WorkerDeploymentName, buildID)
+			resp, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+				Namespace: p.TemporalNamespace,
+				Query:     query,
+			})
+			switch {
+			case err != nil:
+				l.Info("could not confirm inactive version has no running pinned workflows, keeping it", "buildID", buildID, "error", err)
+				held = true
+			case resp.GetCount() > 0:
+				l.Info("inactive version has running pinned workflows, keeping it", "buildID", buildID, "pinnedExecutions", resp.GetCount())
+				held = true
+			}
+			hold[buildID] = held
+		}
+		if !held {
+			kept = append(kept, d)
+		}
+	}
+	p.DeleteDeployments = kept
+}
+
 func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, temporalClient sdkclient.Client, p *plan) error {
+	r.holdPinnedInactiveVersions(ctx, l, temporalClient, workerDeploy, p)
+
 	if err := r.executeK8sOperations(ctx, l, workerDeploy, p); err != nil {
 		return err
 	}

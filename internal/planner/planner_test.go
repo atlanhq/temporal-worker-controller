@@ -3803,3 +3803,83 @@ func TestGetScaleDeployments_RenameOrphanLeftToItsScaledObject(t *testing.T) {
 			"planner must not fight the rename-orphan's ScaledObject for replica ownership")
 	}
 }
+
+// A version superseded while Inactive never becomes Drained, so it is deleted, with its
+// variants, once every one of its pools has finished scaling down. The target, the current
+// version and anything with pods left are kept.
+func TestGetDeleteDeployments_SupersededInactive(t *testing.T) {
+	scaled := func(name string, spec, pods, terminating int32, observed bool) *appsv1.Deployment {
+		d := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Generation: 2},
+			Spec:       appsv1.DeploymentSpec{Replicas: &spec},
+			Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: pods},
+		}
+		if !observed {
+			d.Status.ObservedGeneration = 1
+		}
+		if terminating > 0 {
+			d.Status.TerminatingReplicas = &terminating
+		}
+		return d
+	}
+	down := func(name string) *appsv1.Deployment { return scaled(name, 0, 0, 0, true) }
+	inactive := func(buildID string) *temporaliov1alpha1.DeprecatedWorkerDeploymentVersion {
+		return &temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID:    buildID,
+				Status:     temporaliov1alpha1.VersionStatusInactive,
+				Deployment: &corev1.ObjectReference{Name: "w-" + buildID},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		base    *appsv1.Deployment
+		variant *appsv1.Deployment
+		target  string
+		current string
+		found   bool
+		want    []string
+	}{
+		{"scaled down, deleted with its variant", down("w-b"), down("w-od-b"), "c", "a", true, []string{"w-b", "w-od-b"}},
+		{"no variant, deleted", down("w-b"), nil, "c", "a", true, []string{"w-b"}},
+		{"no current version, deleted", down("w-b"), nil, "c", "", true, []string{"w-b"}},
+		{"variant still has a pod, kept", down("w-b"), scaled("w-od-b", 0, 1, 0, true), "c", "a", true, nil},
+		{"base set above zero, kept", scaled("w-b", 1, 1, 0, true), down("w-od-b"), "c", "a", true, nil},
+		{"base spec zero but pod remains, kept", scaled("w-b", 0, 1, 0, true), nil, "c", "a", true, nil},
+		{"base spec change not yet observed, kept", scaled("w-b", 0, 0, 0, false), nil, "c", "a", true, nil},
+		{"base pods terminating, kept", scaled("w-b", 0, 0, 1, true), nil, "c", "a", true, nil},
+		{"version is the target, kept", down("w-b"), nil, "b", "a", true, nil},
+		{"version is current, kept", down("w-b"), nil, "c", "b", true, nil},
+		{"worker deployment not found in Temporal, kept", down("w-b"), nil, "c", "a", false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &k8s.DeploymentState{Deployments: map[string]*appsv1.Deployment{"b": tc.base}}
+			if tc.variant != nil {
+				state.VariantDeployments = map[string]map[string]*appsv1.Deployment{"b": {"od": tc.variant}}
+			}
+			status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+				TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: tc.target},
+				},
+				DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{inactive("b")},
+			}
+			if tc.current != "" {
+				status.CurrentVersion = &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+					BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: tc.current},
+				}
+			}
+			spec := &temporaliov1alpha1.TemporalWorkerDeploymentSpec{}
+			if tc.variant != nil {
+				spec.Variants = []temporaliov1alpha1.WorkerVariant{{Name: "od"}}
+			}
+
+			var got []string
+			for _, d := range getDeleteDeployments(state, status, spec, tc.found, "w") {
+				got = append(got, d.Name)
+			}
+			assert.ElementsMatch(t, tc.want, got)
+		})
+	}
+}
