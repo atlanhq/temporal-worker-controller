@@ -20,6 +20,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/flowcontrol"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -305,6 +306,12 @@ func TestDeleteInactiveVersions_WaitsForSiblings(t *testing.T) {
 		d.Status.Replicas = replicas
 		return d
 	}
+	otherAppDeployment := func() *appsv1.Deployment {
+		d := siblingDeployment(1)
+		d.Name = "other-app-b"
+		d.Spec.Template.Spec.Containers = []corev1.Container{{Name: "worker", Env: []corev1.EnvVar{{Name: k8s.TemporalDeploymentNameEnvVar, Value: "other-app"}}}}
+		return d
+	}
 	for _, tc := range []struct {
 		name        string
 		objs        []client.Object
@@ -314,6 +321,7 @@ func TestDeleteInactiveVersions_WaitsForSiblings(t *testing.T) {
 		{"sibling still targets the version, kept", []client.Object{sibling("b", "a"), siblingDeployment(0)}, false},
 		{"sibling runs the version as current, kept", []client.Object{sibling("c", "b"), siblingDeployment(0)}, false},
 		{"sibling still has a pod for the version, kept", []client.Object{sibling("c", "c"), siblingDeployment(1)}, false},
+		{"another app runs the same build ID, deleted", []client.Object{sibling("c", "c"), otherAppDeployment()}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			twd := makeTWD("w-size-m", "app-ns", "conn")
@@ -333,4 +341,32 @@ func TestDeleteInactiveVersions_WaitsForSiblings(t *testing.T) {
 			assert.Equal(t, !tc.wantDeleted, h.known["b"], "server-side version exists")
 		})
 	}
+}
+
+// A failed pinned count backs off like a refused delete, so a degraded visibility store is not
+// queried on every reconcile.
+func TestDeleteInactiveVersions_BacksOffAfterCountError(t *testing.T) {
+	twd := makeTWD("w", "app-ns", "conn")
+	twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+		deprecatedVersion("b", temporaliov1alpha1.VersionStatusInactive),
+	}
+	q := &perBuildPinnedQuerier{deploymentName: "w", count: map[string]int64{"b": 0}, err: map[string]error{"b": errors.New("visibility unavailable")}}
+	h := &versionDeletingHandle{known: map[string]bool{"b": true}}
+	r, _ := newTestReconciler(nil)
+	fakeClock := clocktesting.NewFakeClock(time.Now())
+	r.deleteBackoff = flowcontrol.NewFakeBackOff(10*time.Second, 30*time.Minute, fakeClock)
+	attempt := func() {
+		p := &plan{WorkerDeploymentName: "w", DeleteDeployments: []*appsv1.Deployment{buildDeployment("w-b", "b", k8s.BaseVariantName)}}
+		r.deleteInactiveVersions(context.Background(), logr.Discard(), q, h, twd, p)
+		assert.Len(t, p.DeleteDeployments, 0)
+	}
+
+	attempt()
+	fakeClock.Step(5 * time.Second)
+	attempt()
+	assert.Len(t, q.queried, 1, "no query inside the backoff window")
+	fakeClock.Step(6 * time.Second)
+	attempt()
+	assert.Len(t, q.queried, 2)
+	assert.Zero(t, h.attempts, "never deleted without a count")
 }

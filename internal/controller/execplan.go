@@ -494,6 +494,10 @@ func (r *TemporalWorkerDeploymentReconciler) siblingsReleasedVersion(
 		if _, ours := deleting[d.Name]; ours {
 			continue
 		}
+		// Another app in the namespace can ship the same build ID under its own Worker Deployment.
+		if recorded := k8s.WorkerDeploymentNameFromDeployment(d); recorded != "" && recorded != p.WorkerDeploymentName {
+			continue
+		}
 		if (d.Spec.Replicas != nil && *d.Spec.Replicas > 0) || d.Status.Replicas > 0 {
 			l.Info("sibling TWD still has pods for inactive version, keeping it", "buildID", buildID, "deployment", d.Name)
 			return false
@@ -503,8 +507,8 @@ func (r *TemporalWorkerDeploymentReconciler) siblingsReleasedVersion(
 }
 
 // deleteInactiveVersion reports whether the version has no running pinned workflows and its
-// server-side record is gone. A version the server refused is not asked again until its backoff
-// expires, so a server that keeps failing is not called on every reconcile.
+// server-side record is gone. A version whose count or delete failed is not tried again until its
+// backoff expires, so a server that keeps failing is not called on every reconcile.
 func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersion(
 	ctx context.Context,
 	l logr.Logger,
@@ -523,6 +527,7 @@ func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersion(
 	})
 	if err != nil {
 		l.Info("could not confirm inactive version has no running pinned workflows, keeping it", "buildID", buildID, "error", err)
+		r.noteVersionDeleteFailure(backoffKey)
 		return false
 	}
 	if n := resp.GetCount(); n > 0 {
