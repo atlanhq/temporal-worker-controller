@@ -346,6 +346,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 // they have no server-side version and return NotFound, which is skipped.
 func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.Context, l logr.Logger, deploymentHandler sdkclient.WorkerDeploymentHandle, p *plan) {
 	for _, d := range p.DeleteDeployments {
+		if !isBaseDeployment(d) {
+			continue
+		}
 		buildID, ok := d.GetLabels()[k8s.BuildIDLabel]
 		if !ok {
 			l.Info("deployment has no build ID label, skipping Temporal server-side version cleanup", "deployment", d.Name)
@@ -392,13 +395,12 @@ func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersions(
 			inactive[v.BuildID] = struct{}{}
 		}
 	}
-	// A version is nominated when its base Deployment is. A variant alone is removed from
-	// spec.variants, which deletes only that Deployment and leaves the version in place.
+	// A version is nominated when its base Deployment is. A variant alone is being removed
+	// from spec.variants, which leaves the version in place.
 	nominated := make(map[string]struct{})
 	for _, d := range p.DeleteDeployments {
 		buildID := d.GetLabels()[k8s.BuildIDLabel]
-		variant := d.GetLabels()[k8s.VariantLabel]
-		if _, ok := inactive[buildID]; ok && (variant == "" || variant == k8s.BaseVariantName) {
+		if _, ok := inactive[buildID]; ok && isBaseDeployment(d) {
 			nominated[buildID] = struct{}{}
 		}
 	}
@@ -433,6 +435,13 @@ func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersions(
 		}
 	}
 	p.DeleteWorkerResources = keptResources
+}
+
+// isBaseDeployment reports whether d is its version's base Deployment rather than a variant.
+// Only deleting the base retires the version; a variant alone is removed from spec.variants.
+func isBaseDeployment(d *appsv1.Deployment) bool {
+	variant := d.GetLabels()[k8s.VariantLabel]
+	return variant == "" || variant == k8s.BaseVariantName
 }
 
 // deleteInactiveVersion reports whether the version has no running pinned workflows and its

@@ -167,7 +167,7 @@ func TestExecutePlan_InactiveVersionDeletedServerFirst(t *testing.T) {
 
 // When the Deployment delete fails after the server record is gone, the Deployment stays and
 // the version reads as NotRegistered on the next reconcile, which the planner deletes (see
-// TestGetDeleteDeployments_SupersededInactive).
+// TestGetDeleteDeployments_InactiveRecordGoneDeploymentLeft).
 func TestExecutePlan_InactiveVersionDeploymentDeleteFails(t *testing.T) {
 	twd := makeTWD("app-worker", "app-ns", "conn")
 	twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
@@ -188,5 +188,27 @@ func TestExecutePlan_InactiveVersionDeploymentDeleteFails(t *testing.T) {
 	require.Error(t, r.executePlan(context.Background(), logr.Discard(), twd, temporalClient, p))
 	assert.True(t, exists(t, r.Client, "app-worker-b"))
 	assert.False(t, handle.known["b"])
+}
 
+// Removing a variant from spec.variants deletes only that Deployment. Its version's server
+// record stays, so the pinned check is not needed and nothing is asked of the server.
+func TestExecutePlan_RemovedVariantKeepsVersion(t *testing.T) {
+	twd := makeTWD("app-worker", "app-ns", "conn")
+	twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+		deprecatedVersion("b", temporaliov1alpha1.VersionStatusInactive),
+	}
+	v := buildDeployment("app-worker-od-b", "b", "od")
+	r, _ := newTestReconciler([]client.Object{v.DeepCopy()})
+	handle := &versionDeletingHandle{known: map[string]bool{"b": true}}
+	temporalClient := &countingTemporalClient{
+		stubTemporalClient: &stubTemporalClient{wdClient: &stubWDClient{handle: handle}},
+		pinned:             fakePinnedQuerier{count: 1},
+	}
+	p := &plan{WorkerDeploymentName: "app", DeleteDeployments: []*appsv1.Deployment{v}}
+
+	require.NoError(t, r.executePlan(context.Background(), logr.Discard(), twd, temporalClient, p))
+
+	assert.False(t, exists(t, r.Client, "app-worker-od-b"))
+	assert.True(t, handle.known["b"])
+	assert.Empty(t, temporalClient.pinned.countQueries)
 }
