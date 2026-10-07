@@ -300,12 +300,22 @@ func TestDeleteInactiveVersions_WaitsForSiblings(t *testing.T) {
 		}
 		return s
 	}
-	siblingDeployment := func(replicas int32) *appsv1.Deployment {
+	// Deployments rendered by the controller record their Worker Deployment name; older ones may not.
+	siblingDeploymentRecording := func(replicas int32, recorded string) *appsv1.Deployment {
 		d := buildDeployment("w-size-s-b", "b", k8s.BaseVariantName)
 		d.Spec.Replicas = &replicas
 		d.Status.Replicas = replicas
+		if recorded != "" {
+			d.Spec.Template.Spec.Containers = []corev1.Container{{Name: "worker", Env: []corev1.EnvVar{{Name: k8s.TemporalDeploymentNameEnvVar, Value: recorded}}}}
+		}
 		return d
 	}
+	sharedName := k8s.ComputeWorkerDeploymentName(func() *temporaliov1alpha1.TemporalWorkerDeployment {
+		t := makeTWD("w-size-m", "app-ns", "conn")
+		t.Spec.WorkerOptions.WorkerDeploymentName = "w"
+		return t
+	}())
+	siblingDeployment := func(replicas int32) *appsv1.Deployment { return siblingDeploymentRecording(replicas, sharedName) }
 	otherAppDeployment := func() *appsv1.Deployment {
 		d := siblingDeployment(1)
 		d.Name = "other-app-b"
@@ -321,6 +331,7 @@ func TestDeleteInactiveVersions_WaitsForSiblings(t *testing.T) {
 		{"sibling still targets the version, kept", []client.Object{sibling("b", "a"), siblingDeployment(0)}, false},
 		{"sibling runs the version as current, kept", []client.Object{sibling("c", "b"), siblingDeployment(0)}, false},
 		{"sibling still has a pod for the version, kept", []client.Object{sibling("c", "c"), siblingDeployment(1)}, false},
+		{"sibling Deployment without a recorded name still has a pod, kept", []client.Object{sibling("c", "c"), siblingDeploymentRecording(1, "")}, false},
 		{"another app runs the same build ID, deleted", []client.Object{sibling("c", "c"), otherAppDeployment()}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
