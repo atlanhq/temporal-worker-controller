@@ -78,6 +78,7 @@ type WorkerResourceRef struct {
 	Name       string
 	APIVersion string
 	Kind       string
+	BuildID    string
 }
 
 // WRTOwnerRefPatch holds a WRT pair for a single merge-patch:
@@ -366,6 +367,7 @@ func getDeleteWorkerResources(
 				Name:       resourceName,
 				APIVersion: templateMeta.APIVersion,
 				Kind:       templateMeta.Kind,
+				BuildID:    buildID,
 			})
 		}
 	}

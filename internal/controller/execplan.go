@@ -327,16 +327,16 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 // record for each Deployment deleted this reconcile (executeK8sOperations, called
 // first). The planner only adds a drained version to DeleteDeployments once it is
 // EligibleForDeletion (see planner.getDeleteDeployments): drained past the sunset
-// delays with no active worker pods. It adds a superseded Inactive version once all
-// of its pools are scaled down and no workflow is pinned to it (see
-// holdPinnedInactiveVersions). Deleting the Kubernetes Deployment alone would
+// delays with no active worker pods. Deleting the Kubernetes Deployment alone would
 // leave the server-side version registered forever — the only other cleanup path is
 // the CRD-deletion finalizer, which never runs during a normal rollout. This is also
 // the only point that can reliably prune it: a version's status entry only exists in
 // status.DeprecatedVersions while its Deployment does (see state_mapper.go), so once
 // the Deployment is gone there is no way to retry on a later reconcile. Left unpruned,
 // these accumulate one per rollout and eventually hit the server's per-deployment
-// version cap, after which every new build ID fails to register (#377).
+// version cap, after which every new build ID fails to register (#377). A superseded
+// Inactive version's record is deleted earlier, before its Deployments (see
+// deleteInactiveVersions), and is NotFound here.
 //
 // Build IDs are read off the in-memory Deployment objects, which survive their cluster
 // deletion, so this runs in the Temporal phase without reaching back into k8sState.
@@ -351,7 +351,7 @@ func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.C
 			l.Info("deployment has no build ID label, skipping Temporal server-side version cleanup", "deployment", d.Name)
 			continue
 		}
-		l.Info("deleting worker deployment version", "buildID", buildID)
+		l.Info("deleting drained worker deployment version", "buildID", buildID)
 		if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
 			BuildID:  buildID,
 			Identity: getControllerIdentity(),
@@ -365,16 +365,24 @@ func (r *TemporalWorkerDeploymentReconciler) deleteDrainedVersions(ctx context.C
 	}
 }
 
-// holdPinnedInactiveVersions removes from p.DeleteDeployments every Deployment of an Inactive
-// version that still has running workflows pinned to it, or whose count could not be read.
-// The server's DeleteVersion only refuses a version with pollers, and an Inactive version at
-// zero replicas has none, so without this check its pinned workflows would be stranded with
-// no worker. A held version stays nominated and is retried on the next reconcile. Base and
-// variant Deployments share one count per build, so they are held or deleted together.
-func (r *TemporalWorkerDeploymentReconciler) holdPinnedInactiveVersions(
+// deleteInactiveVersions deletes the server-side record of each Inactive version the planner
+// nominated, before its Deployments are deleted, and keeps in the plan only the versions the
+// server confirmed gone. Both checks must pass first:
+//   - No workflow pinned to the version is running. The server only refuses a version that
+//     still has pollers, and an Inactive version at zero replicas has none, so it would
+//     otherwise strand them with no worker.
+//   - The server deletes the record. It refuses while the version's last pollers are still
+//     recorded, which lasts for some minutes after its pods are gone. Once the Deployment is
+//     deleted the version leaves status and the record could never be retried.
+//
+// A version that fails either check keeps its Deployments and rendered worker resources and
+// stays nominated, so the next reconcile retries. Base and variant Deployments of a version
+// share one decision.
+func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersions(
 	ctx context.Context,
 	l logr.Logger,
 	c pinnedExecutionQuerier,
+	deploymentHandler sdkclient.WorkerDeploymentHandle,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 	p *plan,
 ) {
@@ -389,45 +397,78 @@ func (r *TemporalWorkerDeploymentReconciler) holdPinnedInactiveVersions(
 	}
 
 	hold := make(map[string]bool)
-	kept := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
-	for _, d := range p.DeleteDeployments {
-		buildID := d.GetLabels()[k8s.BuildIDLabel]
+	isHeld := func(buildID string) bool {
 		if _, ok := inactive[buildID]; !ok {
-			kept = append(kept, d)
-			continue
+			return false
 		}
-		held, checked := hold[buildID]
-		if !checked {
-			query := pinnedExecutionQuery(p.WorkerDeploymentName, buildID)
-			resp, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
-				Namespace: p.TemporalNamespace,
-				Query:     query,
-			})
-			switch {
-			case err != nil:
-				l.Info("could not confirm inactive version has no running pinned workflows, keeping it", "buildID", buildID, "error", err)
-				held = true
-			case resp.GetCount() > 0:
-				l.Info("inactive version has running pinned workflows, keeping it", "buildID", buildID, "pinnedExecutions", resp.GetCount())
-				held = true
-			}
-			hold[buildID] = held
+		if held, decided := hold[buildID]; decided {
+			return held
 		}
-		if !held {
-			kept = append(kept, d)
+		hold[buildID] = !r.deleteInactiveVersion(ctx, l, c, deploymentHandler, p, buildID)
+		return hold[buildID]
+	}
+
+	keptDeployments := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	for _, d := range p.DeleteDeployments {
+		if !isHeld(d.GetLabels()[k8s.BuildIDLabel]) {
+			keptDeployments = append(keptDeployments, d)
 		}
 	}
-	p.DeleteDeployments = kept
+	p.DeleteDeployments = keptDeployments
+
+	keptResources := make([]planner.WorkerResourceRef, 0, len(p.DeleteWorkerResources))
+	for _, res := range p.DeleteWorkerResources {
+		if !hold[res.BuildID] {
+			keptResources = append(keptResources, res)
+		}
+	}
+	p.DeleteWorkerResources = keptResources
+}
+
+// deleteInactiveVersion reports whether the version has no running pinned workflows and its
+// server-side record is gone.
+func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersion(
+	ctx context.Context,
+	l logr.Logger,
+	c pinnedExecutionQuerier,
+	deploymentHandler sdkclient.WorkerDeploymentHandle,
+	p *plan,
+	buildID string,
+) bool {
+	resp, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+		Namespace: p.TemporalNamespace,
+		Query:     pinnedExecutionQuery(p.WorkerDeploymentName, buildID),
+	})
+	if err != nil {
+		l.Info("could not confirm inactive version has no running pinned workflows, keeping it", "buildID", buildID, "error", err)
+		return false
+	}
+	if n := resp.GetCount(); n > 0 {
+		l.Info("inactive version has running pinned workflows, keeping it", "buildID", buildID, "pinnedExecutions", n)
+		return false
+	}
+	if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
+		BuildID:  buildID,
+		Identity: getControllerIdentity(),
+	}); err != nil {
+		var notFound *serviceerror.NotFound
+		if !errors.As(err, &notFound) {
+			l.Info("server has not deleted inactive version yet, keeping it", "buildID", buildID, "error", err)
+			return false
+		}
+	}
+	l.Info("deleted inactive worker deployment version", "buildID", buildID)
+	return true
 }
 
 func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, temporalClient sdkclient.Client, p *plan) error {
-	r.holdPinnedInactiveVersions(ctx, l, temporalClient, workerDeploy, p)
+	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(p.WorkerDeploymentName)
+
+	r.deleteInactiveVersions(ctx, l, temporalClient, deploymentHandler, workerDeploy, p)
 
 	if err := r.executeK8sOperations(ctx, l, workerDeploy, p); err != nil {
 		return err
 	}
-
-	deploymentHandler := temporalClient.WorkerDeploymentClient().GetHandle(p.WorkerDeploymentName)
 
 	// Prune Temporal server-side version records for the versions whose Deployments
 	// were just deleted in executeK8sOperations. Must happen in the same reconcile as
