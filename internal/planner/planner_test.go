@@ -3883,3 +3883,34 @@ func TestGetDeleteDeployments_SupersededInactive(t *testing.T) {
 		})
 	}
 }
+
+// An Inactive version's server record is deleted before its Deployments. If those deletes then
+// fail, the version reads as NotRegistered on the next reconcile and is deleted on that path,
+// variants included, whatever its replicas.
+func TestGetDeleteDeployments_InactiveRecordGoneDeploymentLeft(t *testing.T) {
+	replicas := int32(1)
+	deploy := func(name string) *appsv1.Deployment {
+		return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: appsv1.DeploymentSpec{Replicas: &replicas}}
+	}
+	state := &k8s.DeploymentState{
+		Deployments:        map[string]*appsv1.Deployment{"b": deploy("w-b")},
+		VariantDeployments: map[string]map[string]*appsv1.Deployment{"b": {"od": deploy("w-od-b")}},
+	}
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{BuildID: "c"},
+		},
+		DeprecatedVersions: []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID: "b", Status: temporaliov1alpha1.VersionStatusNotRegistered, Deployment: &corev1.ObjectReference{Name: "w-b"},
+			},
+		}},
+	}
+	spec := &temporaliov1alpha1.TemporalWorkerDeploymentSpec{Variants: []temporaliov1alpha1.WorkerVariant{{Name: "od"}}}
+
+	var got []string
+	for _, d := range getDeleteDeployments(state, status, spec, true, "w") {
+		got = append(got, d.Name)
+	}
+	assert.ElementsMatch(t, []string{"w-b", "w-od-b"}, got)
+}

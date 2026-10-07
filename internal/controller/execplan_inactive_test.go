@@ -21,6 +21,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // perBuildPinnedQuerier answers CountWorkflow by the version named in the query.
@@ -66,9 +67,9 @@ func (h *versionDeletingHandle) DeleteVersion(_ context.Context, o sdkclient.Wor
 	return sdkclient.WorkerDeploymentDeleteVersionResponse{}, nil
 }
 
-func buildDeployment(name, buildID string) *appsv1.Deployment {
+func buildDeployment(name, buildID, variant string) *appsv1.Deployment {
 	return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
-		Name: name, Namespace: "app-ns", Labels: map[string]string{k8s.BuildIDLabel: buildID},
+		Name: name, Namespace: "app-ns", Labels: map[string]string{k8s.BuildIDLabel: buildID, k8s.VariantLabel: variant},
 	}}
 }
 
@@ -81,7 +82,8 @@ func deprecatedVersion(buildID string, s temporaliov1alpha1.VersionStatus) *temp
 // An Inactive version is deleted from the server before its Deployments, and only when no
 // workflow is pinned to it. Whatever stops that (pinned workflows, an unreadable count, the
 // server refusing) keeps the version's Deployments and rendered resources for a retry, and a
-// base and its variant always share the outcome.
+// base and its variant always share the outcome. A variant removed from the spec on its own
+// leaves its version alone.
 func TestDeleteInactiveVersions(t *testing.T) {
 	twd := makeTWD("w", "app-ns", "conn")
 	twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
@@ -91,22 +93,25 @@ func TestDeleteInactiveVersions(t *testing.T) {
 		deprecatedVersion("unknown", temporaliov1alpha1.VersionStatusInactive),
 		deprecatedVersion("refused", temporaliov1alpha1.VersionStatusInactive),
 		deprecatedVersion("drained", temporaliov1alpha1.VersionStatusDrained),
+		deprecatedVersion("live", temporaliov1alpha1.VersionStatusInactive),
 	}
 	q := &perBuildPinnedQuerier{
 		deploymentName: "w",
-		count:          map[string]int64{"idle": 0, "gone": 0, "pinned": 2, "unknown": 0, "refused": 0},
+		count:          map[string]int64{"idle": 0, "gone": 0, "pinned": 2, "unknown": 0, "refused": 0, "live": 0},
 		err:            map[string]error{"unknown": errors.New("visibility unavailable")},
 	}
 	h := &versionDeletingHandle{
-		known:  map[string]bool{"idle": true, "pinned": true, "unknown": true, "refused": true, "drained": true},
+		known:  map[string]bool{"idle": true, "pinned": true, "unknown": true, "refused": true, "drained": true, "live": true},
 		refuse: map[string]error{"refused": serviceerror.NewFailedPrecondition("version has active pollers")},
 	}
 	var deployments []*appsv1.Deployment
 	var resources []planner.WorkerResourceRef
 	for _, b := range []string{"idle", "gone", "pinned", "unknown", "refused", "drained"} {
-		deployments = append(deployments, buildDeployment("w-"+b, b), buildDeployment("w-od-"+b, b))
+		deployments = append(deployments, buildDeployment("w-"+b, b, k8s.BaseVariantName), buildDeployment("w-od-"+b, b, "od"))
 		resources = append(resources, planner.WorkerResourceRef{Name: "res-" + b, BuildID: b})
 	}
+	// Only the removed variant of version "live" is being deleted.
+	deployments = append(deployments, buildDeployment("w-od-live", "live", "od"))
 	p := &plan{WorkerDeploymentName: "w", DeleteDeployments: deployments, DeleteWorkerResources: resources}
 
 	r, _ := newTestReconciler(nil)
@@ -119,9 +124,9 @@ func TestDeleteInactiveVersions(t *testing.T) {
 	for _, res := range p.DeleteWorkerResources {
 		keptResources = append(keptResources, res.Name)
 	}
-	assert.ElementsMatch(t, []string{"w-idle", "w-od-idle", "w-gone", "w-od-gone", "w-drained", "w-od-drained"}, keptDeployments)
+	assert.ElementsMatch(t, []string{"w-idle", "w-od-idle", "w-gone", "w-od-gone", "w-drained", "w-od-drained", "w-od-live"}, keptDeployments)
 	assert.ElementsMatch(t, []string{"res-idle", "res-gone", "res-drained"}, keptResources)
-	assert.ElementsMatch(t, []string{"idle", "gone", "pinned", "unknown", "refused"}, q.queried, "one query per Inactive version, none for Drained")
+	assert.ElementsMatch(t, []string{"idle", "gone", "pinned", "unknown", "refused"}, q.queried, "one query per nominated Inactive version")
 	assert.Equal(t, []string{"idle"}, h.deleted, "only versions with no pinned workflows are deleted, and Drained is left to deleteDrainedVersions")
 }
 
@@ -143,7 +148,7 @@ func TestExecutePlan_InactiveVersionDeletedServerFirst(t *testing.T) {
 			twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
 				deprecatedVersion("b", temporaliov1alpha1.VersionStatusInactive),
 			}
-			d := buildDeployment("app-worker-b", "b")
+			d := buildDeployment("app-worker-b", "b", k8s.BaseVariantName)
 			r, _ := newTestReconciler([]client.Object{d.DeepCopy()})
 			handle := &versionDeletingHandle{known: map[string]bool{"b": true}, refuse: map[string]error{"b": tc.refuse}}
 			temporalClient := &countingTemporalClient{
@@ -158,4 +163,30 @@ func TestExecutePlan_InactiveVersionDeletedServerFirst(t *testing.T) {
 			assert.Equal(t, !tc.wantDeleted, handle.known["b"], "server-side version exists")
 		})
 	}
+}
+
+// When the Deployment delete fails after the server record is gone, the Deployment stays and
+// the version reads as NotRegistered on the next reconcile, which the planner deletes (see
+// TestGetDeleteDeployments_SupersededInactive).
+func TestExecutePlan_InactiveVersionDeploymentDeleteFails(t *testing.T) {
+	twd := makeTWD("app-worker", "app-ns", "conn")
+	twd.Status.DeprecatedVersions = []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion{
+		deprecatedVersion("b", temporaliov1alpha1.VersionStatusInactive),
+	}
+	d := buildDeployment("app-worker-b", "b", k8s.BaseVariantName)
+	r, _ := newTestReconcilerWithInterceptors([]client.Object{d.DeepCopy()}, interceptor.Funcs{
+		Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+			return errors.New("apiserver unavailable")
+		},
+	})
+	handle := &versionDeletingHandle{known: map[string]bool{"b": true}}
+	temporalClient := &countingTemporalClient{
+		stubTemporalClient: &stubTemporalClient{wdClient: &stubWDClient{handle: handle}},
+	}
+	p := &plan{WorkerDeploymentName: "app", DeleteDeployments: []*appsv1.Deployment{d}}
+
+	require.Error(t, r.executePlan(context.Background(), logr.Discard(), twd, temporalClient, p))
+	assert.True(t, exists(t, r.Client, "app-worker-b"))
+	assert.False(t, handle.known["b"])
+
 }

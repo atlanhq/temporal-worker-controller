@@ -392,13 +392,23 @@ func (r *TemporalWorkerDeploymentReconciler) deleteInactiveVersions(
 			inactive[v.BuildID] = struct{}{}
 		}
 	}
-	if len(inactive) == 0 {
+	// A version is nominated when its base Deployment is. A variant alone is removed from
+	// spec.variants, which deletes only that Deployment and leaves the version in place.
+	nominated := make(map[string]struct{})
+	for _, d := range p.DeleteDeployments {
+		buildID := d.GetLabels()[k8s.BuildIDLabel]
+		variant := d.GetLabels()[k8s.VariantLabel]
+		if _, ok := inactive[buildID]; ok && (variant == "" || variant == k8s.BaseVariantName) {
+			nominated[buildID] = struct{}{}
+		}
+	}
+	if len(nominated) == 0 {
 		return
 	}
 
 	hold := make(map[string]bool)
 	isHeld := func(buildID string) bool {
-		if _, ok := inactive[buildID]; !ok {
+		if _, ok := nominated[buildID]; !ok {
 			return false
 		}
 		if held, decided := hold[buildID]; decided {
