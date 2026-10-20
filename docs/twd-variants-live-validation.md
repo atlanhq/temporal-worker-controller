@@ -121,3 +121,15 @@ The round-1 "version-GC retry loop" errors were misdiagnosed as benign: they wer
 - ai-memory left on `odMirrorMode=variants` + `unsafeCustomBuildID=main-5336556b` (the consolidated real-app example; revert = remove both HelmRelease values keys).
 - Harness (`rerouter-e2e` ns incl. VPA), test workflows, taints: all removed. Fleet generations: unchanged except the canary and enrichment-studio's own perpetual churn (+1 on gen ~680, unrelated).
 - Restore points: TWC `1.6.0-atlan-2-8633f913...`, chart `0.1.2-beta-d263ae5`, rerouter `sha-4bce6904...`.
+
+## Version selection follow-up (2026-10-20): Current/Ramping no longer select all active versions
+
+Current and Ramping SOs stopped setting `selectAllActive`; they keep `selectUnversioned`. The "Workflow task without a Build ID" row above was validated with the old flags. Its outcome still holds through mechanism (a) by a different route: on Temporal 1.30 the per-version query is credited with the version's share of the default-queue backlog, and the Current/Ramping double-count of one spooled task is gone (only the server's round-up of each ramp share remains).
+
+| Check | Result |
+|---|---|
+| New Current's pool with another build's pinned backlog queued | Metric 0 and pool at its floor; previously the metric equalled the other build's backlog and the pool sat at max |
+| Scale from zero on Current (base queue, pool queue, both `-od` queues) | Each woke 0 -> 1 within about 30s of one unpinned task |
+| Unpinned backlog at promotion | Credit moved to the new Current on promotion; it woke and drained the backlog |
+| Ramping at 50% | Ramping SO read its own share only and woke from 0; warm-start floor unchanged |
+| Old build's pinned backlog | Scaled the old build through its own per-build SO |

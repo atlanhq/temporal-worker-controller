@@ -223,10 +223,9 @@ func TestVariantSOsDeprecatedWithVersion(t *testing.T) {
 	}, names)
 }
 
-// TestVariantSOUnversionedFlags: the od variant's SO must carry selectAllActive +
-// selectUnversioned exactly like the base for Current/Ramping versions, so an
-// unversioned (no-build-ID) task spooled on the suffixed queue wakes the variant
-// from zero too. Draining stays strictly per-build-scoped.
+// TestVariantSOUnversionedFlags: the od variant's SO selects versions exactly like
+// the base: selectUnversioned for Current/Ramping, never selectAllActive, and
+// Draining strictly per-build.
 func TestVariantSOUnversionedFlags(t *testing.T) {
 	twd := variantTWD()
 	ref := &corev1.ObjectReference{Name: "app-worker-twd-od-bid1", Namespace: "app-ns"}
@@ -242,7 +241,7 @@ func TestVariantSOUnversionedFlags(t *testing.T) {
 			BuildID: "bid1", Status: tc.status, Deployment: ref, Variant: &twd.Spec.Variants[0],
 		}, "temporal:7233")
 		md := soTrigger(t, so)
-		assert.Equal(t, tc.want, md["selectAllActive"] == "true", "selectAllActive for %s", tc.status)
+		assert.NotContains(t, md, "selectAllActive", "selectAllActive for %s", tc.status)
 		assert.Equal(t, tc.want, md["selectUnversioned"] == "true", "selectUnversioned for %s", tc.status)
 	}
 }
