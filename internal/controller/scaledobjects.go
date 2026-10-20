@@ -1011,10 +1011,13 @@ func buildScaledObject(
 	// ramp percentage for Ramping. So a Current or Ramping version scaled to
 	// zero still sees the spooled work that will route to it and wakes up.
 	//
-	// selectUnversioned adds the default-queue backlog attributed to no
-	// version, which is non-zero only while part of the routing goes to
-	// unversioned workers. Current and Ramping keep it so that work stays
-	// visible during such a rollout.
+	// selectUnversioned adds the default-queue backlog the server credits to no
+	// version. That is the whole default-queue backlog when the server does
+	// not credit versions at all (servers before 1.30) or has no routing data
+	// for this queue yet (a queue the version has not registered), and the
+	// unversioned ramp share while part of the routing goes to unversioned
+	// workers. Without it a Current or Ramping version at zero would miss that
+	// work.
 	//
 	// selectAllActive is never set. It adds every loaded version's own queue,
 	// and another version's queue holds only work pinned to that version, which
@@ -1022,8 +1025,9 @@ func buildScaledObject(
 	// max while an old version's pinned work waits; that work already scales the
 	// old version through the old version's own ScaledObject.
 	//
-	// Draining and other deprecated versions own no share of the default queue,
-	// so they stay strictly per-build.
+	// Draining and other deprecated versions are not the server's Current or
+	// Ramping, so they get no share of the default queue and stay strictly
+	// per-build.
 	if v.Status == temporaliov1alpha1.VersionStatusCurrent ||
 		v.Status == temporaliov1alpha1.VersionStatusRamping {
 		triggerMetadata["selectUnversioned"] = "true"
