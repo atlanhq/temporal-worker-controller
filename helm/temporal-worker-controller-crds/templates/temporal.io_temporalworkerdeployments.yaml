@@ -4574,6 +4574,10 @@ spec:
                     items:
                       type: string
                     type: array
+                  runningWorkflowWarmWorkers:
+                    format: int32
+                    minimum: 0
+                    type: integer
                   targetQueueSize:
                     format: int32
                     type: integer

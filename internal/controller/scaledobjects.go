@@ -1151,6 +1151,9 @@ func setTriggerMetadata(m map[string]interface{}, twd *temporaliov1alpha1.Tempor
 	if ws.IncludeRunningWorkflowCount != nil {
 		m["includeRunningWorkflowCount"] = strconv.FormatBool(*ws.IncludeRunningWorkflowCount)
 	}
+	if ws.RunningWorkflowWarmWorkers != nil {
+		m["runningWorkflowWarmWorkers"] = strconv.FormatInt(int64(*ws.RunningWorkflowWarmWorkers), 10)
+	}
 	if ws.WorkflowTaskQueueForCount != "" {
 		m["workflowTaskQueueForCount"] = ws.WorkflowTaskQueueForCount
 	}

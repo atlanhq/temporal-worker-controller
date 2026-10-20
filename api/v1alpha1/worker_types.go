@@ -320,6 +320,17 @@ type WorkerScalingConfig struct {
 	// +optional
 	IncludeRunningWorkflowCount *bool `json:"includeRunningWorkflowCount,omitempty"`
 
+	// RunningWorkflowWarmWorkers caps how many workers the running-workflow
+	// count keeps warm. Unset or 0 counts every running workflow as one
+	// targetQueueSize of demand. Above 0, running workflows hold at most this
+	// many workers and overlap with used activity slots instead of adding to
+	// them, while backlog and used slots still scale beyond it. Needs an
+	// accurate activitySlotsPerWorker, or idle workers' phantom used slots keep
+	// them up.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	RunningWorkflowWarmWorkers *int32 `json:"runningWorkflowWarmWorkers,omitempty"`
+
 	// WorkflowTaskQueueForCount overrides the task queue name used for
 	// CountWorkflowExecutions when it differs from the worker task queue.
 	// +optional

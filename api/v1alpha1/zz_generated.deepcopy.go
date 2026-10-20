@@ -870,6 +870,11 @@ func (in *WorkerScalingConfig) DeepCopyInto(out *WorkerScalingConfig) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.RunningWorkflowWarmWorkers != nil {
+		in, out := &in.RunningWorkflowWarmWorkers, &out.RunningWorkflowWarmWorkers
+		*out = new(int32)
+		**out = **in
+	}
 	if in.WorkerMetricsPort != nil {
 		in, out := &in.WorkerMetricsPort, &out.WorkerMetricsPort
 		*out = new(int32)

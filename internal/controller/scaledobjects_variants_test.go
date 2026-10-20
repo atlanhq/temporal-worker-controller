@@ -284,6 +284,46 @@ func TestBuildScaledObject_VariantScalingFlagsAreVariantOnly(t *testing.T) {
 	assert.NotContains(t, bm, "activitySlotsPerWorker", "base SO must NOT inherit the variant's slot ceiling")
 }
 
+// runningWorkflowWarmWorkers is a base-worker setting, written from
+// workerScaling like every shared trigger field, so the -od variant inherits
+// it too. That is harmless: the variant counts running workflows on
+// "<queue>-od", where none ever run, so the capped and uncapped metrics are
+// both backlog + used slots.
+func TestBuildScaledObject_RunningWorkflowWarmWorkersFromWorkerScaling(t *testing.T) {
+	warm := int32(1)
+	slots := int32(1)
+	gate := false
+	twd := variantTWD()
+	twd.Spec.WorkerScaling.RunningWorkflowWarmWorkers = &warm
+	twd.Spec.WorkerScaling.ActivitySlotsPerWorker = &slots
+	twd.Spec.Variants[0].Scaling = &temporaliov1alpha1.VariantScaling{
+		GateSlotsOnRunningWorkflow: &gate,
+		ActivitySlotsPerWorker:     &slots,
+	}
+
+	base := versionRef{
+		BuildID:    "bid1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "app-worker-twd-bid1", Namespace: "app-ns"},
+	}
+	variant := versionRef{
+		BuildID:    "bid1",
+		Status:     temporaliov1alpha1.VersionStatusCurrent,
+		Deployment: &corev1.ObjectReference{Name: "app-worker-twd-od-bid1", Namespace: "app-ns"},
+		Variant:    &twd.Spec.Variants[0],
+	}
+
+	bm := soTrigger(t, buildScaledObject(twd, base, "temporal:7233"))
+	assert.Equal(t, "1", bm["runningWorkflowWarmWorkers"])
+	assert.Equal(t, "1", bm["activitySlotsPerWorker"])
+	assert.NotContains(t, bm, "gateSlotsOnRunningWorkflow", "base keeps the scaler's gate default")
+
+	vm := soTrigger(t, buildScaledObject(twd, variant, "temporal:7233"))
+	assert.Equal(t, "1", vm["runningWorkflowWarmWorkers"])
+	assert.Equal(t, "false", vm["gateSlotsOnRunningWorkflow"])
+	assert.Equal(t, "atlan-app-production-od", vm["workflowTaskQueueForCount"], "variant counts workflows on its own -od queue")
+}
+
 // A version superseded before promotion (deprecated Inactive) must not keep a
 // pod on either pool, while the Inactive target keeps its warm-start floor on
 // both. Covers the hand-off from status, through activeVersionsForScaling and
