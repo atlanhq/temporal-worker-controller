@@ -1002,36 +1002,30 @@ func buildScaledObject(
 		"workerDeploymentName":    triggerWDN,
 		"workerDeploymentBuildId": v.BuildID,
 	}
-	// Current and Ramping versions catch unassigned backlog so they can scale
-	// from zero. In Temporal's worker-deployment-versioning model, newly-queued
-	// workflows have no version search attribute until a worker picks them up,
-	// and matching routes them at AddTask time but spools the task in the
-	// default (unversioned) partition until sync-match succeeds. Per-build
-	// scoped queries (TaskQueueVersionSelection.BuildIDs / TemporalWorker
-	// DeploymentVersion) return 0 for these spooled tasks. Setting
-	// selectAllActive + selectUnversioned on both Current and Ramping routes
-	// their DescribeTaskQueueEnhanced query through the all-active +
-	// unversioned buckets so they see the spooled work and wake a worker up.
+	// The backlog term counts only work this version's pods can poll.
 	//
-	// Ramping needs this too: when matching pre-routes a task to Ramping's
-	// version (via deterministic workflowId hash + routing %), the task sits
-	// in the default partition with syncMatchQueue=Ramping. Without the flags,
-	// Ramping's per-build SO query returns 0, no Ramping pod starts, and the
-	// task is stuck (Current workers don't poll the default partition; only
-	// the version Ramping points at can drain it).
+	// Matching spools unpinned tasks in the default (unversioned) queue and
+	// routes them to the Current or Ramping version at dispatch. Describing a
+	// version by its own "<deployment>:<buildId>" makes the server add that
+	// version's share of the default-queue backlog: all of it for Current, the
+	// ramp percentage for Ramping. So a Current or Ramping version scaled to
+	// zero still sees the spooled work that will route to it and wakes up.
 	//
-	// Drained/Deprecated versions stay strictly per-build-scoped: they only
-	// see workflows already pinned to them, which is the correct behavior
-	// (they should never reach into the unversioned bucket).
+	// selectUnversioned adds the default-queue backlog attributed to no
+	// version, which is non-zero only while part of the routing goes to
+	// unversioned workers. Current and Ramping keep it so that work stays
+	// visible during such a rollout.
 	//
-	// Trade-off: Current and Ramping double-count the same default-partition
-	// backlog, so both can scale up in response to the same spooled task. The
-	// over-provisioning is contained to the cold-start window when ramping is
-	// active; once both versions are warm, sync-match succeeds at AddTask time
-	// and the default partition stays empty.
+	// selectAllActive is never set. It adds every loaded version's own queue,
+	// and another version's queue holds only work pinned to that version, which
+	// this version's pods cannot poll. Counting it scales a new Current to its
+	// max while an old version's pinned work waits; that work already scales the
+	// old version through the old version's own ScaledObject.
+	//
+	// Draining and other deprecated versions own no share of the default queue,
+	// so they stay strictly per-build.
 	if v.Status == temporaliov1alpha1.VersionStatusCurrent ||
 		v.Status == temporaliov1alpha1.VersionStatusRamping {
-		triggerMetadata["selectAllActive"] = "true"
 		triggerMetadata["selectUnversioned"] = "true"
 	}
 	setTriggerMetadata(triggerMetadata, twd)
