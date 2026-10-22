@@ -20,23 +20,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// fakeVersionQueues serves describeVersionQueues from a fixed set and counts calls.
-type fakeVersionQueues struct {
-	queues map[string]bool
+// fakeRouting serves describeQueueRouting from a per-queue table and counts calls.
+type fakeRouting struct {
+	routes map[string][]queueRouting
 	err    error
 	calls  int
 }
 
-func (f *fakeVersionQueues) describe(context.Context, *temporaliov1alpha1.TemporalWorkerDeployment, string, string) (map[string]bool, error) {
+func (f *fakeRouting) describe(_ context.Context, _ *temporaliov1alpha1.TemporalWorkerDeployment, queue string) ([]queueRouting, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
-	out := make(map[string]bool, len(f.queues))
-	for q, ok := range f.queues {
-		out[q] = ok
-	}
-	return out, nil
+	return f.routes[queue], nil
+}
+
+// both returns the same routing for the workflow and the activity type.
+func both(deployment, buildID string) []queueRouting {
+	return []queueRouting{{deployment, buildID}, {deployment, buildID}}
 }
 
 // soMinByTarget returns each ScaledObject's minReplicaCount keyed by its target Deployment.
@@ -57,7 +58,7 @@ func soMinByTarget(t *testing.T, r *TemporalWorkerDeploymentReconciler) map[stri
 	return out
 }
 
-func TestResolveMinReplicas_CurrentWithoutItsQueue(t *testing.T) {
+func TestResolveMinReplicas_CurrentWhoseQueueRoutesElsewhere(t *testing.T) {
 	twd := &temporaliov1alpha1.TemporalWorkerDeployment{Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
 		WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{MinReplicaCount: int32Ptr(0)},
 	}}
@@ -67,11 +68,11 @@ func TestResolveMinReplicas_CurrentWithoutItsQueue(t *testing.T) {
 		min     int32
 		wantMin int64
 	}{
-		{"current holding its queue runs at the configured min", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent}, 0, 0},
-		{"current missing its queue keeps one worker", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent, QueueNotOnVersion: true}, 0, 1},
-		{"a higher configured min still wins", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent, QueueNotOnVersion: true}, 3, 3},
-		{"draining is never floored", versionRef{Status: temporaliov1alpha1.VersionStatusDraining, QueueNotOnVersion: true}, 0, 0},
-		{"a variant missing its queue keeps one worker", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent, QueueNotOnVersion: true,
+		{"current receiving its queue runs at the configured min", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent}, 0, 0},
+		{"current whose queue routes elsewhere keeps one worker", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent, QueueRoutedElsewhere: true}, 0, 1},
+		{"a higher configured min still wins", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent, QueueRoutedElsewhere: true}, 3, 3},
+		{"draining is never floored", versionRef{Status: temporaliov1alpha1.VersionStatusDraining, QueueRoutedElsewhere: true}, 0, 0},
+		{"a variant whose queue routes elsewhere keeps one worker", versionRef{Status: temporaliov1alpha1.VersionStatusCurrent, QueueRoutedElsewhere: true,
 			Variant: &temporaliov1alpha1.WorkerVariant{Name: "od", TaskQueueSuffix: "-od"}}, 0, 1},
 	}
 	for _, tc := range cases {
@@ -84,34 +85,49 @@ func TestResolveMinReplicas_CurrentWithoutItsQueue(t *testing.T) {
 	}
 }
 
-// The incident: the Current version holds the variant's queue but not the
-// base queue. The base must keep one worker so it polls and registers its
-// queue; the variant, whose queue is on the version, scales from zero as before.
-func TestReconcileScaledObjects_CurrentMissingBaseQueueKeepsOneWorker(t *testing.T) {
+// The incident: after a workerDeploymentName change the Current version was
+// promoted before its base worker polled, and matching still routes the base
+// queue to the old worker deployment's version. The base keeps one worker so
+// it polls and takes the queue over; once routing reaches the Current version
+// the floor lifts. Variants whose queues route to the Current version, or to
+// no version at all, scale from zero as before.
+func TestReconcileScaledObjects_BaseQueueRoutedToOldDeploymentKeepsOneWorker(t *testing.T) {
 	r, twd := soReconcileFixture(t)
 	twd.Spec.WorkerScaling.MinReplicaCount = int32Ptr(0)
-	fake := &fakeVersionQueues{queues: map[string]bool{"atlan-app-production-od": true, "atlan-app-production-spot": true}}
-	r.describeVersionQueues = fake.describe
+	dep := resolveWorkerDeployment(twd)
+	fake := &fakeRouting{routes: map[string][]queueRouting{
+		"atlan-app-production":      both("app-ns/old-name", "old-build"),
+		"atlan-app-production-od":   both(dep, testLongBuildID),
+		"atlan-app-production-spot": both("", ""),
+	}}
+	r.describeQueueRouting = fake.describe
 
 	require.NoError(t, r.reconcileScaledObjects(context.Background(), logr.Discard(), twd, "temporal:7233"))
 	mins := soMinByTarget(t, r)
-	assert.Equal(t, int64(1), mins["dep-base"], "base must hold one worker until its queue is on the version")
+	assert.Equal(t, int64(1), mins["dep-base"], "base must hold one worker while its queue routes to the old deployment")
 	assert.Equal(t, int64(0), mins["dep-od"])
-	assert.Equal(t, int64(0), mins["dep-spot"])
+	assert.Equal(t, int64(0), mins["dep-spot"], "unversioned routing needs no floor: selectUnversioned counts it")
 
-	// The worker polled: the queue is now on the version and the floor lifts.
-	fake.queues["atlan-app-production"] = true
-	r.versionQueues.put(versionQueuesKey{twd: twd.UID, deployment: resolveWorkerDeployment(twd), buildID: testLongBuildID},
-		&versionQueuesEntry{queues: map[string]bool{}, checkedAt: time.Now().Add(-time.Hour)})
+	// The worker polled: routing moved to the Current version and the floor lifts.
+	fake.routes["atlan-app-production"] = both(dep, testLongBuildID)
+	k := queueRoutingKey{twd: twd.UID, deployment: dep, buildID: testLongBuildID, queue: "atlan-app-production"}
+	r.queueRouting.get(k).checkedAt = time.Now().Add(-2 * queueRoutingRecheckInterval)
 	require.NoError(t, r.reconcileScaledObjects(context.Background(), logr.Discard(), twd, "temporal:7233"))
 	assert.Equal(t, int64(0), soMinByTarget(t, r)["dep-base"])
 }
 
-func TestReconcileScaledObjects_VariantMissingItsQueueKeepsOneWorker(t *testing.T) {
+// An activity-only pool registers only the activity type, so routing of either
+// type to another version counts.
+func TestReconcileScaledObjects_ActivityTypeRoutedElsewhereKeepsOneWorker(t *testing.T) {
 	r, twd := soReconcileFixture(t)
 	twd.Spec.WorkerScaling.MinReplicaCount = int32Ptr(0)
-	fake := &fakeVersionQueues{queues: map[string]bool{"atlan-app-production": true, "atlan-app-production-spot": true}}
-	r.describeVersionQueues = fake.describe
+	dep := resolveWorkerDeployment(twd)
+	fake := &fakeRouting{routes: map[string][]queueRouting{
+		"atlan-app-production":      both(dep, testLongBuildID),
+		"atlan-app-production-od":   {{"", ""}, {"app-ns/old-name", "old-build"}},
+		"atlan-app-production-spot": both(dep, testLongBuildID),
+	}}
+	r.describeQueueRouting = fake.describe
 
 	require.NoError(t, r.reconcileScaledObjects(context.Background(), logr.Discard(), twd, "temporal:7233"))
 	mins := soMinByTarget(t, r)
@@ -120,69 +136,77 @@ func TestReconcileScaledObjects_VariantMissingItsQueueKeepsOneWorker(t *testing.
 	assert.Equal(t, int64(0), mins["dep-spot"])
 }
 
-// Only the Current version is checked: a Draining version gets no share of new
-// work, so its queue being absent says nothing about routing.
+// Only the Current version is checked: a Draining version gets no new work.
 func TestReconcileScaledObjects_OnlyCurrentIsDescribed(t *testing.T) {
 	r, twd := soReconcileFixture(t)
 	twd.Status.CurrentVersion.Status = temporaliov1alpha1.VersionStatusDraining
-	fake := &fakeVersionQueues{queues: map[string]bool{}}
-	r.describeVersionQueues = fake.describe
+	fake := &fakeRouting{}
+	r.describeQueueRouting = fake.describe
 
 	require.NoError(t, r.reconcileScaledObjects(context.Background(), logr.Discard(), twd, "temporal:7233"))
 	assert.Zero(t, fake.calls)
 }
 
-func TestVersionHoldsQueue_CachesHitsAndRechecksMisses(t *testing.T) {
-	r := &TemporalWorkerDeploymentReconciler{}
+func newRoutingTestTWD() *temporaliov1alpha1.TemporalWorkerDeployment {
 	twd := &temporaliov1alpha1.TemporalWorkerDeployment{}
 	twd.UID = types.UID("twd-1")
 	twd.Namespace, twd.Name = "ns", "twd"
-	fake := &fakeVersionQueues{queues: map[string]bool{}}
-	r.describeVersionQueues = fake.describe
+	return twd
+}
+
+func TestQueueRoutedElsewhere_CachesSettledAndRechecksOthers(t *testing.T) {
+	r := &TemporalWorkerDeploymentReconciler{}
+	twd := newRoutingTestTWD()
+	dep := resolveWorkerDeployment(twd)
+	fake := &fakeRouting{routes: map[string][]queueRouting{"q": both("other/dep", "b0")}}
+	r.describeQueueRouting = fake.describe
 	ctx, l := context.Background(), logr.Discard()
 
-	assert.False(t, r.versionHoldsQueue(ctx, l, twd, "b1", "q"))
-	assert.False(t, r.versionHoldsQueue(ctx, l, twd, "b1", "q"))
-	assert.Equal(t, 1, fake.calls, "a miss is not re-described within the recheck interval")
+	assert.True(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.True(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.Equal(t, 1, fake.calls, "not re-described within the recheck interval")
 
-	k := versionQueuesKey{twd: twd.UID, deployment: resolveWorkerDeployment(twd), buildID: "b1"}
-	r.versionQueues.get(k).checkedAt = time.Now().Add(-2 * queueRecheckInterval)
-	fake.queues["q"] = true
-	assert.True(t, r.versionHoldsQueue(ctx, l, twd, "b1", "q"))
+	k := queueRoutingKey{twd: twd.UID, deployment: dep, buildID: "b1", queue: "q"}
+	r.queueRouting.get(k).checkedAt = time.Now().Add(-2 * queueRoutingRecheckInterval)
+	fake.routes["q"] = both(dep, "b1")
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
 	assert.Equal(t, 2, fake.calls)
 
-	assert.True(t, r.versionHoldsQueue(ctx, l, twd, "b1", "q"))
-	assert.Equal(t, 2, fake.calls, "a hit is kept without rechecking")
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.Equal(t, 2, fake.calls, "routing to this version is final for the version")
 
-	// A new Current replaces the old version's entry.
-	assert.True(t, r.versionHoldsQueue(ctx, l, twd, "b2", "q"))
-	assert.Nil(t, r.versionQueues.get(k))
+	// Unversioned routing is rechecked: another worker deployment could still take the queue.
+	fake.routes["u"] = both("", "")
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "u"))
+	ku := queueRoutingKey{twd: twd.UID, deployment: dep, buildID: "b1", queue: "u"}
+	assert.False(t, r.queueRouting.get(ku).checkedAt.IsZero())
 
-	r.versionQueues.forget(twd.UID)
-	assert.Empty(t, r.versionQueues.entries)
+	// A new Current drops the old version's entries.
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b2", "u"))
+	assert.Nil(t, r.queueRouting.get(k))
+
+	r.queueRouting.forget(twd.UID)
+	assert.Empty(t, r.queueRouting.entries)
 }
 
-// A failed describe never holds a worker up on its own, but does not discard
-// a miss already observed.
-func TestVersionHoldsQueue_DescribeFailure(t *testing.T) {
+// A failed describe never holds a worker up on its own, but keeps what was
+// last observed.
+func TestQueueRoutedElsewhere_DescribeFailure(t *testing.T) {
 	r := &TemporalWorkerDeploymentReconciler{}
-	twd := &temporaliov1alpha1.TemporalWorkerDeployment{}
-	twd.UID = types.UID("twd-1")
-	fake := &fakeVersionQueues{err: errors.New("unavailable")}
-	r.describeVersionQueues = fake.describe
+	twd := newRoutingTestTWD()
+	fake := &fakeRouting{err: errors.New("unavailable")}
+	r.describeQueueRouting = fake.describe
 	ctx, l := context.Background(), logr.Discard()
 
-	assert.True(t, r.versionHoldsQueue(ctx, l, twd, "b1", "q"), "nothing known: do not hold a worker")
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"), "nothing known: do not hold a worker")
 
-	k := versionQueuesKey{twd: twd.UID, deployment: resolveWorkerDeployment(twd), buildID: "b1"}
-	r.versionQueues.put(k, &versionQueuesEntry{queues: map[string]bool{}, checkedAt: time.Now().Add(-time.Hour)})
-	assert.False(t, r.versionHoldsQueue(ctx, l, twd, "b1", "q"), "keep the last observed miss")
+	k := queueRoutingKey{twd: twd.UID, deployment: resolveWorkerDeployment(twd), buildID: "b1", queue: "q"}
+	r.queueRouting.put(k, &queueRoutingEntry{elsewhere: true, checkedAt: time.Now().Add(-time.Hour)})
+	assert.True(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"), "keep the last observed routing")
 }
 
-// Without a Temporal client (as in the other controller tests) the lookup
-// answers "held", so no ScaledObject changes.
-func TestVersionHoldsQueue_NoClientPool(t *testing.T) {
+// Without a Temporal client (as in the other controller tests) nothing is floored.
+func TestQueueRoutedElsewhere_NoClientPool(t *testing.T) {
 	r := &TemporalWorkerDeploymentReconciler{}
-	twd := &temporaliov1alpha1.TemporalWorkerDeployment{}
-	assert.True(t, r.versionHoldsQueue(context.Background(), logr.Discard(), twd, "b1", "q"))
+	assert.False(t, r.queueRoutedElsewhere(context.Background(), logr.Discard(), newRoutingTestTWD(), "b1", "q"))
 }
