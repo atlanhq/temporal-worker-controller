@@ -217,3 +217,47 @@ func TestQueueRoutedElsewhere_NoClientPool(t *testing.T) {
 	r := &TemporalWorkerDeploymentReconciler{}
 	assert.False(t, r.queueRoutedElsewhere(context.Background(), logr.Discard(), newRoutingTestTWD(), "b1", "q"))
 }
+
+// Another build of the same worker deployment can only be routing data catching
+// up after a promotion, so it does not hold a worker.
+func TestQueueRoutedElsewhere_SameDeploymentOtherBuildIsNotElsewhere(t *testing.T) {
+	r := &TemporalWorkerDeploymentReconciler{}
+	twd := newRoutingTestTWD()
+	dep := resolveWorkerDeployment(twd)
+	fake := &fakeRouting{routes: map[string][]queueRouting{"q": both(dep, "previous-build")}}
+	r.describeQueueRouting = fake.describe
+	assert.False(t, r.queueRoutedElsewhere(context.Background(), logr.Discard(), twd, "b1", "q"))
+}
+
+// Once one type routes to this version the pool's worker has polled the queue;
+// a type still routed to another deployment is one it does not poll, and
+// holding a worker would never move it.
+func TestQueueRoutedElsewhere_OneTypeHereSettles(t *testing.T) {
+	r := &TemporalWorkerDeploymentReconciler{}
+	twd := newRoutingTestTWD()
+	dep := resolveWorkerDeployment(twd)
+	fake := &fakeRouting{routes: map[string][]queueRouting{"q": {{"other/dep", "b0"}, {dep, "b1"}}}}
+	r.describeQueueRouting = fake.describe
+	ctx, l := context.Background(), logr.Discard()
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.Equal(t, 1, fake.calls, "settled for this version")
+}
+
+// A failed describe is retried on the short interval, not on every reconcile.
+func TestQueueRoutedElsewhere_FailureIsRetriedOnTheShortInterval(t *testing.T) {
+	r := &TemporalWorkerDeploymentReconciler{}
+	twd := newRoutingTestTWD()
+	fake := &fakeRouting{err: errors.New("unavailable")}
+	r.describeQueueRouting = fake.describe
+	ctx, l := context.Background(), logr.Discard()
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.Equal(t, 1, fake.calls)
+	k := queueRoutingKey{twd: twd.UID, deployment: resolveWorkerDeployment(twd), buildID: "b1", queue: "q"}
+	r.queueRouting.get(k).checkedAt = time.Now().Add(-2 * queueRoutingRecheckInterval)
+	fake.err = nil
+	fake.routes = map[string][]queueRouting{"q": both("other/dep", "b0")}
+	assert.True(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "q"))
+	assert.Equal(t, 2, fake.calls)
+}
