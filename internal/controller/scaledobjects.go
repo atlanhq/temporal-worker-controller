@@ -56,10 +56,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
+	sdkclient "go.temporal.io/sdk/client"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -398,6 +401,12 @@ type versionRef struct {
 	// SO watches <taskQueue><variant.TaskQueueSuffix> under the SAME
 	// {workerDeploymentName, buildID}. Nil for the base.
 	Variant *temporaliov1alpha1.WorkerVariant
+	// QueueNotOnVersion marks a Current or Ramping version that the server does
+	// not yet list this ScaledObject's task queue on. Matching routes a queue
+	// only to a version that holds it, so until a worker of this pool polls,
+	// the queue's work goes to whichever other version last held it and this
+	// ScaledObject's own backlog reads zero.
+	QueueNotOnVersion bool
 }
 
 // variantName is the spec.variants name this ref stands for, "" for the base.
@@ -518,7 +527,16 @@ func variantVersionsForScaling(
 // runs at 0 whatever the configured min, as the planner does for versions
 // KEDA doesn't manage; work pinned to it still scales it up through the
 // scaler's per-build backlog (and running-workflow count, when enabled).
-// Once a version becomes Current the floor is released and the user's
+//
+// A Current version keeps the floor while the server does not list its
+// ScaledObject's task queue on it (QueueNotOnVersion). The server promotes a
+// version once any of its workers has polled, so a version can become Current
+// before this pool's workers poll: another pool on the same worker deployment
+// name, or this version's variant, registered it first. Until a worker of this
+// pool polls, matching keeps routing the queue to the last version that held
+// it, which may belong to another worker deployment with no workers left, and
+// this ScaledObject reads zero, so nothing would ever start that worker.
+// Once the queue is on the version the floor is released and the user's
 // configured min applies.
 func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDeployment) (int64, bool) {
 	var base int32
@@ -543,7 +561,8 @@ func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDepl
 	// Warm-start invariant for new versions.
 	if v.Status == temporaliov1alpha1.VersionStatusRamping ||
 		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusInactive) ||
-		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) {
+		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) ||
+		(v.QueueNotOnVersion && v.Status == temporaliov1alpha1.VersionStatusCurrent) {
 		if !baseSet || base < 1 {
 			return 1, true
 		}
@@ -628,6 +647,9 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 			if err := r.Get(ctx, types.NamespacedName{Namespace: v.Deployment.Namespace, Name: v.Deployment.Name}, &dep); err == nil {
 				v.RecordedWDN = k8s.WorkerDeploymentNameFromDeployment(&dep)
 			}
+		}
+		if v.Status == temporaliov1alpha1.VersionStatusCurrent {
+			v.QueueNotOnVersion = !r.versionHoldsQueue(ctx, l, twd, v.BuildID, scaledObjectTaskQueue(twd, v))
 		}
 		so := buildScaledObject(twd, v, temporalEndpoint)
 		so.SetName(names[i])
@@ -804,6 +826,7 @@ func (r *TemporalWorkerDeploymentReconciler) disablePerVersionScaling(
 	l logr.Logger,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
+	r.versionQueues.forget(twd.UID)
 	existing, err := r.listOwnedScaledObjects(ctx, twd)
 	if err != nil {
 		return fmt.Errorf("list scaled objects (disable path): %w", err)
@@ -989,12 +1012,7 @@ func buildScaledObject(
 	if v.RecordedWDN != "" && v.RecordedWDN != resolvedWDN {
 		triggerWDN = v.RecordedWDN
 	}
-	taskQueue := resolveTaskQueue(twd)
-	if v.Variant != nil {
-		// The variant polls (and its SO watches) the suffixed queue; the
-		// version identity {workerDeploymentName, buildID} stays the base's.
-		taskQueue += v.Variant.TaskQueueSuffix
-	}
+	taskQueue := scaledObjectTaskQueue(twd, v)
 	triggerMetadata := map[string]interface{}{
 		"endpoint":                temporalEndpoint,
 		"namespace":               twd.Spec.WorkerOptions.TemporalNamespace,
@@ -1270,6 +1288,142 @@ func resolveTaskQueue(twd *temporaliov1alpha1.TemporalWorkerDeployment) string {
 // way the deployment template already honors them.
 func resolveWorkerDeployment(twd *temporaliov1alpha1.TemporalWorkerDeployment) string {
 	return k8s.ComputeWorkerDeploymentName(twd)
+}
+
+// scaledObjectTaskQueue is the task queue v's ScaledObject watches and v's pods
+// poll. A variant polls the suffixed queue; its version identity
+// {workerDeploymentName, buildID} stays the base's.
+func scaledObjectTaskQueue(twd *temporaliov1alpha1.TemporalWorkerDeployment, v versionRef) string {
+	taskQueue := resolveTaskQueue(twd)
+	if v.Variant != nil {
+		taskQueue += v.Variant.TaskQueueSuffix
+	}
+	return taskQueue
+}
+
+// --- Task queues held by a version -------------------------------------------
+
+// queueRecheckInterval spaces out describes of a version that does not yet
+// hold a queue. A queue, once on a version, stays there, so a hit is kept
+// without rechecking.
+const queueRecheckInterval = 15 * time.Second
+
+type versionQueuesKey struct {
+	twd        types.UID
+	deployment string
+	buildID    string
+}
+
+type versionQueuesEntry struct {
+	queues    map[string]bool
+	checkedAt time.Time
+}
+
+// versionQueueCache remembers, per TWD, the task queues the server lists on
+// its Current version, so a reconcile describes a version only until all of
+// the TWD's queues are on it.
+type versionQueueCache struct {
+	mu      sync.Mutex
+	entries map[versionQueuesKey]*versionQueuesEntry
+}
+
+func (c *versionQueueCache) get(k versionQueuesKey) *versionQueuesEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.entries[k]
+}
+
+// put stores e for k and drops this TWD's entries for other versions, so the
+// cache holds at most one version per TWD.
+func (c *versionQueueCache) put(k versionQueuesKey, e *versionQueuesEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = map[versionQueuesKey]*versionQueuesEntry{}
+	}
+	for other := range c.entries {
+		if other.twd == k.twd && other != k {
+			delete(c.entries, other)
+		}
+	}
+	c.entries[k] = e
+}
+
+// forget drops every entry of a TWD.
+func (c *versionQueueCache) forget(twd types.UID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.entries {
+		if k.twd == twd {
+			delete(c.entries, k)
+		}
+	}
+}
+
+// versionHoldsQueue reports whether the server lists queue on the version
+// buildID of twd's worker deployment. It answers true when it cannot tell
+// (no queue, or the describe failed with nothing cached), so a failed lookup
+// never holds a worker up; the next reconcile asks again.
+func (r *TemporalWorkerDeploymentReconciler) versionHoldsQueue(
+	ctx context.Context,
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID, queue string,
+) bool {
+	if queue == "" || buildID == "" {
+		return true
+	}
+	k := versionQueuesKey{twd: twd.UID, deployment: resolveWorkerDeployment(twd), buildID: buildID}
+	cached := r.versionQueues.get(k)
+	if cached != nil && (cached.queues[queue] || time.Since(cached.checkedAt) < queueRecheckInterval) {
+		return cached.queues[queue]
+	}
+	describe := r.describeVersionQueues
+	if describe == nil {
+		describe = r.describeVersionQueuesFromTemporal
+	}
+	queues, err := describe(ctx, twd, k.deployment, buildID)
+	if err != nil {
+		l.Info("could not read the task queues on the current version; not holding a worker for them",
+			"buildID", buildID, "error", err.Error())
+		if cached != nil {
+			return cached.queues[queue]
+		}
+		return true
+	}
+	r.versionQueues.put(k, &versionQueuesEntry{queues: queues, checkedAt: time.Now()})
+	if !queues[queue] {
+		l.Info("current version does not hold this pool's task queue yet; keeping one worker so it polls and registers it",
+			"buildID", buildID, "taskQueue", queue)
+	}
+	return queues[queue]
+}
+
+// describeVersionQueuesFromTemporal returns the task queues, of every type,
+// the server lists on a worker deployment version. Every type counts because
+// a pool that only runs activities registers only its activity queue.
+func (r *TemporalWorkerDeploymentReconciler) describeVersionQueuesFromTemporal(
+	ctx context.Context,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	deployment, buildID string,
+) (map[string]bool, error) {
+	if r.TemporalClientPool == nil {
+		return nil, errors.New("no Temporal client pool")
+	}
+	c, err := r.temporalClientFor(ctx, twd)
+	if err != nil {
+		return nil, err
+	}
+	desc, err := c.WorkerDeploymentClient().GetHandle(deployment).DescribeVersion(ctx,
+		sdkclient.WorkerDeploymentDescribeVersionOptions{BuildID: buildID})
+	if err != nil {
+		return nil, err
+	}
+	queues := make(map[string]bool, len(desc.Info.TaskQueuesInfos))
+	for _, tq := range desc.Info.TaskQueuesInfos {
+		queues[tq.Name] = true
+	}
+	return queues, nil
 }
 
 // --- Helpers ------------------------------------------------------------------
