@@ -1304,10 +1304,17 @@ func scaledObjectTaskQueue(twd *temporaliov1alpha1.TemporalWorkerDeployment, v v
 
 // --- Where a task queue routes ---------------------------------------------
 
-// queueRoutingRecheckInterval spaces out describes of a queue that is not yet
-// routed to the version that should serve it. Once it is, the answer holds for
-// that version and is kept without rechecking.
-const queueRoutingRecheckInterval = 30 * time.Second
+// queueRoutingRecheckInterval spaces out describes of a queue routed to
+// another version, where a worker is being held and the floor should lift soon
+// after the queue moves. queueRoutingIdleRecheckInterval spaces out describes
+// of a queue no version holds: nothing is held for it, and it routes elsewhere
+// only if another worker deployment starts polling it. Once a queue routes to
+// the version that should serve it, the answer holds for that version and is
+// kept without rechecking.
+const (
+	queueRoutingRecheckInterval     = 30 * time.Second
+	queueRoutingIdleRecheckInterval = 5 * time.Minute
+)
 
 // queueRouting is the version matching sends a task queue's new work to, for
 // one task queue type. Empty means no version holds the queue, so its work is
@@ -1392,7 +1399,11 @@ func (r *TemporalWorkerDeploymentReconciler) queueRoutedElsewhere(
 	cached := r.queueRouting.get(k)
 	if cached != nil {
 		settled := !cached.elsewhere && cached.checkedAt.IsZero()
-		if settled || time.Since(cached.checkedAt) < queueRoutingRecheckInterval {
+		interval := queueRoutingIdleRecheckInterval
+		if cached.elsewhere {
+			interval = queueRoutingRecheckInterval
+		}
+		if settled || time.Since(cached.checkedAt) < interval {
 			return cached.elsewhere
 		}
 	}

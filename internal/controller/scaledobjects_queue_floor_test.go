@@ -180,6 +180,13 @@ func TestQueueRoutedElsewhere_CachesSettledAndRechecksOthers(t *testing.T) {
 	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "u"))
 	ku := queueRoutingKey{twd: twd.UID, deployment: dep, buildID: "b1", queue: "u"}
 	assert.False(t, r.queueRouting.get(ku).checkedAt.IsZero())
+	calls := fake.calls
+	r.queueRouting.get(ku).checkedAt = time.Now().Add(-2 * queueRoutingRecheckInterval)
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "u"))
+	assert.Equal(t, calls, fake.calls, "unversioned routing is rechecked on the longer interval")
+	r.queueRouting.get(ku).checkedAt = time.Now().Add(-2 * queueRoutingIdleRecheckInterval)
+	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b1", "u"))
+	assert.Equal(t, calls+1, fake.calls)
 
 	// A new Current drops the old version's entries.
 	assert.False(t, r.queueRoutedElsewhere(ctx, l, twd, "b2", "u"))
