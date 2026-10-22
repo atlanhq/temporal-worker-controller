@@ -85,12 +85,11 @@ func TestResolveMinReplicas_CurrentWhoseQueueRoutesElsewhere(t *testing.T) {
 	}
 }
 
-// The incident: after a workerDeploymentName change the Current version was
-// promoted before its base worker polled, and matching still routes the base
-// queue to the old worker deployment's version. The base keeps one worker so
-// it polls and takes the queue over; once routing reaches the Current version
-// the floor lifts. Variants whose queues route to the Current version, or to
-// no version at all, scale from zero as before.
+// A Current version promoted before its base worker polled, while matching
+// still routes the base queue to another worker deployment's version, keeps one
+// base worker so it polls and takes the queue over; once routing reaches the
+// Current version the floor lifts. Variants whose queues route to the Current
+// version, or to no version at all, scale from zero as before.
 func TestReconcileScaledObjects_BaseQueueRoutedToOldDeploymentKeepsOneWorker(t *testing.T) {
 	r, twd := soReconcileFixture(t)
 	twd.Spec.WorkerScaling.MinReplicaCount = int32Ptr(0)

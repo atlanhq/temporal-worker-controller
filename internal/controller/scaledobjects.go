@@ -1394,7 +1394,8 @@ func (c *queueRoutingCache) forget(twd types.UID) {
 //     routing config, so that answer can only be routing data catching up;
 //   - any type already routing to this version: this pool's worker has polled
 //     the queue, and a type still routed elsewhere is one it does not poll,
-//     so holding a worker for it would never move it.
+//     so holding a worker for it would never move it. A pool that polls both
+//     types but registers only one is not held up for the other.
 //
 // It answers false when it cannot tell (no queue, or the describe failed with
 // nothing known), so a failed lookup never holds a worker up on its own.
@@ -1427,8 +1428,10 @@ func (r *TemporalWorkerDeploymentReconciler) queueRoutedElsewhere(
 	}
 	routes, err := describe(ctx, twd, queue)
 	if err != nil {
-		l.Info("could not read where the task queue routes; not holding a worker for it",
-			"taskQueue", queue, "error", err.Error())
+		if cached == nil || !cached.failed {
+			l.Info("could not read where the task queue routes; keeping the last answer and retrying",
+				"taskQueue", queue, "error", err.Error())
+		}
 		// Keep the last answer and retry on the short interval.
 		entry := &queueRoutingEntry{failed: true, checkedAt: time.Now()}
 		if cached != nil {
@@ -1448,7 +1451,7 @@ func (r *TemporalWorkerDeploymentReconciler) queueRoutedElsewhere(
 	}
 	entry := &queueRoutingEntry{elsewhere: otherDeployment && !here, settled: here, checkedAt: time.Now()}
 	if entry.elsewhere && (cached == nil || !cached.elsewhere) {
-		l.Info("task queue routes to another worker deployment's version; keeping one worker of the current version so it polls and takes the queue over",
+		l.Info("task queue routes to another worker deployment; holding one worker so it takes the queue over",
 			"taskQueue", queue, "buildID", buildID)
 	}
 	r.queueRouting.put(k, entry)
