@@ -1440,15 +1440,7 @@ func (r *TemporalWorkerDeploymentReconciler) queueRoutedElsewhere(
 		r.queueRouting.put(k, entry)
 		return entry.elsewhere
 	}
-	here, otherDeployment := false, false
-	for _, rt := range routes {
-		switch {
-		case rt.deployment == k.deployment && rt.buildID == buildID:
-			here = true
-		case rt.deployment != "" && rt.deployment != k.deployment:
-			otherDeployment = true
-		}
-	}
+	here, otherDeployment := classifyRoutes(routes, k.deployment, buildID)
 	entry := &queueRoutingEntry{elsewhere: otherDeployment && !here, settled: here, checkedAt: time.Now()}
 	if entry.elsewhere && (cached == nil || !cached.elsewhere) {
 		l.Info("task queue routes to another worker deployment; holding one worker so it takes the queue over",
@@ -1456,6 +1448,20 @@ func (r *TemporalWorkerDeploymentReconciler) queueRoutedElsewhere(
 	}
 	r.queueRouting.put(k, entry)
 	return entry.elsewhere
+}
+
+// classifyRoutes reports whether any route goes to buildID of deployment, and
+// whether any goes to a version of another worker deployment.
+func classifyRoutes(routes []queueRouting, deployment, buildID string) (here, otherDeployment bool) {
+	for _, rt := range routes {
+		switch {
+		case rt.deployment == deployment && rt.buildID == buildID:
+			here = true
+		case rt.deployment != "" && rt.deployment != deployment:
+			otherDeployment = true
+		}
+	}
+	return here, otherDeployment
 }
 
 // describeQueueRoutingFromTemporal returns the version matching routes queue's
