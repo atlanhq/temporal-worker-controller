@@ -530,8 +530,9 @@ func variantVersionsForScaling(
 // scaler's per-build backlog (and running-workflow count, when enabled).
 //
 // A Current version keeps the floor while matching routes its ScaledObject's
-// task queue to a different version (QueueRoutedElsewhere). The server promotes
-// a version once any of its workers has polled, so a version can become
+// task queue to a different version (QueueRoutedElsewhere). Without a gate the
+// planner promotes a version once any of its workers has polled, and the
+// server accepts that while the missing queue is idle, so a version can become
 // Current before this pool's workers poll: another pool on the same worker
 // deployment name, or this version's variant, registered it first. Matching
 // then keeps routing the queue to the newest Current that holds it, which can
