@@ -127,6 +127,13 @@ type TemporalWorkerDeploymentReconciler struct {
 	// deleteBackoff spaces out DeleteVersion retries per (worker deployment, build ID).
 	deleteBackoff     *flowcontrol.Backoff
 	deleteBackoffOnce sync.Once
+
+	// queueRouting caches where each TWD's Current version's task queues route
+	// (see queueRoutedElsewhere).
+	queueRouting queueRoutingCache
+	// describeQueueRouting replaces the Temporal describe behind
+	// queueRoutedElsewhere when set.
+	describeQueueRouting func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, queue string) ([]queueRouting, error)
 }
 
 // +kubebuilder:rbac:groups=temporal.io,resources=temporalworkerdeployments,verbs=get;list;watch;create;update;patch;delete
@@ -508,6 +515,7 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 	l logr.Logger,
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
+	r.queueRouting.forget(workerDeploy.UID)
 	sos, err := r.listOwnedScaledObjects(ctx, workerDeploy)
 	if err != nil {
 		// A cluster with no KEDA installed has no ScaledObject kind registered, so
