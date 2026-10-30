@@ -664,94 +664,72 @@ func TestRegisterTargetVersion_PromotionHeldIsReportedAgain(t *testing.T) {
 	assert.True(t, hasEvent(drainEvents(rec), ReasonPromotionHeld))
 }
 
-// withProvingSibling puts twd on a worker deployment with a sibling TWD on "q-heavy" whose base worker
-// of b2 has registered its queue; the worker of the build is seen only there.
-func withProvingSibling(t *testing.T, r *TemporalWorkerDeploymentReconciler, twd *temporaliov1alpha1.TemporalWorkerDeployment, f *fakeTemporalVersions) {
+// stuckCanaryFixture is twd (base "q", variant "q-od") sharing its worker deployment with a cheaper
+// canary TWD "light" (base "q-light", variant "q-light-od") whose base worker never registers.
+func stuckCanaryFixture(t *testing.T) (*TemporalWorkerDeploymentReconciler, *temporaliov1alpha1.TemporalWorkerDeployment, *fakeTemporalVersions) {
 	t.Helper()
-	sibling := &temporaliov1alpha1.TemporalWorkerDeployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "heavy", Namespace: "ns", UID: types.UID("sibling-uid")},
+	light := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "light", Namespace: "ns", UID: types.UID("light-uid")},
 		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
-			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-heavy"},
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-light"},
+			Variants:      []temporaliov1alpha1.WorkerVariant{{Name: "od", TaskQueueSuffix: "-od"}},
 		},
 	}
-	shareWith(t, r, twd, sibling)
-	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-heavy", act})
-	f.versions["b2"] = []versionQueue{{"q-heavy", act}}
-	f.workerQueues = map[string]bool{"q-heavy": true}
+	withCPURequest(light, "500m")
+	r, _, twd, f := registrationFixture(t)
+	withCPURequest(twd, "6")
+	shareWith(t, r, twd, light)
+	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-light", act}, versionQueue{"q-light-od", act})
+	f.versions["b2"] = []versionQueue{{"q-light-od", act}}
+	return r, twd, f
 }
 
-// A canary whose worker cannot run for its own reasons does not hold the release for good: once a
-// sibling's base worker of the build has polled and the grace has passed, the controller registers
-// the canary pool's queues.
-func TestRegisterTargetVersion_StuckCanaryHandsItsBaseToTheControllerOnceProven(t *testing.T) {
-	r, _, twd, f := registrationFixture(t)
-	withProvingSibling(t, r, twd, f)
-	f.workerBuild = ""
-
-	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	require.False(t, r.registration.registers(twd.UID, "b2", ""), "the base is the canary")
-	require.True(t, r.promotionHeld(twd))
-
-	f.workerBuild = "b2" // the sibling's worker polled
+// pastGrace makes twd's next registration pass run as if the grace had passed.
+func pastGrace(r *TemporalWorkerDeploymentReconciler, twd *temporaliov1alpha1.TemporalWorkerDeployment) {
 	e := r.registration.get(twd.UID)
 	e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
 	r.registration.put(twd.UID, e)
-	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // sees the proof
-	e = r.registration.get(twd.UID)
-	e.complete, e.checkedAt = false, time.Time{}
-	r.registration.put(twd.UID, e)
-	f.polls = nil
-	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // hands the base over
-
-	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
-	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls)
-	assert.False(t, r.promotionHeld(twd))
 }
 
-// The canary hand-off keeps retrying: a failed first poll after the grace does not end it.
-func TestRegisterTargetVersion_HandOffRetriesAfterAFailedPoll(t *testing.T) {
-	r, _, twd, f := registrationFixture(t)
-	withProvingSibling(t, r, twd, f)
-	f.workerBuild = ""
+// A canary whose worker cannot run for its own reasons does not hold the release for good: after the
+// grace, once a worker of the build has polled another TWD's base queue, the canary's queue no longer
+// holds promotion. The controller never registers it, so the server still refuses promotion while
+// that queue has backlog.
+func TestRegisterTargetVersion_StuckCanaryStopsHoldingOnceAnotherBaseProvesTheBuild(t *testing.T) {
+	r, twd, f := stuckCanaryFixture(t)
+	f.workerQueues = map[string]bool{"q": true}
+
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.True(t, r.promotionHeld(twd), "within the grace the canary's queue holds")
 
-	f.workerBuild = "b2"
-	e := r.registration.get(twd.UID)
-	e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
-	r.registration.put(twd.UID, e)
-	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // sees the proof
-
-	f.noAdd, f.pollErr = true, errors.New("matching unavailable")
-	e = r.registration.get(twd.UID)
-	e.complete, e.checkedAt = false, time.Time{}
-	r.registration.put(twd.UID, e)
-	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // hand-off; its poll fails
-	require.True(t, r.registration.registers(twd.UID, "b2", ""))
-	require.True(t, r.promotionHeld(twd))
-
-	f.noAdd, f.pollErr, f.polls = false, nil, nil
-	e = r.registration.get(twd.UID)
-	e.checkedAt = time.Now().Add(-2 * registrationRetryInterval)
-	r.registration.put(twd.UID, e)
+	pastGrace(r, twd)
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls, "the hand-off retried")
 	assert.False(t, r.promotionHeld(twd))
+	assert.NotContains(t, f.polls, versionQueue{"q-light", act}, "the canary's queue is not registered")
 }
 
-// A canary proven only by its own variant pool keeps its base worker: that proves nothing about the
-// base pool, which may be the one that cannot run.
-func TestRegisterTargetVersion_CanaryProvenByItsOwnVariantIsNotHandedOff(t *testing.T) {
+// A worker polling only the canary's own queues proves nothing about its base pool, which may be the
+// one that cannot run: the canary's queue keeps holding promotion.
+func TestRegisterTargetVersion_StuckCanaryHoldsWhenOnlyItsOwnQueuesWerePolled(t *testing.T) {
+	r, twd, f := stuckCanaryFixture(t)
+	f.workerQueues = map[string]bool{"q-light-od": true}
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	pastGrace(r, twd)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd))
+}
+
+// A TWD alone on its worker deployment is its own canary: proof from its variant pool does not
+// release its base queue, which stays held until its own base worker registers it.
+func TestRegisterTargetVersion_LoneCanaryProvenByItsVariantStaysHeld(t *testing.T) {
 	r, _, twd, f := registrationFixture(t)
 	f.workerQueues = map[string]bool{"q-od": true}
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	for i := 0; i < 2; i++ {
-		e := r.registration.get(twd.UID)
-		require.True(t, e.proved, "the od worker polled")
-		e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
-		r.registration.put(twd.UID, e)
-		r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	}
+	require.True(t, r.registration.get(twd.UID).proved, "the od worker polled")
+	pastGrace(r, twd)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
 	assert.False(t, r.registration.registers(twd.UID, "b2", ""))
 	assert.NotContains(t, f.polls, versionQueue{"q", wf})
