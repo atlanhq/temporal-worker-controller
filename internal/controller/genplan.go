@@ -228,13 +228,16 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 // startAtZero creates d with no workers and owned by its ScaledObject from the start. A Deployment
 // with replicas unset is created at one, which starts a worker before KEDA reads the version's
 // minReplicaCount; the label keeps the planner from scaling it back up while no ScaledObject exists.
+// The label map is copied: the constructor shares it with spec.selector, which must not change.
 func startAtZero(d *appsv1.Deployment) {
 	zero := int32(0)
 	d.Spec.Replicas = &zero
-	if d.Labels == nil {
-		d.Labels = map[string]string{}
+	labels := make(map[string]string, len(d.Labels)+1)
+	for k, v := range d.Labels {
+		labels[k] = v
 	}
-	d.Labels[ManagedByLabel] = "true"
+	labels[ManagedByLabel] = "true"
+	d.Labels = labels
 }
 
 // Create a new deployment with owner reference

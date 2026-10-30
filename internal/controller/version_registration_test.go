@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
+	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	appsv1 "k8s.io/api/apps/v1"
@@ -320,12 +321,37 @@ func TestRegisterTargetVersion_DescribeFailureKeepsWorkers(t *testing.T) {
 	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
 }
 
+// The constructor shares one label map between the Deployment and its selector; marking the
+// Deployment KEDA-managed must leave the selector, which has to match the pod labels, as it was.
 func TestStartAtZero(t *testing.T) {
-	d := &appsv1.Deployment{}
-	startAtZero(d)
-	require.NotNil(t, d.Spec.Replicas)
-	assert.Equal(t, int32(0), *d.Spec.Replicas)
-	assert.Equal(t, "true", d.Labels[ManagedByLabel])
+	twd := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			Variants: []temporaliov1alpha1.WorkerVariant{{Name: "od", TaskQueueSuffix: "-od"}},
+		},
+	}
+	for _, variant := range []*temporaliov1alpha1.WorkerVariant{nil, &twd.Spec.Variants[0]} {
+		d := k8s.NewVariantDeploymentWithOwnerRef(&twd.TypeMeta, &twd.ObjectMeta, &twd.Spec, "ns/app", "b2",
+			temporaliov1alpha1.TemporalConnectionSpec{}, variant)
+		if variant == nil {
+			d = k8s.NewDeploymentWithOwnerRef(&twd.TypeMeta, &twd.ObjectMeta, &twd.Spec, "ns/app", "b2",
+				temporaliov1alpha1.TemporalConnectionSpec{})
+		}
+		before := map[string]string{}
+		for k, v := range d.Spec.Selector.MatchLabels {
+			before[k] = v
+		}
+
+		startAtZero(d)
+
+		require.NotNil(t, d.Spec.Replicas)
+		assert.Equal(t, int32(0), *d.Spec.Replicas)
+		assert.Equal(t, "true", d.Labels[ManagedByLabel])
+		assert.Equal(t, before, d.Spec.Selector.MatchLabels, "the selector must not change")
+		for k, v := range d.Spec.Selector.MatchLabels {
+			assert.Equal(t, v, d.Spec.Template.Labels[k], "pod labels must still match the selector")
+		}
+	}
 }
 
 func TestPollEnd(t *testing.T) {
