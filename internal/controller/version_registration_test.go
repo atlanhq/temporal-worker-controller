@@ -660,3 +660,30 @@ func TestRegisterTargetVersion_PromotionHeldIsReportedAgain(t *testing.T) {
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.True(t, hasEvent(drainEvents(rec), ReasonPromotionHeld))
 }
+
+// A canary whose worker cannot run for its own reasons does not hold the release for good: once
+// another worker of the build has polled and the grace has passed, the controller registers the
+// canary pool's queues.
+func TestRegisterTargetVersion_StuckCanaryHandsItsBaseToTheControllerOnceProven(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	f.workerBuild = ""
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.False(t, r.registration.registers(twd.UID, "b2", ""), "the base is the canary")
+	require.True(t, r.promotionHeld(twd))
+
+	f.workerBuild = "b2" // another worker of the build polled
+	e := r.registration.get(twd.UID)
+	e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // sees the proof
+	e = r.registration.get(twd.UID)
+	e.complete, e.checkedAt = false, time.Time{}
+	r.registration.put(twd.UID, e)
+	f.polls = nil
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // hands the base over
+
+	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
+	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls)
+	assert.False(t, r.promotionHeld(twd))
+}

@@ -78,6 +78,8 @@ type registration struct {
 	// a queue already registered still has a poll that could be handed a task.
 	polling        bool
 	heldReportedAt time.Time
+	// canaryBase is set while the base pool keeps its warm worker as this worker deployment's canary.
+	canaryBase bool
 	// proved is set once a worker of the build, not the controller, has been seen polling one of its
 	// queues. Promotion waits for it: a Deployment at zero replicas is Available, so without it nothing
 	// shows the build can start before it is promoted.
@@ -220,20 +222,20 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 
 	e := prev
 	if e == nil {
-		e = &registration{buildID: target.BuildID, since: time.Now(), holdPromotion: true,
-			pools: r.choosePools(ctx, l, twd, current)}
+		e = &registration{buildID: target.BuildID, since: time.Now(), holdPromotion: true}
+		e.pools, e.canaryBase = r.choosePools(ctx, l, twd, current)
 	} else if e.pools[""] && r.isCanary(ctx, twd) {
 		// The canary changed under this release (a sibling left): this base pool must now prove
 		// the build with its own worker.
 		l.Info("this TWD became its worker deployment's canary; starting its base worker")
 		delete(e.pools, "")
+		e.canaryBase = true
 	} else if e.pools[""] && !e.proved && time.Since(e.since) > registrationGrace {
 		// No worker of the build has polled within the grace: the canary may be failing for its
 		// own reasons (a secret, a node selector). This TWD's base worker proves the build instead.
 		l.Info("no worker of the build has polled; starting this TWD's base worker to prove it")
 		delete(e.pools, "")
 	}
-	own := pairsFor(current, declaredQueues(twd), e.pools)
 	registered, err := describe(ctx, twd, wdn, target.BuildID)
 	if err != nil && !isNotFound(err) {
 		l.Info("could not read the target version's task queues; retrying", "error", err.Error())
@@ -242,6 +244,15 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 		r.registration.put(twd.UID, e)
 		return
 	}
+	if e.canaryBase && e.proved && time.Since(e.since) > registrationGrace && !queueRegistered(resolveTaskQueue(twd), registered) {
+		// Another worker of the build has polled, so the build runs, but this canary's own worker
+		// has not registered within the grace (it cannot run for its own reasons). Register its
+		// queues so the release is not held for good by one pool.
+		l.Info("the build is proven but the canary's worker has not registered; registering its queues")
+		e.pools[""] = true
+		e.canaryBase = false
+	}
+	own := pairsFor(current, declaredQueues(twd), e.pools)
 	if missing := subtract(own, registered); len(missing) > 0 && !e.fellBack {
 		e.polling = true
 		r.registration.put(twd.UID, e)
@@ -339,7 +350,7 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 			polling = true
 		}
 	}
-	if len(missing) == 0 && !polling && !e.proved {
+	if !polling && !e.proved {
 		e.proved = r.workerPolled(ctx, l, twd, e.buildID, registered)
 	}
 	e.holdPromotion = len(missing) > 0 || polling || !e.proved
@@ -471,6 +482,16 @@ func unregisteredNewQueues(expected map[string]string, current, registered []ver
 	return out
 }
 
+// queueRegistered reports whether any type of queue is registered.
+func queueRegistered(queue string, registered []versionQueue) bool {
+	for _, q := range registered {
+		if q.name == queue {
+			return true
+		}
+	}
+	return false
+}
+
 // unregisteredQueues returns one entry per queue of want that has no type registered at all.
 func unregisteredQueues(want, registered []versionQueue) []versionQueue {
 	have := map[string]bool{}
@@ -497,19 +518,20 @@ func (r *TemporalWorkerDeploymentReconciler) choosePools(
 	l logr.Logger,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
 	current []versionQueue,
-) map[string]bool {
+) (pools map[string]bool, canaryBase bool) {
 	byQueue := map[string][]versionQueue{}
 	for _, q := range current {
 		byQueue[q.name] = append(byQueue[q.name], q)
 	}
 	canary := r.isCanary(ctx, twd)
-	pools := map[string]bool{}
+	pools = map[string]bool{}
 	for queue, variant := range declaredQueues(twd) {
 		held := byQueue[queue]
 		reason := ""
 		switch {
 		case variant == "" && canary:
 			reason = "this pool's worker proves the new build runs before it is promoted"
+			canaryBase = true
 		case len(held) == 0:
 			reason = "the Current version does not hold this pool's queue"
 		case !onlyWorkflowAndActivity(held):
@@ -523,7 +545,7 @@ func (r *TemporalWorkerDeploymentReconciler) choosePools(
 		}
 		pools[variant] = true
 	}
-	return pools
+	return pools, canaryBase
 }
 
 func onlyWorkflowAndActivity(qs []versionQueue) bool {
