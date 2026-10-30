@@ -491,10 +491,13 @@ func (r *TemporalWorkerDeploymentReconciler) withoutStuckSiblings(
 	if err != nil || len(siblings) == 0 {
 		return missing
 	}
+	own := declaredQueues(twd)
 	owners := map[string]*temporaliov1alpha1.TemporalWorkerDeployment{}
 	for _, s := range siblings {
 		for q := range declaredQueues(s) {
-			owners[q] = s
+			if _, mine := own[q]; !mine {
+				owners[q] = s
+			}
 		}
 	}
 	proof := basePollProof{r: r, l: l, twd: twd, buildID: buildID, registered: registered,

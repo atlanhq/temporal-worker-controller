@@ -734,6 +734,26 @@ func TestRegisterTargetVersion_OwnMissingQueueHoldsDespiteASiblingsProof(t *test
 	assert.True(t, r.promotionHeld(twd))
 }
 
+// A queue this TWD declares keeps holding even when a stuck sibling declares it too.
+func TestRegisterTargetVersion_OwnQueueSharedWithAStuckSiblingHolds(t *testing.T) {
+	r, twd, f := stuckSiblingFixture(t)
+	shared := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: types.UID("shared-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-od"},
+		},
+	}
+	shareWith(t, r, twd, shared)
+	f.versions["b2"] = []versionQueue{{"q", wf}, {"q", act}, {"q-light", act}, {"q-light-od", act}}
+	f.workerQueues = map[string]bool{"q-light": true}
+	f.noAdd = true // q-od, declared by this TWD and by the stuck sibling, never registers
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	pastGrace(r, twd)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd))
+}
+
 // A TWD alone on its worker deployment is its own canary: proof from its variant pool does not
 // release its base queue, which stays held until its own base worker registers it.
 func TestRegisterTargetVersion_LoneCanaryProvenByItsVariantStaysHeld(t *testing.T) {
