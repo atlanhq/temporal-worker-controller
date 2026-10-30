@@ -131,6 +131,7 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 	plannerConfig := &planner.Config{
 		RolloutStrategy:    rolloutStrategy,
 		ExpectedGateQueues: planner.ExpectedGateQueues(&w.Spec),
+		HoldPromotion:      r.registration.holdPromotion(w.UID, targetBuildID),
 	}
 
 	// Fetch all WorkerResourceTemplates that reference this TWD so that the planner
@@ -193,6 +194,9 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 		if err != nil {
 			return nil, err
 		}
+		if r.registration.registers(w.UID, targetBuildID, "") {
+			startAtZero(d)
+		}
 		plan.CreateDeployment = d
 	}
 
@@ -211,11 +215,26 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 			if err != nil {
 				return nil, err
 			}
+			if r.registration.registers(w.UID, targetBuildID, name) {
+				startAtZero(d)
+			}
 			plan.CreateVariantDeployments = append(plan.CreateVariantDeployments, d)
 		}
 	}
 
 	return plan, nil
+}
+
+// startAtZero creates d with no workers and owned by its ScaledObject from the start. A Deployment
+// with replicas unset is created at one, which starts a worker before KEDA reads the version's
+// minReplicaCount; the label keeps the planner from scaling it back up while no ScaledObject exists.
+func startAtZero(d *appsv1.Deployment) {
+	zero := int32(0)
+	d.Spec.Replicas = &zero
+	if d.Labels == nil {
+		d.Labels = map[string]string{}
+	}
+	d.Labels[ManagedByLabel] = "true"
 }
 
 // Create a new deployment with owner reference
