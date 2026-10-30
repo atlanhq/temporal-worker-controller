@@ -22,6 +22,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -142,23 +143,31 @@ func TestResolveMinReplicas_ControllerRegisteredTargetHasNoFloor(t *testing.T) {
 	}
 }
 
-// The controller polls each queue/type the Current version holds, once, with the target build, and
-// covers both pools; promotion is not held once every queue registered.
-func TestRegisterTargetVersion_RegistersEveryCurrentQueue(t *testing.T) {
+// The controller polls each queue/type the Current version holds, once, with the target build, for
+// every pool except the canary's base pool, whose own worker must register before promotion.
+func TestRegisterTargetVersion_RegistersAllButTheCanaryPool(t *testing.T) {
 	r, rec, twd, f := registrationFixture(t)
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
-	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}, {"q-od", act}}, f.polls)
-	assert.ElementsMatch(t, f.versions["b1"], f.versions["b2"])
-	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
+	assert.Equal(t, []versionQueue{{"q-od", act}}, f.polls)
+	assert.False(t, r.registration.registers(twd.UID, "b2", ""), "a single TWD is its own canary")
 	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
-	assert.False(t, r.registration.registers(twd.UID, "b1", ""), "only the target build is covered")
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
-	assert.True(t, hasEvent(drainEvents(rec), ReasonVersionRegistered))
+	assert.False(t, r.registration.registers(twd.UID, "b1", "od"), "only the target build is covered")
+	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the canary worker")
+	events := drainEvents(rec)
+	assert.True(t, hasEvent(events, ReasonVersionRegistered))
+	assert.True(t, hasEvent(events, ReasonPromotionHeld))
 
-	// Registered: the next reconcile makes no Temporal calls.
+	// The canary worker polled: its queues registered and the hold lifts, without another poll.
 	f.polls = nil
+	f.versions["b2"] = append(f.versions["b2"], versionQueue{"q", wf}, versionQueue{"q", act})
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.Empty(t, f.polls)
+	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, hasEvent(drainEvents(rec), ReasonPromotionHeld), "the hold is reported once")
+
+	// Registered and not held: the next reconcile makes no Temporal calls.
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.Empty(t, f.polls)
 }
@@ -176,19 +185,25 @@ func TestRegisterTargetVersion_PollsOnlyMissingQueues(t *testing.T) {
 
 // A pool whose Current Deployment has workers keeps its warm worker: the new worker will have work.
 func TestRegisterTargetVersion_BusyPoolKeepsItsWorker(t *testing.T) {
+	cheaper := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "aaa-light", Namespace: "ns", UID: types.UID("light-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-light"},
+		},
+	}
 	r, _, twd, f := registrationFixture(t)
+	shareWith(t, r, twd, cheaper) // the sibling is the canary, so this TWD's base would be registered
 	var busy appsv1.Deployment
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "app-b1"}, &busy))
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "app-od-b1"}, &busy))
 	busy.Spec.Replicas = int32Ptr(2)
 	require.NoError(t, r.Update(context.Background(), &busy))
-	f.noAdd = true // nothing but the busy pool's worker would register its queue
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
-	assert.Equal(t, []versionQueue{{"q-od", act}}, f.polls)
-	assert.False(t, r.registration.registers(twd.UID, "b2", ""))
-	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the base worker to register its queue")
+	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls)
+	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
+	assert.False(t, r.registration.registers(twd.UID, "b2", "od"), "the busy -od pool keeps its worker")
+	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the -od worker to register its queue")
 }
 
 // A pool whose queue the Current version doesn't hold (a new pool) keeps its warm worker, and the
@@ -196,12 +211,57 @@ func TestRegisterTargetVersion_BusyPoolKeepsItsWorker(t *testing.T) {
 func TestRegisterTargetVersion_NewPoolKeepsItsWorker(t *testing.T) {
 	r, _, twd, f := registrationFixture(t)
 	f.versions["b1"] = []versionQueue{{"q", wf}, {"q", act}}
+	f.versions["b2"] = []versionQueue{{"q", wf}, {"q", act}} // the canary worker registered
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
-	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
+	assert.Empty(t, f.polls)
 	assert.False(t, r.registration.registers(twd.UID, "b2", "od"))
 	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+}
+
+// shareWith puts sibling on twd's worker deployment, moving to twd's target build "b2".
+func shareWith(t *testing.T, r *TemporalWorkerDeploymentReconciler, twd, sibling *temporaliov1alpha1.TemporalWorkerDeployment) {
+	t.Helper()
+	shared := "ns/shared"
+	sibling.Spec.WorkerOptions.TemporalNamespace = "default"
+	sibling.Spec.WorkerOptions.WorkerDeploymentName = shared
+	sibling.Spec.WorkerOptions.UnsafeCustomBuildID = "b2"
+	require.NoError(t, r.Create(context.Background(), sibling))
+	status := twd.Status
+	twd.Spec.WorkerOptions.WorkerDeploymentName = shared
+	twd.Spec.WorkerOptions.UnsafeCustomBuildID = "b2"
+	require.NoError(t, r.Update(context.Background(), twd))
+	twd.Status = status
+}
+
+func withCPURequest(twd *temporaliov1alpha1.TemporalWorkerDeployment, cpu string) {
+	twd.Spec.Template.Spec.Containers = []corev1.Container{{Name: "worker", Resources: corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)},
+	}}}
+}
+
+// The canary is the TWD on the worker deployment whose base worker requests the least CPU: its base
+// keeps a warm worker and every other TWD's pools are registered by the controller.
+func TestRegisterTargetVersion_CanaryIsTheCheapestBase(t *testing.T) {
+	light := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "zzz-light", Namespace: "ns", UID: types.UID("light-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-light"},
+		},
+	}
+	withCPURequest(light, "500m")
+	r, _, twd, f := registrationFixture(t)
+	withCPURequest(twd, "6")
+	shareWith(t, r, twd, light)
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+
+	assert.True(t, r.registration.registers(twd.UID, "b2", ""), "the heavier TWD is not the canary")
+	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
+	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}, {"q-od", act}}, f.polls)
+	assert.True(t, r.isCanary(context.Background(), light))
+	assert.False(t, r.isCanary(context.Background(), twd))
 }
 
 // A sibling TWD on the same worker deployment moving to the same build holds promotion until its own
@@ -213,22 +273,13 @@ func TestRegisterTargetVersion_HoldsForSiblingQueues(t *testing.T) {
 			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-heavy"},
 		},
 	}
-	sibling.Spec.WorkerOptions.TemporalNamespace = "default"
 	// The sibling's spec has moved to b2 in the same release, but its status still reads b1: its own
 	// reconcile has not run yet. Its queues must count from the spec, or this TWD promotes without them.
-	sibling.Spec.WorkerOptions.UnsafeCustomBuildID = "b2"
 	sibling.Status.TargetVersion.BuildID = "b1"
-	r, _, twd, f := registrationFixture(t, sibling)
-	shared := "ns/shared"
-	twd.Spec.WorkerOptions.WorkerDeploymentName = shared
-	require.NoError(t, r.Update(context.Background(), twd))
-	twd.Status.TargetVersion.BuildID = "b2"
-	twd.Status.TargetVersion.Status = temporaliov1alpha1.VersionStatusNotRegistered
-	twd.Status.CurrentVersion.BuildID = "b1"
-	sibling.Spec.WorkerOptions.WorkerDeploymentName = shared
-	require.NoError(t, r.Update(context.Background(), sibling))
-	require.NoError(t, r.Status().Update(context.Background(), sibling))
+	r, _, twd, f := registrationFixture(t)
+	shareWith(t, r, twd, sibling)
 	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-heavy", act})
+	f.versions["b2"] = []versionQueue{{"q", wf}, {"q", act}} // this TWD is the canary; its worker registered
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.NotContains(t, f.polls, versionQueue{"q-heavy", act}, "a TWD polls only its own queues")
@@ -239,7 +290,30 @@ func TestRegisterTargetVersion_HoldsForSiblingQueues(t *testing.T) {
 	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
 }
 
-// A task handed to a registration poll is reported; the pool stays covered.
+// A sibling whose registration polls are still open holds promotion even once every queue is listed:
+// a registered queue's poll could still be handed a task.
+func TestRegisterTargetVersion_HoldsWhileASiblingPolls(t *testing.T) {
+	sibling := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "heavy", Namespace: "ns", UID: types.UID("sibling-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-heavy"},
+		},
+	}
+	r, _, twd, f := registrationFixture(t)
+	shareWith(t, r, twd, sibling)
+	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-heavy", act})
+	f.versions["b2"] = append([]versionQueue(nil), f.versions["b1"]...)
+	r.registration.put(sibling.UID, &registration{buildID: "b2", polling: true})
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+
+	r.registration.put(sibling.UID, &registration{buildID: "b2", complete: true})
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+}
+
+// A task handed to a registration poll is reported.
 func TestRegisterTargetVersion_TaskReceivedIsReported(t *testing.T) {
 	r, rec, twd, f := registrationFixture(t)
 	f.pollErr = errRegistrationTaskReceived
@@ -257,7 +331,7 @@ func TestRegisterTargetVersion_FallsBackAfterGrace(t *testing.T) {
 	f.pollErr = errors.New("matching unavailable")
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	require.True(t, r.registration.registers(twd.UID, "b2", ""), "inside the grace the pools stay at zero")
+	require.True(t, r.registration.registers(twd.UID, "b2", "od"), "inside the grace the pool stays at zero")
 	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
 
 	e := r.registration.get(twd.UID)
@@ -266,7 +340,6 @@ func TestRegisterTargetVersion_FallsBackAfterGrace(t *testing.T) {
 	r.registration.put(twd.UID, e)
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
-	assert.False(t, r.registration.registers(twd.UID, "b2", ""))
 	assert.False(t, r.registration.registers(twd.UID, "b2", "od"))
 	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
 	assert.True(t, hasEvent(drainEvents(rec), ReasonRegistrationFellBack))

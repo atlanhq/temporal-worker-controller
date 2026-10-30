@@ -34,6 +34,7 @@ const (
 	ReasonVersionRegistered          = "VersionRegistered"
 	ReasonRegistrationFellBack       = "RegistrationFellBack"
 	ReasonRegistrationTaskReceived   = "RegistrationTaskReceived"
+	ReasonPromotionHeld              = "PromotionHeld"
 
 	ReasonTeardownDrainingPinnedExecutions = "TeardownDrainingPinnedExecutions"
 	ReasonPinnedExecutionsTerminated       = "PinnedExecutionsTerminated"

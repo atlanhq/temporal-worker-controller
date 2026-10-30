@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -70,8 +71,12 @@ type registration struct {
 	holdPromotion bool
 	complete      bool
 	fellBack      bool
-	since         time.Time
-	checkedAt     time.Time
+	// polling is set while this TWD's registration polls are open. A sibling must not promote then:
+	// a queue already registered still has a poll that could be handed a task.
+	polling      bool
+	heldReported bool
+	since        time.Time
+	checkedAt    time.Time
 }
 
 // registers reports whether the controller registers the given pool of this registration's build.
@@ -148,8 +153,15 @@ func declaredQueues(twd *temporaliov1alpha1.TemporalWorkerDeployment) map[string
 // first version, or a workerDeploymentName change), the Current version doesn't hold the pool's
 // queue (a new pool), the queue has a type other than workflow or activity, or the Current version's
 // pool has workers up, where the new worker will have work and a cold start at promotion would cost
-// more than the worker. Polls end before this returns, so a promotion later in the reconcile can't
-// route a task to one of them.
+// more than the worker.
+//
+// One pool per worker deployment always keeps its warm worker: the base pool of the canary TWD (see
+// isCanary). Promotion waits for its queues, which only that worker registers, so a build is never
+// promoted before one of its workers has started and polled; a build that can't start stays
+// unpromoted and the Current version keeps serving.
+//
+// Polls end before this returns, so a promotion later in this reconcile can't route a task to one of
+// them, and siblings hold their promotion while they are open.
 func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 	ctx context.Context,
 	l logr.Logger,
@@ -200,7 +212,10 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 		return
 	}
 	if missing := subtract(own, registered); len(missing) > 0 && !e.fellBack {
+		e.polling = true
+		r.registration.put(twd.UID, e)
 		registered = r.pollUntilRegistered(ctx, l, twd, wdn, target.BuildID, missing, describe)
+		e.polling = false
 	}
 	wasComplete := prev != nil && prev.complete
 	e.complete = len(subtract(own, registered)) == 0
@@ -262,8 +277,9 @@ func (r *TemporalWorkerDeploymentReconciler) recordOutcome(
 	}
 }
 
-// updateHold sets whether promotion must wait for a queue the Current version holds and a live TWD
-// on the same worker deployment declares.
+// updateHold sets whether promotion must wait: for a queue the Current version holds and a live TWD
+// on the same worker deployment declares, or for a sibling whose registration polls are still open.
+// The first time it holds once this TWD's own part is done, it says what it waits for.
 func (r *TemporalWorkerDeploymentReconciler) updateHold(
 	ctx context.Context,
 	l logr.Logger,
@@ -271,13 +287,26 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 	e *registration,
 	current, registered []versionQueue,
 ) {
-	expected, err := r.expectedQueues(ctx, twd, e.buildID)
+	expected, siblings, err := r.expectedQueues(ctx, twd, e.buildID)
 	if err != nil {
 		l.Info("could not list the TWDs on this worker deployment; holding promotion", "error", err.Error())
 		e.holdPromotion = true
 		return
 	}
-	e.holdPromotion = len(subtract(pairsFor(current, expected, nil), registered)) > 0
+	missing := subtract(pairsFor(current, expected, nil), registered)
+	polling := false
+	for _, uid := range siblings {
+		if g := r.registration.get(uid); g != nil && g.buildID == e.buildID && g.polling {
+			polling = true
+		}
+	}
+	e.holdPromotion = len(missing) > 0 || polling
+	if e.holdPromotion && (e.complete || e.fellBack) && !e.heldReported && len(missing) > 0 {
+		e.heldReported = true
+		r.Recorder.Eventf(twd, corev1.EventTypeNormal, ReasonPromotionHeld,
+			"Holding promotion of build %q until its workers register %d task queue(s), e.g. %s",
+			e.buildID, len(missing), missing[0])
+	}
 }
 
 // choosePools picks the pools whose queues the controller registers for a new target build. The
@@ -293,11 +322,14 @@ func (r *TemporalWorkerDeploymentReconciler) choosePools(
 	for _, q := range current {
 		byQueue[q.name] = append(byQueue[q.name], q)
 	}
+	canary := r.isCanary(ctx, twd)
 	pools := map[string]bool{}
 	for queue, variant := range declaredQueues(twd) {
 		held := byQueue[queue]
 		reason := ""
 		switch {
+		case variant == "" && canary:
+			reason = "this pool's worker proves the new build runs before it is promoted"
 		case len(held) == 0:
 			reason = "the Current version does not hold this pool's queue"
 		case !onlyWorkflowAndActivity(held):
@@ -359,24 +391,85 @@ func (r *TemporalWorkerDeploymentReconciler) expectedQueues(
 	ctx context.Context,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
 	buildID string,
-) (map[string]string, error) {
+) (map[string]string, []types.UID, error) {
 	out := map[string]string{}
 	for q, v := range declaredQueues(twd) {
 		out[q] = v
 	}
-	siblings, err := r.siblingTWDs(ctx, twd)
+	siblings, err := r.sameBuildSiblings(ctx, twd, buildID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	uids := make([]types.UID, 0, len(siblings))
 	for _, s := range siblings {
-		if !s.DeletionTimestamp.IsZero() || k8s.ComputeBuildID(s) != buildID {
-			continue
-		}
+		uids = append(uids, s.UID)
 		for q, v := range declaredQueues(s) {
 			out[q] = v
 		}
 	}
+	return out, uids, nil
+}
+
+// sameBuildSiblings returns the other live TWDs on twd's worker deployment whose spec moves to buildID.
+func (r *TemporalWorkerDeploymentReconciler) sameBuildSiblings(
+	ctx context.Context,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
+) ([]*temporaliov1alpha1.TemporalWorkerDeployment, error) {
+	siblings, err := r.siblingTWDs(ctx, twd)
+	if err != nil {
+		return nil, err
+	}
+	var out []*temporaliov1alpha1.TemporalWorkerDeployment
+	for _, s := range siblings {
+		if s.DeletionTimestamp.IsZero() && k8s.ComputeBuildID(s) == buildID {
+			out = append(out, s)
+		}
+	}
 	return out, nil
+}
+
+// isCanary reports whether twd's base pool is the one pool on its worker deployment that keeps a warm
+// worker through a release: of twd and its live siblings moving to the same build, the TWD whose base
+// worker requests the least CPU, then the first by name. Every TWD computes the same answer. It
+// answers true when the siblings can't be listed, which keeps the warm worker.
+func (r *TemporalWorkerDeploymentReconciler) isCanary(
+	ctx context.Context,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+) bool {
+	siblings, err := r.sameBuildSiblings(ctx, twd, k8s.ComputeBuildID(twd))
+	if err != nil {
+		return true
+	}
+	best := twd
+	for _, s := range siblings {
+		if cheaperCanary(s, best) {
+			best = s
+		}
+	}
+	return best.UID == twd.UID
+}
+
+// cheaperCanary orders canary candidates by the CPU their base worker requests, then by name.
+func cheaperCanary(a, b *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+	ca, cb := baseCPURequest(a), baseCPURequest(b)
+	if ca != cb {
+		return ca < cb
+	}
+	return a.Name < b.Name
+}
+
+// baseCPURequest is the CPU the TWD's worker container requests, in millicores; unset sorts last.
+func baseCPURequest(twd *temporaliov1alpha1.TemporalWorkerDeployment) int64 {
+	cs := twd.Spec.Template.Spec.Containers
+	if len(cs) == 0 {
+		return math.MaxInt64
+	}
+	q, ok := cs[0].Resources.Requests[corev1.ResourceCPU]
+	if !ok {
+		return math.MaxInt64
+	}
+	return q.MilliValue()
 }
 
 // pairsFor returns the Current version's queue/type pairs whose queue is in declared and, when pools
