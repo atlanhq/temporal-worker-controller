@@ -42,14 +42,15 @@ type fakeTemporalVersions struct {
 	polls    []versionQueue
 	pollErr  error
 	noAdd    bool
-	// workerBuild, when set, is the build of a worker seen polling every queue; workerIdentity is its
-	// identity (a pod's "pid@pod" by default).
+	// workerBuild, when set, is the build of a worker seen polling every queue, or only workerQueues
+	// when that is set; workerIdentity is its identity (a pod's "pid@pod" by default).
 	workerBuild    string
+	workerQueues   map[string]bool
 	workerIdentity string
 }
 
-func (f *fakeTemporalVersions) pollers(_ context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, _ versionQueue) ([]poller, error) {
-	if f.workerBuild == "" {
+func (f *fakeTemporalVersions) pollers(_ context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, q versionQueue) ([]poller, error) {
+	if f.workerBuild == "" || (f.workerQueues != nil && !f.workerQueues[q.name]) {
 		return nil, nil
 	}
 	id := f.workerIdentity
@@ -663,18 +664,35 @@ func TestRegisterTargetVersion_PromotionHeldIsReportedAgain(t *testing.T) {
 	assert.True(t, hasEvent(drainEvents(rec), ReasonPromotionHeld))
 }
 
-// A canary whose worker cannot run for its own reasons does not hold the release for good: once
-// another worker of the build has polled and the grace has passed, the controller registers the
-// canary pool's queues.
+// withProvingSibling puts twd on a worker deployment with a sibling TWD on "q-heavy" whose base worker
+// of b2 has registered its queue; the worker of the build is seen only there.
+func withProvingSibling(t *testing.T, r *TemporalWorkerDeploymentReconciler, twd *temporaliov1alpha1.TemporalWorkerDeployment, f *fakeTemporalVersions) {
+	t.Helper()
+	sibling := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "heavy", Namespace: "ns", UID: types.UID("sibling-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-heavy"},
+		},
+	}
+	shareWith(t, r, twd, sibling)
+	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-heavy", act})
+	f.versions["b2"] = []versionQueue{{"q-heavy", act}}
+	f.workerQueues = map[string]bool{"q-heavy": true}
+}
+
+// A canary whose worker cannot run for its own reasons does not hold the release for good: once a
+// sibling's base worker of the build has polled and the grace has passed, the controller registers
+// the canary pool's queues.
 func TestRegisterTargetVersion_StuckCanaryHandsItsBaseToTheControllerOnceProven(t *testing.T) {
 	r, _, twd, f := registrationFixture(t)
+	withProvingSibling(t, r, twd, f)
 	f.workerBuild = ""
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	require.False(t, r.registration.registers(twd.UID, "b2", ""), "the base is the canary")
 	require.True(t, r.promotionHeld(twd))
 
-	f.workerBuild = "b2" // another worker of the build polled
+	f.workerBuild = "b2" // the sibling's worker polled
 	e := r.registration.get(twd.UID)
 	e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
 	r.registration.put(twd.UID, e)
@@ -693,6 +711,7 @@ func TestRegisterTargetVersion_StuckCanaryHandsItsBaseToTheControllerOnceProven(
 // The canary hand-off keeps retrying: a failed first poll after the grace does not end it.
 func TestRegisterTargetVersion_HandOffRetriesAfterAFailedPoll(t *testing.T) {
 	r, _, twd, f := registrationFixture(t)
+	withProvingSibling(t, r, twd, f)
 	f.workerBuild = ""
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
@@ -717,6 +736,27 @@ func TestRegisterTargetVersion_HandOffRetriesAfterAFailedPoll(t *testing.T) {
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls, "the hand-off retried")
 	assert.False(t, r.promotionHeld(twd))
+}
+
+// A canary proven only by its own variant pool keeps its base worker: that proves nothing about the
+// base pool, which may be the one that cannot run.
+func TestRegisterTargetVersion_CanaryProvenByItsOwnVariantIsNotHandedOff(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	f.workerQueues = map[string]bool{"q-od": true}
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	for i := 0; i < 2; i++ {
+		e := r.registration.get(twd.UID)
+		require.True(t, e.proved, "the od worker polled")
+		e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
+		r.registration.put(twd.UID, e)
+		r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	}
+
+	assert.False(t, r.registration.registers(twd.UID, "b2", ""))
+	assert.NotContains(t, f.polls, versionQueue{"q", wf})
+	assert.NotContains(t, f.polls, versionQueue{"q", act})
+	assert.True(t, r.promotionHeld(twd))
 }
 
 // A Deployment the controller started at zero blocks promotion while it has no worker available,

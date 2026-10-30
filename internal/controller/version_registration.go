@@ -90,9 +90,13 @@ type registration struct {
 	// proved is set once a worker of the build, not the controller, has been seen polling one of its
 	// queues. Promotion waits for it: a Deployment at zero replicas is Available, so without it nothing
 	// shows the build can start before it is promoted.
-	proved    bool
-	since     time.Time
-	checkedAt time.Time
+	proved bool
+	// siblingProved is set once a worker of the build in a sibling TWD's base pool has been seen polling.
+	// Only that lets a stuck canary hand its base pool to the controller: a build proven by this TWD's
+	// own variant pools alone may still be unable to run its base pool.
+	siblingProved bool
+	since         time.Time
+	checkedAt     time.Time
 }
 
 // registers reports whether the controller registers the given pool of this registration's build.
@@ -194,7 +198,8 @@ func declaredQueues(twd *temporaliov1alpha1.TemporalWorkerDeployment) map[string
 // One pool per worker deployment always keeps its warm worker: the base pool of the canary TWD (see
 // isCanary). Promotion waits for its queues, which only that worker registers, so a build is never
 // promoted before one of its workers has started and polled; a build that can't start stays
-// unpromoted and the Current version keeps serving.
+// unpromoted and the Current version keeps serving. Only a sibling's base worker proving the build
+// lets a stuck canary hand its pool to the controller (handOffStuckCanary).
 //
 // Polls end before this returns, so a promotion later in this reconcile can't route a task to one of
 // them, and siblings hold their promotion while they are open.
@@ -302,15 +307,17 @@ func (r *TemporalWorkerDeploymentReconciler) reviseBasePool(
 	}
 }
 
-// handOffStuckCanary registers the canary's base pool through the controller once another worker of
-// the build has polled, so the build runs, but the canary's own worker has not registered within the
-// grace (it cannot run for its own reasons). One pool must not hold the release for good.
+// handOffStuckCanary registers the canary's base pool through the controller once a sibling TWD's base
+// worker of the build has polled, but the canary's own worker has not registered within the grace (it
+// cannot run for its own reasons, a node selector or a secret). The sibling would otherwise promote
+// the build without the canary's queue anyway; registering it keeps that queue versioned. A canary
+// with no such sibling stays held until its own worker runs.
 func handOffStuckCanary(l logr.Logger, twd *temporaliov1alpha1.TemporalWorkerDeployment, e *registration, registered []versionQueue) {
-	if !e.canaryBase || !e.proved || time.Since(e.since) <= registrationGrace ||
+	if !e.canaryBase || !e.siblingProved || time.Since(e.since) <= registrationGrace ||
 		queueRegistered(resolveTaskQueue(twd), registered) {
 		return
 	}
-	l.Info("the build is proven but the canary's worker has not registered; registering its queues")
+	l.Info("a sibling's worker proved the build but the canary's worker has not registered; registering its queues")
 	e.pools[""] = true
 	e.canaryBase = false
 	e.handedOff = true
@@ -430,6 +437,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 	if !polling && !e.proved {
 		e.proved = r.workerPolled(ctx, l, twd, e.buildID, registered)
 	}
+	if !polling && e.canaryBase && !e.siblingProved {
+		e.siblingProved = r.siblingBasePolled(ctx, l, twd, e.buildID, registered)
+	}
 	e.holdPromotion = len(missing) > 0 || polling || !e.proved
 	if e.holdPromotion && (e.complete || e.fellBack) && (len(missing) > 0 || !e.proved) &&
 		time.Since(e.heldReportedAt) > heldReportInterval {
@@ -495,6 +505,34 @@ func (r *TemporalWorkerDeploymentReconciler) workerPolled(
 		}
 	}
 	return false
+}
+
+// siblingBasePolled reports whether a worker of the build has polled the base queue of a live sibling
+// TWD moving to the same build.
+func (r *TemporalWorkerDeploymentReconciler) siblingBasePolled(
+	ctx context.Context,
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
+	registered []versionQueue,
+) bool {
+	siblings, err := r.sameBuildSiblings(ctx, twd, buildID)
+	if err != nil {
+		return false
+	}
+	bases := map[string]bool{}
+	for _, s := range siblings {
+		if q := resolveTaskQueue(s); q != "" && q != resolveTaskQueue(twd) {
+			bases[q] = true
+		}
+	}
+	var queues []versionQueue
+	for _, q := range registered {
+		if bases[q.name] {
+			queues = append(queues, q)
+		}
+	}
+	return len(queues) > 0 && r.workerPolled(ctx, l, twd, buildID, queues)
 }
 
 // poller is one entry of a task queue's recent pollers.
