@@ -351,7 +351,10 @@ func (r *TemporalWorkerDeploymentReconciler) currentPoolBusy(
 }
 
 // expectedQueues are the task queues the target must hold before promotion: those twd declares, and
-// those declared by every other live TWD on the same worker deployment that targets the same build.
+// those declared by every other live TWD on the same worker deployment whose spec moves to the same
+// build. The spec, not the status: a release updates every TWD's spec together, and a sibling's
+// status names the new build only after its own next reconcile, by which time this TWD may have
+// promoted the version without that sibling's queues.
 func (r *TemporalWorkerDeploymentReconciler) expectedQueues(
 	ctx context.Context,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
@@ -366,7 +369,7 @@ func (r *TemporalWorkerDeploymentReconciler) expectedQueues(
 		return nil, err
 	}
 	for _, s := range siblings {
-		if !s.DeletionTimestamp.IsZero() || s.Status.TargetVersion.BuildID != buildID {
+		if !s.DeletionTimestamp.IsZero() || k8s.ComputeBuildID(s) != buildID {
 			continue
 		}
 		for q, v := range declaredQueues(s) {

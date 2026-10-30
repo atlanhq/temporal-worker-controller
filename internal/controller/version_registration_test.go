@@ -204,8 +204,8 @@ func TestRegisterTargetVersion_NewPoolKeepsItsWorker(t *testing.T) {
 	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
 }
 
-// A sibling TWD on the same worker deployment targeting the same build holds promotion until its
-// own queue registers; the server alone would promote while that queue is idle.
+// A sibling TWD on the same worker deployment moving to the same build holds promotion until its own
+// queue registers; the server alone would promote while that queue is idle.
 func TestRegisterTargetVersion_HoldsForSiblingQueues(t *testing.T) {
 	sibling := &temporaliov1alpha1.TemporalWorkerDeployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "heavy", Namespace: "ns", UID: types.UID("sibling-uid")},
@@ -214,7 +214,10 @@ func TestRegisterTargetVersion_HoldsForSiblingQueues(t *testing.T) {
 		},
 	}
 	sibling.Spec.WorkerOptions.TemporalNamespace = "default"
-	sibling.Status.TargetVersion.BuildID = "b2"
+	// The sibling's spec has moved to b2 in the same release, but its status still reads b1: its own
+	// reconcile has not run yet. Its queues must count from the spec, or this TWD promotes without them.
+	sibling.Spec.WorkerOptions.UnsafeCustomBuildID = "b2"
+	sibling.Status.TargetVersion.BuildID = "b1"
 	r, _, twd, f := registrationFixture(t, sibling)
 	shared := "ns/shared"
 	twd.Spec.WorkerOptions.WorkerDeploymentName = shared
