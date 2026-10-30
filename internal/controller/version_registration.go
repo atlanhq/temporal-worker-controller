@@ -221,6 +221,9 @@ func registrationApplies(twd *temporaliov1alpha1.TemporalWorkerDeployment) bool 
 	switch target.Status {
 	case "", temporaliov1alpha1.VersionStatusNotRegistered, temporaliov1alpha1.VersionStatusInactive:
 		return true
+	case temporaliov1alpha1.VersionStatusRamping, temporaliov1alpha1.VersionStatusCurrent,
+		temporaliov1alpha1.VersionStatusDraining, temporaliov1alpha1.VersionStatusDrained:
+		return false
 	}
 	return false
 }
