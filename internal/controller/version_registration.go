@@ -393,7 +393,7 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 		// After the grace a queue counts once any of its types registered: a type the build's
 		// workers no longer poll must not hold a release for good. Every queue still needs one.
 		missing = unregisteredQueues(pairsFor(current, expected, nil), registered)
-		missing = r.withoutStuckCanary(ctx, l, twd, e.buildID, missing, registered)
+		missing = r.withoutStuckSiblings(ctx, l, twd, e.buildID, missing, registered)
 	}
 	polling := false
 	for _, uid := range siblings {
@@ -471,13 +471,13 @@ func (r *TemporalWorkerDeploymentReconciler) workerPolled(
 	return false
 }
 
-// withoutStuckCanary drops the canary's base queue from missing once a worker of the build has polled
-// the base queue of another TWD on the worker deployment: the build runs, and the canary's own worker
-// cannot (a node selector, a secret). The controller does not register the canary's queue, so
-// promotion goes as it does without registration, and the server still refuses it while that queue
-// has backlog. A queue of the canary itself never counts as the proof, and a TWD with no sibling stays
-// held until its own worker runs.
-func (r *TemporalWorkerDeploymentReconciler) withoutStuckCanary(
+// withoutStuckSiblings drops a sibling's queues from missing once a worker of the build has polled the
+// base queue of another TWD on the worker deployment: the build runs, and that sibling's own workers
+// cannot (a node selector, a secret). It applies only after the grace, so siblings starting up
+// together still wait for each other. The controller does not register those queues, so promotion goes
+// as it does without registration, and the server still refuses it while one of them has backlog. This
+// TWD's own queues keep holding, and none of a sibling's own queues count as the proof for it.
+func (r *TemporalWorkerDeploymentReconciler) withoutStuckSiblings(
 	ctx context.Context,
 	l logr.Logger,
 	twd *temporaliov1alpha1.TemporalWorkerDeployment,
@@ -491,39 +491,64 @@ func (r *TemporalWorkerDeploymentReconciler) withoutStuckCanary(
 	if err != nil || len(siblings) == 0 {
 		return missing
 	}
-	canary := twd
+	owners := map[string]*temporaliov1alpha1.TemporalWorkerDeployment{}
 	for _, s := range siblings {
-		if cheaperCanary(s, canary) {
-			canary = s
+		for q := range declaredQueues(s) {
+			owners[q] = s
 		}
 	}
-	canaryQueues := declaredQueues(canary)
-	canaryBase := resolveTaskQueue(canary)
-	if !queueListed(canaryBase, missing) {
-		return missing
-	}
-	bases := map[string]bool{}
-	for _, t := range append(siblings, twd) {
-		if _, ok := canaryQueues[resolveTaskQueue(t)]; !ok && t.UID != canary.UID {
-			bases[resolveTaskQueue(t)] = true
-		}
-	}
-	var proof []versionQueue
-	for _, q := range registered {
-		if bases[q.name] {
-			proof = append(proof, q)
-		}
-	}
-	if len(proof) == 0 || !r.workerPolled(ctx, l, twd, buildID, proof) {
-		return missing
-	}
+	proof := basePollProof{r: r, l: l, twd: twd, buildID: buildID, registered: registered,
+		all: append([]*temporaliov1alpha1.TemporalWorkerDeployment{twd}, siblings...), polled: map[string]bool{}}
 	out := make([]versionQueue, 0, len(missing))
 	for _, q := range missing {
-		if q.name != canaryBase {
+		if s := owners[q.name]; s == nil || !proof.provenWithout(ctx, s) {
 			out = append(out, q)
 		}
 	}
 	return out
+}
+
+// basePollProof answers, for one hold check, whether a worker of the build has polled a base queue,
+// reading each base queue's pollers at most once.
+type basePollProof struct {
+	r          *TemporalWorkerDeploymentReconciler
+	l          logr.Logger
+	twd        *temporaliov1alpha1.TemporalWorkerDeployment
+	buildID    string
+	registered []versionQueue
+	all        []*temporaliov1alpha1.TemporalWorkerDeployment
+	polled     map[string]bool
+}
+
+// provenWithout reports whether a worker of the build has polled the base queue of a TWD other than
+// stuck, on a queue stuck does not declare.
+func (p *basePollProof) provenWithout(ctx context.Context, stuck *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+	excluded := declaredQueues(stuck)
+	for _, t := range p.all {
+		base := resolveTaskQueue(t)
+		if _, ok := excluded[base]; ok || base == "" || t.UID == stuck.UID {
+			continue
+		}
+		if p.basePolled(ctx, base) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *basePollProof) basePolled(ctx context.Context, base string) bool {
+	if seen, ok := p.polled[base]; ok {
+		return seen
+	}
+	var pairs []versionQueue
+	for _, q := range p.registered {
+		if q.name == base {
+			pairs = append(pairs, q)
+		}
+	}
+	seen := len(pairs) > 0 && p.r.workerPolled(ctx, p.l, p.twd, p.buildID, pairs)
+	p.polled[base] = seen
+	return seen
 }
 
 // poller is one entry of a task queue's recent pollers.
@@ -586,16 +611,6 @@ func unregisteredNewQueues(expected map[string]string, current, registered []ver
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
-}
-
-// queueListed reports whether any type of queue is in qs.
-func queueListed(queue string, qs []versionQueue) bool {
-	for _, q := range qs {
-		if q.name == queue {
-			return true
-		}
-	}
-	return false
 }
 
 // unregisteredQueues returns one entry per queue of want that has no type registered at all.

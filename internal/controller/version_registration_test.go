@@ -664,9 +664,9 @@ func TestRegisterTargetVersion_PromotionHeldIsReportedAgain(t *testing.T) {
 	assert.True(t, hasEvent(drainEvents(rec), ReasonPromotionHeld))
 }
 
-// stuckCanaryFixture is twd (base "q", variant "q-od") sharing its worker deployment with a cheaper
-// canary TWD "light" (base "q-light", variant "q-light-od") whose base worker never registers.
-func stuckCanaryFixture(t *testing.T) (*TemporalWorkerDeploymentReconciler, *temporaliov1alpha1.TemporalWorkerDeployment, *fakeTemporalVersions) {
+// stuckSiblingFixture is twd (base "q", variant "q-od") sharing its worker deployment with a cheaper
+// canary TWD "light" (base "q-light", variant "q-light-od") whose workers never register.
+func stuckSiblingFixture(t *testing.T) (*TemporalWorkerDeploymentReconciler, *temporaliov1alpha1.TemporalWorkerDeployment, *fakeTemporalVersions) {
 	t.Helper()
 	light := &temporaliov1alpha1.TemporalWorkerDeployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "light", Namespace: "ns", UID: types.UID("light-uid")},
@@ -680,7 +680,6 @@ func stuckCanaryFixture(t *testing.T) (*TemporalWorkerDeploymentReconciler, *tem
 	withCPURequest(twd, "6")
 	shareWith(t, r, twd, light)
 	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-light", act}, versionQueue{"q-light-od", act})
-	f.versions["b2"] = []versionQueue{{"q-light-od", act}}
 	return r, twd, f
 }
 
@@ -691,28 +690,43 @@ func pastGrace(r *TemporalWorkerDeploymentReconciler, twd *temporaliov1alpha1.Te
 	r.registration.put(twd.UID, e)
 }
 
-// A canary whose worker cannot run for its own reasons does not hold the release for good: after the
-// grace, once a worker of the build has polled another TWD's base queue, the canary's queue no longer
-// holds promotion. The controller never registers it, so the server still refuses promotion while
-// that queue has backlog.
-func TestRegisterTargetVersion_StuckCanaryStopsHoldingOnceAnotherBaseProvesTheBuild(t *testing.T) {
-	r, twd, f := stuckCanaryFixture(t)
+// A sibling whose workers cannot run for its own reasons does not hold the release for good: after the
+// grace, once a worker of the build has polled another TWD's base queue, the sibling's queues no longer
+// hold promotion. The controller never registers them, so the server still refuses promotion while
+// one of them has backlog.
+func TestRegisterTargetVersion_StuckSiblingStopsHoldingOnceAnotherBaseProvesTheBuild(t *testing.T) {
+	r, twd, f := stuckSiblingFixture(t)
 	f.workerQueues = map[string]bool{"q": true}
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	require.True(t, r.promotionHeld(twd), "within the grace the canary's queue holds")
+	require.True(t, r.promotionHeld(twd), "within the grace the sibling's queues hold")
 
 	pastGrace(r, twd)
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.False(t, r.promotionHeld(twd))
-	assert.NotContains(t, f.polls, versionQueue{"q-light", act}, "the canary's queue is not registered")
+	assert.NotContains(t, f.polls, versionQueue{"q-light", act}, "the sibling's queues are not registered")
+	assert.NotContains(t, f.polls, versionQueue{"q-light-od", act})
 }
 
-// A worker polling only the canary's own queues proves nothing about its base pool, which may be the
-// one that cannot run: the canary's queue keeps holding promotion.
-func TestRegisterTargetVersion_StuckCanaryHoldsWhenOnlyItsOwnQueuesWerePolled(t *testing.T) {
-	r, twd, f := stuckCanaryFixture(t)
-	f.workerQueues = map[string]bool{"q-light-od": true}
+// A worker polling only a stuck sibling's own queues proves nothing about its pools that cannot run:
+// with its base worker up and its -od pool stuck, the -od queue keeps holding promotion.
+func TestRegisterTargetVersion_StuckSiblingHoldsWhenOnlyItsOwnQueuesWerePolled(t *testing.T) {
+	r, twd, f := stuckSiblingFixture(t)
+	f.versions["b2"] = []versionQueue{{"q-light", act}}
+	f.workerQueues = map[string]bool{"q-light": true}
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	pastGrace(r, twd)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd))
+}
+
+// This TWD's own queues keep holding after the grace, whatever a sibling's worker has proved.
+func TestRegisterTargetVersion_OwnMissingQueueHoldsDespiteASiblingsProof(t *testing.T) {
+	r, twd, f := stuckSiblingFixture(t)
+	f.versions["b2"] = []versionQueue{{"q-light", act}, {"q-light-od", act}}
+	f.workerQueues = map[string]bool{"q-light": true}
+	f.noAdd = true // this TWD's registration polls never register
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	pastGrace(r, twd)
