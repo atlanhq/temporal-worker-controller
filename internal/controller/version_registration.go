@@ -104,18 +104,32 @@ func (c *registrationCache) get(twd types.UID) *registration {
 	defer c.mu.Unlock()
 	if e := c.entries[twd]; e != nil {
 		cp := *e
+		if e.pools != nil {
+			cp.pools = make(map[string]bool, len(e.pools))
+			for k, v := range e.pools {
+				cp.pools[k] = v
+			}
+		}
 		return &cp
 	}
 	return nil
 }
 
+// put stores a copy of e, so a reconcile that keeps changing e never shares it with readers.
 func (c *registrationCache) put(twd types.UID, e *registration) {
+	cp := *e
+	if e.pools != nil {
+		cp.pools = make(map[string]bool, len(e.pools))
+		for k, v := range e.pools {
+			cp.pools[k] = v
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
 		c.entries = map[types.UID]*registration{}
 	}
-	c.entries[twd] = e
+	c.entries[twd] = &cp
 }
 
 func (c *registrationCache) forget(twd types.UID) {
@@ -408,8 +422,8 @@ func (r *TemporalWorkerDeploymentReconciler) workerPolled(
 		}
 		seen, err := pollers(ctx, twd, q)
 		if err != nil {
-			l.Info("could not read the task queue's pollers; retrying", "taskQueue", q.name, "error", err.Error())
-			return false
+			l.Info("could not read the task queue's pollers", "taskQueue", q.name, "error", err.Error())
+			continue
 		}
 		for _, p := range seen {
 			if p.identity != self && p.deploymentName == wdn && p.buildID == buildID {
