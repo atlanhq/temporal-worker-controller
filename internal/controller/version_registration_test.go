@@ -566,6 +566,8 @@ func TestStartAtZero(t *testing.T) {
 		assert.Equal(t, int32(0), *d.Spec.Replicas)
 		assert.Equal(t, "true", d.Labels[ManagedByLabel])
 		assert.Equal(t, before, d.Spec.Selector.MatchLabels, "the selector must not change")
+		assert.Equal(t, "true", d.Annotations[StartedAtZeroAnnotation])
+		assert.NotContains(t, d.Spec.Template.Annotations, StartedAtZeroAnnotation, "the pod template must not change")
 		for k, v := range d.Spec.Selector.MatchLabels {
 			assert.Equal(t, v, d.Spec.Template.Labels[k], "pod labels must still match the selector")
 		}
@@ -686,4 +688,45 @@ func TestRegisterTargetVersion_StuckCanaryHandsItsBaseToTheControllerOnceProven(
 	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
 	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls)
 	assert.False(t, r.promotionHeld(twd))
+}
+
+// The canary hand-off keeps retrying: a failed first poll after the grace does not end it.
+func TestRegisterTargetVersion_HandOffRetriesAfterAFailedPoll(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	f.workerBuild = ""
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+
+	f.workerBuild = "b2"
+	e := r.registration.get(twd.UID)
+	e.since, e.complete, e.checkedAt = time.Now().Add(-2*registrationGrace), false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // sees the proof
+
+	f.noAdd, f.pollErr = true, errors.New("matching unavailable")
+	e = r.registration.get(twd.UID)
+	e.complete, e.checkedAt = false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd) // hand-off; its poll fails
+	require.True(t, r.registration.registers(twd.UID, "b2", ""))
+	require.True(t, r.promotionHeld(twd))
+
+	f.noAdd, f.pollErr, f.polls = false, nil, nil
+	e = r.registration.get(twd.UID)
+	e.checkedAt = time.Now().Add(-2 * registrationRetryInterval)
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls, "the hand-off retried")
+	assert.False(t, r.promotionHeld(twd))
+}
+
+// A Deployment the controller started at zero blocks promotion while it has no worker available,
+// which keeps a TWD that stops opting in mid-release from promoting an unproven build.
+func TestStartedAtZeroWithoutWorkers(t *testing.T) {
+	assert.False(t, startedAtZeroWithoutWorkers(nil))
+	d := &appsv1.Deployment{}
+	assert.False(t, startedAtZeroWithoutWorkers(d), "an ordinary Deployment")
+	startAtZero(d)
+	assert.True(t, startedAtZeroWithoutWorkers(d))
+	d.Status.AvailableReplicas = 1
+	assert.False(t, startedAtZeroWithoutWorkers(d), "a worker of the build runs")
 }

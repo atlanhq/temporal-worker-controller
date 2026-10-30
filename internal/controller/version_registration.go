@@ -31,6 +31,10 @@ import (
 // deployment options, and the pools start at zero.
 const RegistrationAnnotation = "twd.temporal.io/controller-registration"
 
+// StartedAtZeroAnnotation marks a version Deployment the controller created at zero replicas because
+// it registers the pool's task queues itself.
+const StartedAtZeroAnnotation = "twd.temporal.io/started-at-zero"
+
 const (
 	// heldReportInterval spaces repeats of the PromotionHeld event while a promotion stays held;
 	// Kubernetes drops events after about an hour.
@@ -80,6 +84,9 @@ type registration struct {
 	heldReportedAt time.Time
 	// canaryBase is set while the base pool keeps its warm worker as this worker deployment's canary.
 	canaryBase bool
+	// handedOff is set once the canary's base pool was handed to the controller after the grace. Its
+	// registration keeps retrying, and its failure never hands the pools back to their floors.
+	handedOff bool
 	// proved is set once a worker of the build, not the controller, has been seen polling one of its
 	// queues. Promotion waits for it: a Deployment at zero replicas is Available, so without it nothing
 	// shows the build can start before it is promoted.
@@ -90,7 +97,7 @@ type registration struct {
 
 // registers reports whether the controller registers the given pool of this registration's build.
 func (g *registration) registers(buildID, variant string) bool {
-	return g != nil && g.buildID == buildID && !g.fellBack && g.pools[variant]
+	return g != nil && g.buildID == buildID && g.pools[variant] && (!g.fellBack || (variant == "" && g.handedOff))
 }
 
 // registrationCache holds each TWD's registration state for its current target build.
@@ -265,9 +272,13 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 		l.Info("the build is proven but the canary's worker has not registered; registering its queues")
 		e.pools[""] = true
 		e.canaryBase = false
+		e.handedOff = true
 	}
 	own := pairsFor(current, declaredQueues(twd), e.pools)
-	if missing := subtract(own, registered); len(missing) > 0 && !e.fellBack {
+	if missing := subtract(own, registered); len(missing) > 0 && (!e.fellBack || e.handedOff) {
+		if e.fellBack {
+			missing = pairsFor(missing, declaredQueues(twd), map[string]bool{"": true})
+		}
 		e.polling = true
 		r.registration.put(twd.UID, e)
 		registered = r.pollUntilRegistered(ctx, l, twd, wdn, target.BuildID, missing, describe)
@@ -308,7 +319,7 @@ func (g *registration) upToDate() bool {
 	if g.complete && !g.holdPromotion {
 		return true
 	}
-	return !g.complete && !g.fellBack && time.Since(g.checkedAt) < registrationRetryInterval
+	return !g.complete && (!g.fellBack || g.handedOff) && time.Since(g.checkedAt) < registrationRetryInterval
 }
 
 // recordOutcome reports a completed registration once, and hands the pools back to their warm
@@ -320,7 +331,7 @@ func (r *TemporalWorkerDeploymentReconciler) recordOutcome(
 	queues int,
 	wasComplete bool,
 ) {
-	if !e.complete && !e.fellBack && time.Since(e.since) > registrationGrace {
+	if !e.complete && !e.fellBack && !e.handedOff && time.Since(e.since) > registrationGrace {
 		e.fellBack = true
 		r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonRegistrationFellBack,
 			"Could not register build %q within %s; starting a worker in each pool so it registers itself",
