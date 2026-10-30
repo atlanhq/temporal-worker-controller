@@ -131,6 +131,9 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 	plannerConfig := &planner.Config{
 		RolloutStrategy:    rolloutStrategy,
 		ExpectedGateQueues: planner.ExpectedGateQueues(&w.Spec),
+		HoldPromotion: r.promotionHeld(w) ||
+			(w.Status.CurrentVersion != nil && w.Status.CurrentVersion.BuildID != targetBuildID &&
+				startedAtZeroWithoutWorkers(k8sState.Deployments[targetBuildID])),
 	}
 
 	// Fetch all WorkerResourceTemplates that reference this TWD so that the planner
@@ -193,6 +196,9 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 		if err != nil {
 			return nil, err
 		}
+		if r.registration.registers(w.UID, targetBuildID, "") {
+			startAtZero(d)
+		}
 		plan.CreateDeployment = d
 	}
 
@@ -211,11 +217,44 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 			if err != nil {
 				return nil, err
 			}
+			if r.registration.registers(w.UID, targetBuildID, name) {
+				startAtZero(d)
+			}
 			plan.CreateVariantDeployments = append(plan.CreateVariantDeployments, d)
 		}
 	}
 
 	return plan, nil
+}
+
+// startAtZero creates d with no workers and owned by its ScaledObject from the start. A Deployment
+// with replicas unset is created at one, which starts a worker before KEDA reads the version's
+// minReplicaCount; the label keeps the planner from scaling it back up while no ScaledObject exists.
+// The StartedAtZeroAnnotation marks it so promotion never takes its Available condition, true at
+// zero replicas, as a sign that the build runs (see startedAtZeroWithoutWorkers). Both maps are
+// copied: the constructor shares them with spec.selector and the pod template.
+func startAtZero(d *appsv1.Deployment) {
+	zero := int32(0)
+	d.Spec.Replicas = &zero
+	labels := make(map[string]string, len(d.Labels)+1)
+	for k, v := range d.Labels {
+		labels[k] = v
+	}
+	labels[ManagedByLabel] = "true"
+	d.Labels = labels
+	annotations := make(map[string]string, len(d.Annotations)+1)
+	for k, v := range d.Annotations {
+		annotations[k] = v
+	}
+	annotations[StartedAtZeroAnnotation] = "true"
+	d.Annotations = annotations
+}
+
+// startedAtZeroWithoutWorkers reports whether d was created at zero by the controller's registration
+// and has no worker available. Without the registration hold (the TWD stopped opting in mid-release)
+// such a target must not be promoted until a worker of it runs, as one would without the controller.
+func startedAtZeroWithoutWorkers(d *appsv1.Deployment) bool {
+	return d != nil && d.Annotations[StartedAtZeroAnnotation] == "true" && d.Status.AvailableReplicas == 0
 }
 
 // Create a new deployment with owner reference

@@ -134,6 +134,15 @@ type TemporalWorkerDeploymentReconciler struct {
 	// describeQueueRouting replaces the Temporal describe behind
 	// queueRoutedElsewhere when set.
 	describeQueueRouting func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, queue string) ([]queueRouting, error)
+
+	// registration holds each opted-in TWD's controller-side registration of its target build (see
+	// registerTargetVersion).
+	registration registrationCache
+	// describeVersionQueues and pollVersionQueue replace the Temporal calls behind
+	// registerTargetVersion when set.
+	describeVersionQueues func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, wdn, buildID string) ([]versionQueue, error)
+	pollVersionQueue      func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, wdn, buildID string, q versionQueue) error
+	describePollers       func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, q versionQueue) ([]poller, error)
 }
 
 // +kubebuilder:rbac:groups=temporal.io,resources=temporalworkerdeployments,verbs=get;list;watch;create;update;patch;delete
@@ -390,6 +399,10 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 		return ctrl.Result{}, err
 	}
 
+	// Register the target version's task queues before the ScaledObjects and the plan are built: both
+	// read the outcome, and its polls must end before the plan can promote the version.
+	r.registerTargetVersion(ctx, l, &workerDeploy)
+
 	// Reconcile per-version KEDA ScaledObjects before planning: this labels the
 	// child Deployments that have a managed ScaledObject, which getScaleDeployments
 	// reads to decide whether to skip .spec.replicas writes (KEDA owns them).
@@ -516,6 +529,7 @@ func (r *TemporalWorkerDeploymentReconciler) teardownChildren(
 	workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment,
 ) error {
 	r.queueRouting.forget(workerDeploy.UID)
+	r.registration.forget(workerDeploy.UID)
 	sos, err := r.listOwnedScaledObjects(ctx, workerDeploy)
 	if err != nil {
 		// A cluster with no KEDA installed has no ScaledObject kind registered, so

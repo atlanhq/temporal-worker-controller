@@ -408,6 +408,9 @@ type versionRef struct {
 	// version that holds it, so until a worker of this pool polls, the queue's
 	// work goes to the other version and this ScaledObject's backlog reads zero.
 	QueueRoutedElsewhere bool
+	// ControllerRegisters marks a target pool whose task queues the controller registers itself (see
+	// registerTargetVersion), so the version needs no worker of this pool to register.
+	ControllerRegisters bool
 }
 
 // variantName is the spec.variants name this ref stands for, "" for the base.
@@ -540,6 +543,9 @@ func variantVersionsForScaling(
 // workerDeploymentName change) with no workers left, and this ScaledObject
 // reads zero, so nothing would ever start this pool's worker. One worker polls,
 // the queue joins the version, routing moves to it and the floor is released.
+//
+// A target pool whose queues the controller registers (ControllerRegisters) gets
+// no warm-start floor: the version registers without a worker of the pool.
 func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDeployment) (int64, bool) {
 	var base int32
 	var baseSet bool
@@ -562,8 +568,8 @@ func resolveMinReplicas(v versionRef, twd *temporaliov1alpha1.TemporalWorkerDepl
 
 	// Warm-start invariant for new versions.
 	if v.Status == temporaliov1alpha1.VersionStatusRamping ||
-		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusInactive) ||
-		(v.IsTarget && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) ||
+		(v.IsTarget && !v.ControllerRegisters && v.Status == temporaliov1alpha1.VersionStatusInactive) ||
+		(v.IsTarget && !v.ControllerRegisters && v.Status == temporaliov1alpha1.VersionStatusNotRegistered) ||
 		(v.QueueRoutedElsewhere && v.Status == temporaliov1alpha1.VersionStatusCurrent) {
 		if !baseSet || base < 1 {
 			return 1, true
@@ -652,6 +658,9 @@ func (r *TemporalWorkerDeploymentReconciler) reconcileScaledObjects(
 		}
 		if v.Status == temporaliov1alpha1.VersionStatusCurrent {
 			v.QueueRoutedElsewhere = r.queueRoutedElsewhere(ctx, l, twd, v.BuildID, scaledObjectTaskQueue(twd, v))
+		}
+		if v.IsTarget {
+			v.ControllerRegisters = r.registration.registers(twd.UID, v.BuildID, v.variantName())
 		}
 		so := buildScaledObject(twd, v, temporalEndpoint)
 		so.SetName(names[i])
