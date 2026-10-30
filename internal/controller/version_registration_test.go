@@ -42,6 +42,21 @@ type fakeTemporalVersions struct {
 	polls    []versionQueue
 	pollErr  error
 	noAdd    bool
+	// workerBuild, when set, is the build of a worker seen polling every queue; workerIdentity is its
+	// identity (a pod's "pid@pod" by default).
+	workerBuild    string
+	workerIdentity string
+}
+
+func (f *fakeTemporalVersions) pollers(_ context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, _ versionQueue) ([]poller, error) {
+	if f.workerBuild == "" {
+		return nil, nil
+	}
+	id := f.workerIdentity
+	if id == "" {
+		id = "1@worker-pod"
+	}
+	return []poller{{identity: id, deploymentName: k8s.ComputeWorkerDeploymentName(twd), buildID: f.workerBuild}}, nil
 }
 
 func (f *fakeTemporalVersions) describe(_ context.Context, _ *temporaliov1alpha1.TemporalWorkerDeployment, _, buildID string) ([]versionQueue, error) {
@@ -102,8 +117,10 @@ func registrationFixture(t *testing.T, extra ...client.Object) (*TemporalWorkerD
 	f := &fakeTemporalVersions{versions: map[string][]versionQueue{
 		"b1": {{"q", wf}, {"q", act}, {"q-od", act}},
 	}}
+	f.workerBuild = "b2"
 	r.describeVersionQueues = f.describe
 	r.pollVersionQueue = f.poll
+	r.describePollers = f.pollers
 	return r, rec, twd, f
 }
 
@@ -154,7 +171,7 @@ func TestRegisterTargetVersion_RegistersAllButTheCanaryPool(t *testing.T) {
 	assert.False(t, r.registration.registers(twd.UID, "b2", ""), "a single TWD is its own canary")
 	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
 	assert.False(t, r.registration.registers(twd.UID, "b1", "od"), "only the target build is covered")
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the canary worker")
+	assert.True(t, r.promotionHeld(twd), "promotion waits for the canary worker")
 	events := drainEvents(rec)
 	assert.True(t, hasEvent(events, ReasonVersionRegistered))
 	assert.True(t, hasEvent(events, ReasonPromotionHeld))
@@ -164,7 +181,7 @@ func TestRegisterTargetVersion_RegistersAllButTheCanaryPool(t *testing.T) {
 	f.versions["b2"] = append(f.versions["b2"], versionQueue{"q", wf}, versionQueue{"q", act})
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.Empty(t, f.polls)
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 	assert.False(t, hasEvent(drainEvents(rec), ReasonPromotionHeld), "the hold is reported once")
 
 	// Registered and not held: the next reconcile makes no Temporal calls.
@@ -180,7 +197,7 @@ func TestRegisterTargetVersion_PollsOnlyMissingQueues(t *testing.T) {
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
 	assert.Equal(t, []versionQueue{{"q-od", act}}, f.polls)
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // A pool whose Current Deployment has workers keeps its warm worker: the new worker will have work.
@@ -203,7 +220,7 @@ func TestRegisterTargetVersion_BusyPoolKeepsItsWorker(t *testing.T) {
 	assert.ElementsMatch(t, []versionQueue{{"q", wf}, {"q", act}}, f.polls)
 	assert.True(t, r.registration.registers(twd.UID, "b2", ""))
 	assert.False(t, r.registration.registers(twd.UID, "b2", "od"), "the busy -od pool keeps its worker")
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the -od worker to register its queue")
+	assert.True(t, r.promotionHeld(twd), "promotion waits for the -od worker to register its queue")
 }
 
 // A pool whose queue the Current version doesn't hold (a new pool, or one a previous version was
@@ -218,11 +235,11 @@ func TestRegisterTargetVersion_NewPoolKeepsItsWorker(t *testing.T) {
 
 	assert.Empty(t, f.polls)
 	assert.False(t, r.registration.registers(twd.UID, "b2", "od"))
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the new pool's worker")
+	assert.True(t, r.promotionHeld(twd), "promotion waits for the new pool's worker")
 
 	f.versions["b2"] = append(f.versions["b2"], versionQueue{"q-od", act}) // the -od worker polled
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // A declared queue that no worker registers stops holding promotion once the grace has passed, so a
@@ -233,13 +250,13 @@ func TestRegisterTargetVersion_NewPoolWaitIsBoundedByTheGrace(t *testing.T) {
 	f.versions["b2"] = []versionQueue{{"q", wf}, {"q", act}}
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	require.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+	require.True(t, r.promotionHeld(twd))
 
 	e := r.registration.get(twd.UID)
 	e.since = time.Now().Add(-2 * registrationGrace)
 	r.registration.put(twd.UID, e)
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // shareWith puts sibling on twd's worker deployment, moving to twd's target build "b2".
@@ -305,11 +322,11 @@ func TestRegisterTargetVersion_HoldsForSiblingQueues(t *testing.T) {
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.NotContains(t, f.polls, versionQueue{"q-heavy", act}, "a TWD polls only its own queues")
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.True(t, r.promotionHeld(twd))
 
 	f.versions["b2"] = append(f.versions["b2"], versionQueue{"q-heavy", act}) // the sibling registered
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // A sibling whose registration polls are still open holds promotion even once every queue is listed:
@@ -328,11 +345,11 @@ func TestRegisterTargetVersion_HoldsWhileASiblingPolls(t *testing.T) {
 	r.registration.put(sibling.UID, &registration{buildID: "b2", polling: true})
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.True(t, r.promotionHeld(twd))
 
 	r.registration.put(sibling.UID, &registration{buildID: "b2", complete: true})
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // A task handed to a registration poll is reported.
@@ -354,7 +371,7 @@ func TestRegisterTargetVersion_FallsBackAfterGrace(t *testing.T) {
 
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	require.True(t, r.registration.registers(twd.UID, "b2", "od"), "inside the grace the pool stays at zero")
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.True(t, r.promotionHeld(twd))
 
 	e := r.registration.get(twd.UID)
 	e.since = time.Now().Add(-2 * registrationGrace)
@@ -363,14 +380,14 @@ func TestRegisterTargetVersion_FallsBackAfterGrace(t *testing.T) {
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 
 	assert.False(t, r.registration.registers(twd.UID, "b2", "od"))
-	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.True(t, r.promotionHeld(twd))
 	assert.True(t, hasEvent(drainEvents(rec), ReasonRegistrationFellBack))
 
 	f.polls = nil
 	f.versions["b2"] = f.versions["b1"] // the workers registered
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.Empty(t, f.polls, "no polling after the fallback")
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // A failed attempt is retried on the retry interval, not every reconcile.
@@ -408,15 +425,118 @@ func TestRegisterTargetVersion_SkippedCases(t *testing.T) {
 	}
 }
 
-// A describe failure before any pools were chosen leaves every pool on its warm worker.
-func TestRegisterTargetVersion_DescribeFailureKeepsWorkers(t *testing.T) {
+// A describe failure before any pools were chosen leaves every pool on its warm worker and holds
+// promotion: the hold fails closed.
+func TestRegisterTargetVersion_DescribeFailureKeepsWorkersAndHolds(t *testing.T) {
 	r, _, twd, _ := registrationFixture(t)
 	r.describeVersionQueues = func(context.Context, *temporaliov1alpha1.TemporalWorkerDeployment, string, string) ([]versionQueue, error) {
 		return nil, errors.New("unavailable")
 	}
 	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.False(t, r.registration.registers(twd.UID, "b2", ""))
-	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+	assert.False(t, r.registration.registers(twd.UID, "b2", "od"))
+	assert.True(t, r.promotionHeld(twd))
+}
+
+// With no registration recorded for the target (a controller restart, or a pass that never
+// completed), an opted-in TWD's promotion is held; one that does not opt in is not.
+func TestPromotionHeld_FailsClosedWithoutAnEntry(t *testing.T) {
+	r, _, twd, _ := registrationFixture(t)
+	assert.True(t, r.promotionHeld(twd))
+	delete(twd.Annotations, RegistrationAnnotation)
+	assert.False(t, r.promotionHeld(twd))
+}
+
+// An error reading the target's queues after the pools were chosen holds promotion until a pass
+// succeeds, even though the pools already start at zero.
+func TestRegisterTargetVersion_TargetDescribeErrorHolds(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	r.describeVersionQueues = func(ctx context.Context, w *temporaliov1alpha1.TemporalWorkerDeployment, wdn, build string) ([]versionQueue, error) {
+		if build == "b2" {
+			return nil, serviceerror.NewUnavailable("matching unavailable")
+		}
+		return f.describe(ctx, w, wdn, build)
+	}
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
+	assert.True(t, r.promotionHeld(twd))
+}
+
+// Every queue registered is not enough: promotion waits until a worker of the build, not the
+// controller's own poll, has been seen polling.
+func TestRegisterTargetVersion_ProofNeedsAWorkerPoll(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	f.versions["b2"] = append([]versionQueue(nil), f.versions["b1"]...)
+
+	f.workerBuild = ""
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd), "no poller seen")
+
+	f.workerBuild, f.workerIdentity = "b2", getControllerIdentity()
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd), "the controller's own poll proves nothing")
+
+	f.workerBuild, f.workerIdentity = "b1", ""
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd), "a worker of another build proves nothing")
+
+	f.workerBuild = "b2"
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.promotionHeld(twd))
+}
+
+// If the canary sibling leaves mid-release, the TWD that becomes the canary hands its base pool back
+// to its warm worker, and promotion waits for that worker.
+func TestRegisterTargetVersion_NewCanaryStartsItsBaseWorker(t *testing.T) {
+	light := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "zzz-light", Namespace: "ns", UID: types.UID("light-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-light"},
+		},
+	}
+	withCPURequest(light, "500m")
+	r, _, twd, f := registrationFixture(t)
+	withCPURequest(twd, "6")
+	shareWith(t, r, twd, light)
+	f.workerBuild = ""
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.True(t, r.registration.registers(twd.UID, "b2", ""), "the light sibling is the canary")
+
+	require.NoError(t, r.Delete(context.Background(), light))
+	e := r.registration.get(twd.UID)
+	e.checkedAt = time.Now().Add(-2 * registrationRetryInterval)
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+
+	assert.False(t, r.registration.registers(twd.UID, "b2", ""), "the base pool goes back to its warm worker")
+	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
+	assert.True(t, r.promotionHeld(twd), "no worker of the build has polled")
+}
+
+// A registration that completed still holds again when a sibling starts registration polls.
+func TestRegisterTargetVersion_CompleteEntryRechecksSiblingPolling(t *testing.T) {
+	sibling := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "heavy", Namespace: "ns", UID: types.UID("sibling-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-heavy"},
+		},
+	}
+	r, _, twd, f := registrationFixture(t)
+	shareWith(t, r, twd, sibling)
+	f.versions["b1"] = append(f.versions["b1"], versionQueue{"q-heavy", act})
+	f.versions["b2"] = append([]versionQueue(nil), f.versions["b1"]...)
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.False(t, r.promotionHeld(twd))
+
+	r.registration.put(sibling.UID, &registration{buildID: "b2", polling: true})
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd))
+
+	r.registration.put(sibling.UID, &registration{buildID: "b2", complete: true})
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.promotionHeld(twd))
 }
 
 // The constructor shares one label map between the Deployment and its selector; marking the

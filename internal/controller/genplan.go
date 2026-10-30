@@ -131,7 +131,7 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 	plannerConfig := &planner.Config{
 		RolloutStrategy:    rolloutStrategy,
 		ExpectedGateQueues: planner.ExpectedGateQueues(&w.Spec),
-		HoldPromotion:      r.registration.holdPromotion(w.UID, targetBuildID),
+		HoldPromotion:      r.promotionHeld(w),
 	}
 
 	// Fetch all WorkerResourceTemplates that reference this TWD so that the planner

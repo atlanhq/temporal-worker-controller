@@ -142,6 +142,7 @@ type TemporalWorkerDeploymentReconciler struct {
 	// registerTargetVersion when set.
 	describeVersionQueues func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, wdn, buildID string) ([]versionQueue, error)
 	pollVersionQueue      func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, wdn, buildID string, q versionQueue) error
+	describePollers       func(ctx context.Context, twd *temporaliov1alpha1.TemporalWorkerDeployment, q versionQueue) ([]poller, error)
 }
 
 // +kubebuilder:rbac:groups=temporal.io,resources=temporalworkerdeployments,verbs=get;list;watch;create;update;patch;delete

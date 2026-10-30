@@ -75,8 +75,12 @@ type registration struct {
 	// a queue already registered still has a poll that could be handed a task.
 	polling      bool
 	heldReported bool
-	since        time.Time
-	checkedAt    time.Time
+	// proved is set once a worker of the build, not the controller, has been seen polling one of its
+	// queues. Promotion waits for it: a Deployment at zero replicas is Available, so without it nothing
+	// shows the build can start before it is promoted.
+	proved    bool
+	since     time.Time
+	checkedAt time.Time
 }
 
 // registers reports whether the controller registers the given pool of this registration's build.
@@ -120,10 +124,16 @@ func (c *registrationCache) registers(twd types.UID, buildID, variant string) bo
 	return c.get(twd).registers(buildID, variant)
 }
 
-// holdPromotion reports whether twd's planner must not promote buildID yet.
-func (c *registrationCache) holdPromotion(twd types.UID, buildID string) bool {
-	e := c.get(twd)
-	return e != nil && e.buildID == buildID && e.holdPromotion
+// promotionHeld reports whether twd's planner must not promote its target yet. It fails closed: an
+// opted-in TWD whose target still has to register is held until a registration pass for that build
+// has succeeded and cleared the hold, so a Temporal error or a controller restart never lets the
+// version through unchecked.
+func (r *TemporalWorkerDeploymentReconciler) promotionHeld(twd *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+	if !registrationApplies(twd) {
+		return false
+	}
+	e := r.registration.get(twd.UID)
+	return e == nil || e.buildID != twd.Status.TargetVersion.BuildID || e.holdPromotion
 }
 
 func registrationEnabled(twd *temporaliov1alpha1.TemporalWorkerDeployment) bool {
@@ -180,6 +190,12 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 		prev = nil
 	}
 	if prev.upToDate() {
+		if prev.complete && r.siblingPolling(ctx, twd, prev.buildID) {
+			prev.holdPromotion = true
+			prev.complete = false        // re-evaluate the hold on the next pass,
+			prev.checkedAt = time.Time{} // without waiting for the retry interval
+			r.registration.put(twd.UID, prev)
+		}
 		return
 	}
 
@@ -201,12 +217,19 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 
 	e := prev
 	if e == nil {
-		e = &registration{buildID: target.BuildID, since: time.Now(), pools: r.choosePools(ctx, l, twd, current)}
+		e = &registration{buildID: target.BuildID, since: time.Now(), holdPromotion: true,
+			pools: r.choosePools(ctx, l, twd, current)}
+	} else if e.pools[""] && r.isCanary(ctx, twd) {
+		// The canary changed under this release (a sibling left): this base pool must now prove
+		// the build with its own worker.
+		l.Info("this TWD became its worker deployment's canary; starting its base worker")
+		delete(e.pools, "")
 	}
 	own := pairsFor(current, declaredQueues(twd), e.pools)
 	registered, err := describe(ctx, twd, wdn, target.BuildID)
 	if err != nil && !isNotFound(err) {
 		l.Info("could not read the target version's task queues; retrying", "error", err.Error())
+		e.holdPromotion = true
 		e.checkedAt = time.Now()
 		r.registration.put(twd.UID, e)
 		return
@@ -303,13 +326,112 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 			polling = true
 		}
 	}
-	e.holdPromotion = len(missing) > 0 || polling
-	if e.holdPromotion && (e.complete || e.fellBack) && !e.heldReported && len(missing) > 0 {
-		e.heldReported = true
-		r.Recorder.Eventf(twd, corev1.EventTypeNormal, ReasonPromotionHeld,
-			"Holding promotion of build %q until its workers register %d task queue(s), e.g. %s",
-			e.buildID, len(missing), missing[0])
+	if len(missing) == 0 && !polling && !e.proved {
+		e.proved = r.workerPolled(ctx, l, twd, e.buildID, registered)
 	}
+	e.holdPromotion = len(missing) > 0 || polling || !e.proved
+	if e.holdPromotion && (e.complete || e.fellBack) && !e.heldReported && (len(missing) > 0 || !e.proved) {
+		e.heldReported = true
+		if len(missing) > 0 {
+			r.Recorder.Eventf(twd, corev1.EventTypeNormal, ReasonPromotionHeld,
+				"Holding promotion of build %q until its workers register %d task queue(s), e.g. %s",
+				e.buildID, len(missing), missing[0])
+		} else {
+			r.Recorder.Eventf(twd, corev1.EventTypeNormal, ReasonPromotionHeld,
+				"Holding promotion of build %q until one of its workers polls", e.buildID)
+		}
+	}
+}
+
+// siblingPolling reports whether a live sibling on twd's worker deployment has registration polls open
+// for buildID.
+func (r *TemporalWorkerDeploymentReconciler) siblingPolling(
+	ctx context.Context,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
+) bool {
+	siblings, err := r.sameBuildSiblings(ctx, twd, buildID)
+	if err != nil {
+		return true
+	}
+	for _, s := range siblings {
+		if g := r.registration.get(s.UID); g != nil && g.buildID == buildID && g.polling {
+			return true
+		}
+	}
+	return false
+}
+
+// workerPolled reports whether a worker of the build, any poller but the controller itself, has
+// polled one of the build's queues within the server's poller history.
+func (r *TemporalWorkerDeploymentReconciler) workerPolled(
+	ctx context.Context,
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
+	queues []versionQueue,
+) bool {
+	pollers := r.describePollers
+	if pollers == nil {
+		pollers = r.describePollersFromTemporal
+	}
+	wdn := k8s.ComputeWorkerDeploymentName(twd)
+	self := getControllerIdentity()
+	for _, q := range queues {
+		if q.typ != enumspb.TASK_QUEUE_TYPE_WORKFLOW && q.typ != enumspb.TASK_QUEUE_TYPE_ACTIVITY {
+			continue
+		}
+		seen, err := pollers(ctx, twd, q)
+		if err != nil {
+			l.Info("could not read the task queue's pollers; retrying", "taskQueue", q.name, "error", err.Error())
+			return false
+		}
+		for _, p := range seen {
+			if p.identity != self && p.deploymentName == wdn && p.buildID == buildID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// poller is one entry of a task queue's recent pollers.
+type poller struct {
+	identity       string
+	deploymentName string
+	buildID        string
+}
+
+// describePollersFromTemporal returns the recent pollers of one task queue and type.
+func (r *TemporalWorkerDeploymentReconciler) describePollersFromTemporal(
+	ctx context.Context,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	q versionQueue,
+) ([]poller, error) {
+	if r.TemporalClientPool == nil {
+		return nil, errors.New("no Temporal client pool")
+	}
+	c, err := r.temporalClientFor(ctx, twd)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.WorkflowService().DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
+		Namespace:     twd.Spec.WorkerOptions.TemporalNamespace,
+		TaskQueue:     &taskqueuepb.TaskQueue{Name: q.name, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		TaskQueueType: q.typ,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]poller, 0, len(resp.GetPollers()))
+	for _, p := range resp.GetPollers() {
+		out = append(out, poller{
+			identity:       p.GetIdentity(),
+			deploymentName: p.GetDeploymentOptions().GetDeploymentName(),
+			buildID:        p.GetDeploymentOptions().GetBuildId(),
+		})
+	}
+	return out, nil
 }
 
 // unregisteredNewQueues returns the declared queues the Current version does not hold (a new pool, or
