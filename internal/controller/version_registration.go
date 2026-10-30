@@ -157,10 +157,7 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 ) {
 	st := &twd.Status
 	target := st.TargetVersion
-	if !registrationEnabled(twd) || target.BuildID == "" || st.CurrentVersion == nil ||
-		st.CurrentVersion.BuildID == target.BuildID ||
-		(target.Status != "" && target.Status != temporaliov1alpha1.VersionStatusNotRegistered &&
-			target.Status != temporaliov1alpha1.VersionStatusInactive) {
+	if !registrationApplies(twd) {
 		r.registration.forget(twd.UID)
 		return
 	}
@@ -170,10 +167,7 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 	if prev != nil && prev.buildID != target.BuildID {
 		prev = nil
 	}
-	if prev != nil && prev.complete && !prev.holdPromotion {
-		return
-	}
-	if prev != nil && !prev.complete && !prev.fellBack && time.Since(prev.checkedAt) < registrationRetryInterval {
+	if prev.upToDate() {
 		return
 	}
 
@@ -208,29 +202,79 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 	if missing := subtract(own, registered); len(missing) > 0 && !e.fellBack {
 		registered = r.pollUntilRegistered(ctx, l, twd, wdn, target.BuildID, missing, describe)
 	}
+	wasComplete := prev != nil && prev.complete
 	e.complete = len(subtract(own, registered)) == 0
 	e.checkedAt = time.Now()
+	r.recordOutcome(l, twd, e, len(own), wasComplete)
+	r.updateHold(ctx, l, twd, e, current, registered)
+	r.registration.put(twd.UID, e)
+}
 
+// registrationApplies reports whether twd opts in and its target still has to register before it
+// can be promoted, with a Current version to take the queues from.
+func registrationApplies(twd *temporaliov1alpha1.TemporalWorkerDeployment) bool {
+	st := &twd.Status
+	target := st.TargetVersion
+	if !registrationEnabled(twd) || target.BuildID == "" || st.CurrentVersion == nil || st.CurrentVersion.BuildID == target.BuildID {
+		return false
+	}
+	switch target.Status {
+	case "", temporaliov1alpha1.VersionStatusNotRegistered, temporaliov1alpha1.VersionStatusInactive:
+		return true
+	}
+	return false
+}
+
+// upToDate reports whether this reconcile can reuse the registration as it stands: complete with
+// nothing to wait for, or failed and not yet due for a retry.
+func (g *registration) upToDate() bool {
+	if g == nil {
+		return false
+	}
+	if g.complete && !g.holdPromotion {
+		return true
+	}
+	return !g.complete && !g.fellBack && time.Since(g.checkedAt) < registrationRetryInterval
+}
+
+// recordOutcome reports a completed registration once, and hands the pools back to their warm
+// workers when registration has not completed within the grace.
+func (r *TemporalWorkerDeploymentReconciler) recordOutcome(
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	e *registration,
+	queues int,
+	wasComplete bool,
+) {
 	if !e.complete && !e.fellBack && time.Since(e.since) > registrationGrace {
 		e.fellBack = true
 		r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonRegistrationFellBack,
 			"Could not register build %q within %s; starting a worker in each pool so it registers itself",
-			target.BuildID, registrationGrace)
+			e.buildID, registrationGrace)
 	}
-	if e.complete && len(own) > 0 && (prev == nil || !prev.complete) {
-		l.Info("registered the target version's task queues", "queues", len(own))
+	if e.complete && queues > 0 && !wasComplete {
+		l.Info("registered the target version's task queues", "queues", queues)
 		r.Recorder.Eventf(twd, corev1.EventTypeNormal, ReasonVersionRegistered,
-			"Registered %d task queue(s) of build %q without starting workers", len(own), target.BuildID)
+			"Registered %d task queue(s) of build %q without starting workers", queues, e.buildID)
 	}
+}
 
-	expected, err := r.expectedQueues(ctx, twd, target.BuildID)
+// updateHold sets whether promotion must wait for a queue the Current version holds and a live TWD
+// on the same worker deployment declares.
+func (r *TemporalWorkerDeploymentReconciler) updateHold(
+	ctx context.Context,
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	e *registration,
+	current, registered []versionQueue,
+) {
+	expected, err := r.expectedQueues(ctx, twd, e.buildID)
 	if err != nil {
 		l.Info("could not list the TWDs on this worker deployment; holding promotion", "error", err.Error())
 		e.holdPromotion = true
-	} else {
-		e.holdPromotion = len(subtract(pairsFor(current, expected, nil), registered)) > 0
+		return
 	}
-	r.registration.put(twd.UID, e)
+	e.holdPromotion = len(subtract(pairsFor(current, expected, nil), registered)) > 0
 }
 
 // choosePools picks the pools whose queues the controller registers for a new target build. The
@@ -374,37 +418,7 @@ func (r *TemporalWorkerDeploymentReconciler) pollUntilRegistered(
 	missing []versionQueue,
 	describe func(context.Context, *temporaliov1alpha1.TemporalWorkerDeployment, string, string) ([]versionQueue, error),
 ) []versionQueue {
-	poll := r.pollVersionQueue
-	if poll == nil {
-		poll = r.pollVersionQueueFromTemporal
-	}
-	cancels := make(map[versionQueue]context.CancelFunc, len(missing))
-	var wg sync.WaitGroup
-	for _, q := range missing {
-		pctx, cancel := context.WithTimeout(ctx, registrationPollTimeout)
-		cancels[q] = cancel
-		wg.Add(1)
-		go func(q versionQueue) {
-			defer wg.Done()
-			defer cancel()
-			if err := poll(pctx, twd, wdn, buildID, q); err != nil {
-				if errors.Is(err, errRegistrationTaskReceived) {
-					l.Error(err, "a registration poll received a task and failed it back to the server",
-						"taskQueue", q.name, "type", q.typ.String())
-					r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonRegistrationTaskReceived,
-						"A registration poll of %s for build %q received a task; it was failed back to the server for retry", q, buildID)
-					return
-				}
-				l.Info("registration poll ended with an error", "taskQueue", q.name, "type", q.typ.String(), "error", err.Error())
-			}
-		}(q)
-	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	cancels, done := r.startRegistrationPolls(ctx, l, twd, wdn, buildID, missing)
 	var registered []versionQueue
 	ticker := time.NewTicker(registrationDescribeInterval)
 	defer ticker.Stop()
@@ -431,6 +445,60 @@ func (r *TemporalWorkerDeploymentReconciler) pollUntilRegistered(
 				}
 			}
 		}
+	}
+}
+
+// startRegistrationPolls starts one poll per missing queue. It returns each poll's cancel and a
+// channel closed once every poll has returned.
+func (r *TemporalWorkerDeploymentReconciler) startRegistrationPolls(
+	ctx context.Context,
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	wdn, buildID string,
+	missing []versionQueue,
+) (map[versionQueue]context.CancelFunc, <-chan struct{}) {
+	poll := r.pollVersionQueue
+	if poll == nil {
+		poll = r.pollVersionQueueFromTemporal
+	}
+	cancels := make(map[versionQueue]context.CancelFunc, len(missing))
+	var wg sync.WaitGroup
+	for _, q := range missing {
+		pctx, cancel := context.WithTimeout(ctx, registrationPollTimeout)
+		cancels[q] = cancel
+		wg.Add(1)
+		go func(q versionQueue) {
+			defer wg.Done()
+			defer cancel()
+			r.reportPollEnd(l, twd, buildID, q, poll(pctx, twd, wdn, buildID, q))
+		}(q)
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return cancels, done
+}
+
+// reportPollEnd logs a registration poll that ended with an error. A task handed to the poll is
+// logged at error level and recorded as an event: it should never happen.
+func (r *TemporalWorkerDeploymentReconciler) reportPollEnd(
+	l logr.Logger,
+	twd *temporaliov1alpha1.TemporalWorkerDeployment,
+	buildID string,
+	q versionQueue,
+	err error,
+) {
+	switch {
+	case err == nil:
+	case errors.Is(err, errRegistrationTaskReceived):
+		l.Error(err, "a registration poll received a task and failed it back to the server",
+			"taskQueue", q.name, "type", q.typ.String())
+		r.Recorder.Eventf(twd, corev1.EventTypeWarning, ReasonRegistrationTaskReceived,
+			"A registration poll of %s for build %q received a task; it was failed back to the server for retry", q, buildID)
+	default:
+		l.Info("registration poll ended with an error", "taskQueue", q.name, "type", q.typ.String(), "error", err.Error())
 	}
 }
 
@@ -537,6 +605,7 @@ func (r *TemporalWorkerDeploymentReconciler) pollVersionQueueFromTemporal(
 			return fmt.Errorf("%w; failing it back: %v", errRegistrationTaskReceived, err)
 		}
 		return errRegistrationTaskReceived
+	case enumspb.TASK_QUEUE_TYPE_UNSPECIFIED, enumspb.TASK_QUEUE_TYPE_NEXUS:
 	}
 	return fmt.Errorf("task queue type %s is not registered by the controller", q.typ)
 }
