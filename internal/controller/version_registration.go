@@ -294,6 +294,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 		return
 	}
 	missing := subtract(pairsFor(current, expected, nil), registered)
+	if time.Since(e.since) <= registrationGrace {
+		missing = append(missing, unregisteredNewQueues(expected, current, registered)...)
+	}
 	polling := false
 	for _, uid := range siblings {
 		if g := r.registration.get(uid); g != nil && g.buildID == e.buildID && g.polling {
@@ -307,6 +310,29 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 			"Holding promotion of build %q until its workers register %d task queue(s), e.g. %s",
 			e.buildID, len(missing), missing[0])
 	}
+}
+
+// unregisteredNewQueues returns the declared queues the Current version does not hold (a new pool, or
+// one a previous version was promoted without) that the target holds no type of yet. Their workers
+// start as without the controller and register them; promotion waits for that, within the grace, so
+// the queue does not go unversioned at promotion. Their types are unknown until a worker polls, so
+// one registered type is enough.
+func unregisteredNewQueues(expected map[string]string, current, registered []versionQueue) []versionQueue {
+	held := map[string]bool{}
+	for _, q := range current {
+		held[q.name] = true
+	}
+	for _, q := range registered {
+		held[q.name] = true
+	}
+	var out []versionQueue
+	for name := range expected {
+		if !held[name] {
+			out = append(out, versionQueue{name: name, typ: enumspb.TASK_QUEUE_TYPE_UNSPECIFIED})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
 }
 
 // choosePools picks the pools whose queues the controller registers for a new target build. The

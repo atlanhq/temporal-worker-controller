@@ -206,8 +206,9 @@ func TestRegisterTargetVersion_BusyPoolKeepsItsWorker(t *testing.T) {
 	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the -od worker to register its queue")
 }
 
-// A pool whose queue the Current version doesn't hold (a new pool) keeps its warm worker, and the
-// controller does not hold promotion for a queue the Current version never had.
+// A pool whose queue the Current version doesn't hold (a new pool, or one a previous version was
+// promoted without) keeps its warm worker, and promotion waits for that worker to register the queue,
+// with any type, so it does not go unversioned at promotion.
 func TestRegisterTargetVersion_NewPoolKeepsItsWorker(t *testing.T) {
 	r, _, twd, f := registrationFixture(t)
 	f.versions["b1"] = []versionQueue{{"q", wf}, {"q", act}}
@@ -217,6 +218,27 @@ func TestRegisterTargetVersion_NewPoolKeepsItsWorker(t *testing.T) {
 
 	assert.Empty(t, f.polls)
 	assert.False(t, r.registration.registers(twd.UID, "b2", "od"))
+	assert.True(t, r.registration.holdPromotion(twd.UID, "b2"), "promotion waits for the new pool's worker")
+
+	f.versions["b2"] = append(f.versions["b2"], versionQueue{"q-od", act}) // the -od worker polled
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
+}
+
+// A declared queue that no worker registers stops holding promotion once the grace has passed, so a
+// queue the workers no longer poll cannot block a release for good.
+func TestRegisterTargetVersion_NewPoolWaitIsBoundedByTheGrace(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	f.versions["b1"] = []versionQueue{{"q", wf}, {"q", act}}
+	f.versions["b2"] = []versionQueue{{"q", wf}, {"q", act}}
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.True(t, r.registration.holdPromotion(twd.UID, "b2"))
+
+	e := r.registration.get(twd.UID)
+	e.since = time.Now().Add(-2 * registrationGrace)
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
 	assert.False(t, r.registration.holdPromotion(twd.UID, "b2"))
 }
 
