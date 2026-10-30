@@ -32,6 +32,9 @@ import (
 const RegistrationAnnotation = "twd.temporal.io/controller-registration"
 
 const (
+	// heldReportInterval spaces repeats of the PromotionHeld event while a promotion stays held;
+	// Kubernetes drops events after about an hour.
+	heldReportInterval = 30 * time.Minute
 	// registrationPollTimeout bounds each registration poll. The frontend rejects a poll with less than
 	// 2s left before it reaches matching, and logs a warning below 10s.
 	registrationPollTimeout = 10 * time.Second
@@ -73,8 +76,8 @@ type registration struct {
 	fellBack      bool
 	// polling is set while this TWD's registration polls are open. A sibling must not promote then:
 	// a queue already registered still has a poll that could be handed a task.
-	polling      bool
-	heldReported bool
+	polling        bool
+	heldReportedAt time.Time
 	// proved is set once a worker of the build, not the controller, has been seen polling one of its
 	// queues. Promotion waits for it: a Deployment at zero replicas is Available, so without it nothing
 	// shows the build can start before it is promoted.
@@ -224,6 +227,11 @@ func (r *TemporalWorkerDeploymentReconciler) registerTargetVersion(
 		// the build with its own worker.
 		l.Info("this TWD became its worker deployment's canary; starting its base worker")
 		delete(e.pools, "")
+	} else if e.pools[""] && !e.proved && time.Since(e.since) > registrationGrace {
+		// No worker of the build has polled within the grace: the canary may be failing for its
+		// own reasons (a secret, a node selector). This TWD's base worker proves the build instead.
+		l.Info("no worker of the build has polled; starting this TWD's base worker to prove it")
+		delete(e.pools, "")
 	}
 	own := pairsFor(current, declaredQueues(twd), e.pools)
 	registered, err := describe(ctx, twd, wdn, target.BuildID)
@@ -316,9 +324,14 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 		e.holdPromotion = true
 		return
 	}
-	missing := subtract(pairsFor(current, expected, nil), registered)
+	var missing []versionQueue
 	if time.Since(e.since) <= registrationGrace {
+		missing = subtract(pairsFor(current, expected, nil), registered)
 		missing = append(missing, unregisteredNewQueues(expected, current, registered)...)
+	} else {
+		// After the grace a queue counts once any of its types registered: a type the build's
+		// workers no longer poll must not hold a release for good. Every queue still needs one.
+		missing = unregisteredQueues(pairsFor(current, expected, nil), registered)
 	}
 	polling := false
 	for _, uid := range siblings {
@@ -330,8 +343,9 @@ func (r *TemporalWorkerDeploymentReconciler) updateHold(
 		e.proved = r.workerPolled(ctx, l, twd, e.buildID, registered)
 	}
 	e.holdPromotion = len(missing) > 0 || polling || !e.proved
-	if e.holdPromotion && (e.complete || e.fellBack) && !e.heldReported && (len(missing) > 0 || !e.proved) {
-		e.heldReported = true
+	if e.holdPromotion && (e.complete || e.fellBack) && (len(missing) > 0 || !e.proved) &&
+		time.Since(e.heldReportedAt) > heldReportInterval {
+		e.heldReportedAt = time.Now()
 		if len(missing) > 0 {
 			r.Recorder.Eventf(twd, corev1.EventTypeNormal, ReasonPromotionHeld,
 				"Holding promotion of build %q until its workers register %d task queue(s), e.g. %s",
@@ -451,6 +465,24 @@ func unregisteredNewQueues(expected map[string]string, current, registered []ver
 	for name := range expected {
 		if !held[name] {
 			out = append(out, versionQueue{name: name, typ: enumspb.TASK_QUEUE_TYPE_UNSPECIFIED})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+// unregisteredQueues returns one entry per queue of want that has no type registered at all.
+func unregisteredQueues(want, registered []versionQueue) []versionQueue {
+	have := map[string]bool{}
+	for _, q := range registered {
+		have[q.name] = true
+	}
+	seen := map[string]bool{}
+	var out []versionQueue
+	for _, q := range want {
+		if !have[q.name] && !seen[q.name] {
+			seen[q.name] = true
+			out = append(out, versionQueue{name: q.name, typ: enumspb.TASK_QUEUE_TYPE_UNSPECIFIED})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })

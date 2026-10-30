@@ -579,3 +579,84 @@ func TestPollEnd(t *testing.T) {
 	cancel()
 	assert.NoError(t, pollEnd(ctx, boom), "a poll ended by its own cancel or deadline is finished, not failed")
 }
+
+// A type the build's workers no longer poll holds promotion only within the grace; after it, a queue
+// with any registered type counts, while a worker's poll is still required.
+func TestRegisterTargetVersion_DroppedTypeStopsHoldingAfterTheGrace(t *testing.T) {
+	r, _, twd, f := registrationFixture(t)
+	f.versions["b2"] = []versionQueue{{"q", wf}} // the canary worker no longer polls q's activities
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.True(t, r.promotionHeld(twd))
+
+	e := r.registration.get(twd.UID)
+	e.since = time.Now().Add(-2 * registrationGrace)
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.promotionHeld(twd))
+
+	f.workerBuild = ""
+	e = r.registration.get(twd.UID)
+	e.proved, e.complete, e.checkedAt = false, false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, r.promotionHeld(twd), "a worker's poll is still required after the grace")
+}
+
+// When no worker of the build has polled within the grace (a canary that cannot run for its own
+// reasons), a TWD whose base was at zero starts its base worker to prove the build itself.
+func TestRegisterTargetVersion_NoProofStartsOwnBaseWorkerAfterTheGrace(t *testing.T) {
+	light := &temporaliov1alpha1.TemporalWorkerDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "zzz-light", Namespace: "ns", UID: types.UID("light-uid")},
+		Spec: temporaliov1alpha1.TemporalWorkerDeploymentSpec{
+			WorkerScaling: &temporaliov1alpha1.WorkerScalingConfig{TaskQueue: "q-light"},
+		},
+	}
+	withCPURequest(light, "500m")
+	r, _, twd, f := registrationFixture(t)
+	withCPURequest(twd, "6")
+	shareWith(t, r, twd, light)
+	f.workerBuild = "" // the light canary never starts
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.True(t, r.registration.registers(twd.UID, "b2", ""))
+
+	e := r.registration.get(twd.UID)
+	e.since = time.Now().Add(-2 * registrationGrace)
+	e.complete, e.checkedAt = false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.registration.registers(twd.UID, "b2", ""), "the base pool starts its own worker")
+	assert.True(t, r.registration.registers(twd.UID, "b2", "od"))
+	assert.True(t, r.promotionHeld(twd))
+
+	f.workerBuild = "b2" // this TWD's base worker polled
+	e = r.registration.get(twd.UID)
+	e.complete, e.checkedAt = false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, r.promotionHeld(twd))
+}
+
+// A held promotion is reported again after the report interval, so the reason stays visible.
+func TestRegisterTargetVersion_PromotionHeldIsReportedAgain(t *testing.T) {
+	r, rec, twd, f := registrationFixture(t)
+	f.workerBuild = ""
+	f.versions["b2"] = append([]versionQueue(nil), f.versions["b1"]...)
+
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	require.True(t, hasEvent(drainEvents(rec), ReasonPromotionHeld))
+
+	e := r.registration.get(twd.UID)
+	e.complete, e.checkedAt = false, time.Time{}
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.False(t, hasEvent(drainEvents(rec), ReasonPromotionHeld), "not again within the interval")
+
+	e = r.registration.get(twd.UID)
+	e.complete, e.checkedAt = false, time.Time{}
+	e.heldReportedAt = time.Now().Add(-2 * heldReportInterval)
+	r.registration.put(twd.UID, e)
+	r.registerTargetVersion(context.Background(), logr.Discard(), twd)
+	assert.True(t, hasEvent(drainEvents(rec), ReasonPromotionHeld))
+}
