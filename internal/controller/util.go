@@ -31,6 +31,10 @@ const (
 	ReasonScaledObjectNameCollision  = "ScaledObjectNameCollision"
 	ReasonPinnedExecutionsStranded   = "PinnedExecutionsStranded"
 	ReasonPinnedExecutionCheckFailed = "PinnedExecutionCheckFailed"
+	ReasonVersionRegistered          = "VersionRegistered"
+	ReasonRegistrationFellBack       = "RegistrationFellBack"
+	ReasonRegistrationTaskReceived   = "RegistrationTaskReceived"
+	ReasonPromotionHeld              = "PromotionHeld"
 
 	ReasonTeardownDrainingPinnedExecutions = "TeardownDrainingPinnedExecutions"
 	ReasonPinnedExecutionsTerminated       = "PinnedExecutionsTerminated"

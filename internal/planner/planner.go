@@ -134,6 +134,10 @@ type Config struct {
 	// then never fans out to that queue. Empty disables the check (no gate, or
 	// queues not derivable from the spec).
 	ExpectedGateQueues []string
+
+	// HoldPromotion keeps the target version from being promoted while it still misses a task queue
+	// that must register first (set by the controller's registration of the version).
+	HoldPromotion bool
 }
 
 // ExpectedGateQueues derives the queue set a gated rollout must observe on the
@@ -1121,6 +1125,11 @@ func getVersionConfigDiff(
 	// Do nothing if target version's deployment is not healthy yet, or if the version is not yet registered in temporal
 	if status.TargetVersion.HealthySince == nil ||
 		status.TargetVersion.Status == temporaliov1alpha1.VersionStatusNotRegistered {
+		return nil
+	}
+
+	// Do nothing while the controller's registration of the target version is incomplete
+	if config.HoldPromotion {
 		return nil
 	}
 

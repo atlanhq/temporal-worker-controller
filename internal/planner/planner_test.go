@@ -1680,6 +1680,34 @@ func TestGetVersionConfigDiff(t *testing.T) {
 	}
 }
 
+// A Healthy, Inactive target under AllAtOnce is promoted at once, unless the controller is still
+// registering its task queues.
+func TestGetVersionConfigDiff_HoldPromotion(t *testing.T) {
+	status := &temporaliov1alpha1.TemporalWorkerDeploymentStatus{
+		TargetVersion: temporaliov1alpha1.TargetWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID:      "new",
+				Status:       temporaliov1alpha1.VersionStatusInactive,
+				HealthySince: &metav1.Time{Time: time.Now().Add(-time.Minute)},
+			},
+		},
+		CurrentVersion: &temporaliov1alpha1.CurrentWorkerDeploymentVersion{
+			BaseWorkerDeploymentVersion: temporaliov1alpha1.BaseWorkerDeploymentVersion{
+				BuildID: "old",
+				Status:  temporaliov1alpha1.VersionStatusCurrent,
+			},
+		},
+	}
+	config := &Config{RolloutStrategy: temporaliov1alpha1.RolloutStrategy{Strategy: temporaliov1alpha1.UpdateAllAtOnce}}
+
+	vc := getVersionConfigDiff(logr.Discard(), status, &temporal.TemporalWorkerState{}, config, "ns/app")
+	require.NotNil(t, vc)
+	assert.True(t, vc.SetCurrent)
+
+	config.HoldPromotion = true
+	assert.Nil(t, getVersionConfigDiff(logr.Discard(), status, &temporal.TemporalWorkerState{}, config, "ns/app"))
+}
+
 func TestGetVersionConfig_ProgressiveRolloutEdgeCases(t *testing.T) {
 	testCases := map[string]struct {
 		strategy          temporaliov1alpha1.RolloutStrategy
